@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: trm-tech-resource-system
+    runtime: python
+    plan: starter
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    disk:
+      name: trm-data
+      mountPath: /opt/render/project/src/runtime
+      sizeGB: 1
+    envVars:
+      - key: TRM_DB_PATH
+        value: /opt/render/project/src/runtime/trm_system.db
+      - key: TRM_UPLOAD_DIR
+        value: /opt/render/project/src/runtime/uploads

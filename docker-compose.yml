@@ -1,0 +1,13 @@
+services:
+  trm-platform:
+    build: .
+    container_name: trm-platform-v4
+    ports:
+      - "8000:8000"
+    environment:
+      TRM_DB_PATH: /app/data/trm_system.db
+      TRM_UPLOAD_DIR: /app/uploads
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    restart: unless-stopped
