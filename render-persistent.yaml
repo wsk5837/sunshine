@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: trm-tech-resource-system
+    name: trm-tech-resource-poc
     runtime: python
     plan: starter
     region: singapore
@@ -10,10 +10,12 @@ services:
     autoDeployTrigger: commit
     disk:
       name: trm-data
-      mountPath: /opt/render/project/src/runtime
+      mountPath: /var/data
       sizeGB: 1
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.5"
       - key: TRM_DB_PATH
-        value: /opt/render/project/src/runtime/trm_system.db
+        value: /var/data/trm_system.db
       - key: TRM_UPLOAD_DIR
-        value: /opt/render/project/src/runtime/uploads
+        value: /var/data/uploads

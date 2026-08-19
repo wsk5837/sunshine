@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Header, Request, Query
 from pydantic import BaseModel, Field
 
@@ -219,6 +220,18 @@ def init_poc_db():
             "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
             ("tapd_retry_seconds", str(int(float(os.getenv("TRM_TAPD_RETRY_SECONDS", "30")))), "TAPD失败重试间隔，默认30秒", now),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
+            ("tapd_mode", os.getenv("TRM_TAPD_MODE", "mock"), "TAPD运行模式：mock / live", now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
+            ("tapd_workspace_id", os.getenv("TRM_TAPD_WORKSPACE_ID", ""), "TAPD项目workspace_id", now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
+            ("tapd_base_url", os.getenv("TRM_TAPD_BASE_URL", "https://api.tapd.cn"), "TAPD开放平台API地址", now),
+        )
 
         # 用已有预算形成可查询的月度/季度执行快照；后续预算流水会持续更新当前周期。
         if conn.execute("SELECT COUNT(*) c FROM budget_execution_snapshots").fetchone()["c"] == 0:
@@ -327,6 +340,185 @@ def previous_nodes_for(current_node: str):
     return PREVIOUS_NODES.get(current_node, [])
 
 
+
+def tapd_runtime_config(conn):
+    mode = get_setting(conn, "tapd_mode", os.getenv("TRM_TAPD_MODE", "mock")).strip().lower() or "mock"
+    workspace_id = get_setting(conn, "tapd_workspace_id", os.getenv("TRM_TAPD_WORKSPACE_ID", "")).strip()
+    base_url = get_setting(conn, "tapd_base_url", os.getenv("TRM_TAPD_BASE_URL", "https://api.tapd.cn")).strip().rstrip("/")
+    api_user = os.getenv("TRM_TAPD_API_USER", "").strip()
+    api_password = os.getenv("TRM_TAPD_API_PASSWORD", "").strip()
+    return {
+        "mode": mode if mode in ("mock", "live") else "mock",
+        "workspace_id": workspace_id,
+        "base_url": base_url or "https://api.tapd.cn",
+        "credentials_ready": bool(api_user and api_password),
+        "api_user_masked": (api_user[:2] + "***" + api_user[-2:]) if len(api_user) >= 5 else ("已配置" if api_user else "未配置"),
+    }
+
+
+def _tapd_live_ready(conn):
+    cfg = tapd_runtime_config(conn)
+    if cfg["mode"] != "live":
+        return cfg
+    if not cfg["workspace_id"]:
+        raise BusinessError(502, "TAPD-5020", "Live模式未配置TAPD workspace_id")
+    if not cfg["credentials_ready"]:
+        raise BusinessError(502, "TAPD-5020", "Live模式未配置TAPD API账号/口令，请在部署环境变量中设置TRM_TAPD_API_USER与TRM_TAPD_API_PASSWORD")
+    return cfg
+
+
+def _tapd_request(conn, method: str, path: str, *, params=None, data=None, timeout: float = 10.0):
+    cfg = _tapd_live_ready(conn)
+    api_user = os.getenv("TRM_TAPD_API_USER", "").strip()
+    api_password = os.getenv("TRM_TAPD_API_PASSWORD", "").strip()
+    url = f"{cfg['base_url']}/{path.lstrip('/')}"
+    try:
+        with httpx.Client(auth=(api_user, api_password), timeout=timeout, headers={"Accept": "application/json"}) as client:
+            response = client.request(method.upper(), url, params=params, data=data)
+        response.raise_for_status()
+        body = response.json()
+    except httpx.TimeoutException as exc:
+        raise BusinessError(504, "TAPD-5040", "TAPD调用超时", {"endpoint": path}) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise BusinessError(502, "TAPD-5020", "TAPD服务不可用或返回异常", {"endpoint": path, "error": str(exc)[:300]}) from exc
+    if isinstance(body, dict) and body.get("status") not in (None, 1, "1", True):
+        raise BusinessError(502, "TAPD-5020", "TAPD接口返回失败", {"endpoint": path, "info": str(body.get("info", ""))[:300]})
+    return body
+
+
+def _tapd_list_data(body, entity_key: str):
+    data = body.get("data", []) if isinstance(body, dict) else []
+    if isinstance(data, dict) and entity_key in data:
+        data = data[entity_key]
+    if not isinstance(data, list):
+        data = [data] if data else []
+    result = []
+    for item in data:
+        if isinstance(item, dict) and entity_key in item and isinstance(item[entity_key], dict):
+            result.append(item[entity_key])
+        elif isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+def _tapd_status_to_poc(story: dict, fallback: str = "新"):
+    raw = str(story.get("v_status") or story.get("status") or "").strip()
+    low = raw.lower()
+    pairs = [
+        (("已拒绝", "拒绝", "rejected", "reject"), "已拒绝"),
+        (("已关闭", "已完成", "closed", "done", "resolved"), "已关闭"),
+        (("已验收", "验收", "accepted", "verified", "release"), "已验收"),
+        (("测试中", "测试", "testing", "test"), "测试中"),
+        (("开发中", "进行中", "实现中", "developing", "progressing", "in progress"), "开发中"),
+        (("新", "规划中", "未开始", "planning", "open", "new"), "新"),
+    ]
+    for keys, mapped in pairs:
+        if any(k.lower() in low for k in keys):
+            return mapped
+    return fallback if fallback in TAPD_STATUS_MAP else "新"
+
+
+def _as_float(value):
+    try:
+        if value in (None, ""):
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_live_sync_payload(conn, demand_id: int, tapd_id: Optional[str] = None):
+    cfg = _tapd_live_ready(conn)
+    d = conn.execute("SELECT * FROM demands WHERE id=?", (demand_id,)).fetchone()
+    if not d:
+        raise BusinessError(404, "REQ-4040", "需求不存在")
+    req = None
+    if tapd_id:
+        req = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? AND tapd_id=?", (demand_id, tapd_id)).fetchone()
+    if not req:
+        req = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id LIMIT 1", (demand_id,)).fetchone()
+    story_id = tapd_id or (req["tapd_id"] if req else d["tapd_id"])
+    if not story_id:
+        raise BusinessError(409, "REQ-4091", "尚未创建TAPD需求")
+
+    story_body = _tapd_request(conn, "GET", "/stories", params={
+        "workspace_id": cfg["workspace_id"], "id": story_id, "with_v_status": 1, "limit": 1
+    })
+    stories = _tapd_list_data(story_body, "Story")
+    if not stories:
+        raise BusinessError(404, "REQ-4040", "TAPD未返回对应需求", {"tapdId": story_id})
+    story = stories[0]
+    mapped_status = _tapd_status_to_poc(story, d["tapd_status"] or "新")
+
+    tasks = []
+    page = 1
+    while page <= 50:
+        task_body = _tapd_request(conn, "GET", "/tasks", params={
+            "workspace_id": cfg["workspace_id"], "story_id": story_id, "page": page, "limit": 200
+        })
+        batch = _tapd_list_data(task_body, "Task")
+        for t in batch:
+            tasks.append(TapdTaskPayload(
+                task_id=str(t.get("id") or ""),
+                title=str(t.get("name") or ""),
+                description=str(t.get("description") or ""),
+                task_type=str(t.get("label") or "TAPD任务"),
+                planned_start=t.get("begin"), planned_end=t.get("due"),
+                estimated_hours=_as_float(t.get("effort")),
+                creator=str(t.get("creator") or t.get("owner") or ""),
+                created_at=t.get("created"), completed_at=t.get("completed"),
+                completed_hours=_as_float(t.get("effort_completed")),
+                remaining_hours=_as_float(t.get("remain")), overrun_hours=_as_float(t.get("exceed")),
+            ))
+        if len(batch) < 200:
+            break
+        page += 1
+
+    costs = []
+    for task in tasks[:200]:
+        page = 1
+        while page <= 20:
+            cost_body = _tapd_request(conn, "GET", "/timesheets", params={
+                "workspace_id": cfg["workspace_id"], "entity_type": "task", "entity_id": task.task_id,
+                "page": page, "limit": 200
+            })
+            batch = _tapd_list_data(cost_body, "Timesheet")
+            if not batch:
+                batch = _tapd_list_data(cost_body, "TimeSheet")
+            for c in batch:
+                costs.append(TapdCostPayload(
+                    task_id=task.task_id, spent_date=c.get("spentdate"), hours=_as_float(c.get("timespent")),
+                    creator=str(c.get("owner") or ""), description=str(c.get("memo") or ""),
+                ))
+            if len(batch) < 200:
+                break
+            page += 1
+
+    return TapdWebhookPayload(
+        tapd_id=str(story_id), demand_no=d["demand_no"], status=mapped_status,
+        demand_description=str(story.get("description") or d["description"] or ""),
+        rd_owner=str(story.get("developer") or story.get("owner") or ""),
+        rd_department=d["rd_department"] or "",
+        internal_days=float(d["internal_days"] or 0), external_days=float(d["external_days"] or 0),
+        planned_online_date=story.get("due") or d["planned_online_date"],
+        actual_online_date=story.get("completed") or d["actual_online_date"],
+        user_test_date=d["user_test_date"], test_complete_date=d["test_complete_date"], demand_confirm_date=d["demand_confirm_date"],
+        tasks=tasks, costs=costs,
+    )
+
+
+def test_tapd_connection(conn):
+    cfg = tapd_runtime_config(conn)
+    if cfg["mode"] == "mock":
+        return {**cfg, "connected": True, "message": "Mock模式运行正常，切换Live后将调用TAPD开放平台。", "story_count": None, "task_count": None}
+    cfg = _tapd_live_ready(conn)
+    story_body = _tapd_request(conn, "GET", "/stories/count", params={"workspace_id": cfg["workspace_id"]})
+    task_body = _tapd_request(conn, "GET", "/tasks/count", params={"workspace_id": cfg["workspace_id"]})
+    story_count = ((story_body.get("data") or {}).get("count") if isinstance(story_body, dict) else None)
+    task_count = ((task_body.get("data") or {}).get("count") if isinstance(task_body, dict) else None)
+    return {**cfg, "connected": True, "message": "TAPD连接成功", "story_count": story_count, "task_count": task_count}
+
+
 def _tapd_payload(conn, demand_id: int, system_name: str, allocation_id=None):
     d = conn.execute("SELECT * FROM demands WHERE id=?", (demand_id,)).fetchone()
     attachments = [r["original_name"] for r in conn.execute("SELECT original_name FROM attachments WHERE demand_id=? ORDER BY id", (demand_id,))]
@@ -371,29 +563,47 @@ def create_tapd_requirements(conn, demand_id: int, request_id: str = ""):
     if existing:
         raise BusinessError(409, "REQ-4090", "该REQ编号已创建TAPD需求，请勿重复推送")
     strategy = get_setting(conn, "tapd_split_strategy", "system")
+    mode = tapd_runtime_config(conn)["mode"]
     splits = _tapd_splits(conn, demand_id, strategy)
     created = []
     for idx, (split_key, system_name, allocation_id) in enumerate(splits, start=1):
-        tapd_id = f"TAPD-{datetime.now().strftime('%Y%m%d')}-{demand_id:05d}-{idx:02d}"
-        tapd_url = f"https://tapd.example.local/requirements/{tapd_id}"
         payload = _tapd_payload(conn, demand_id, system_name, allocation_id)
         now = now_iso()
+        if mode == "live":
+            cfg = _tapd_live_ready(conn)
+            post_data = {
+                "workspace_id": cfg["workspace_id"],
+                "name": payload["标题"],
+                "description": f"{payload['描述']}\n\n[TRM外部ID] {payload['外部ID']}\n[归属系统] {system_name}",
+                "priority_label": payload["优先级"],
+            }
+            body = _tapd_request(conn, "POST", "/stories", data=post_data)
+            data = body.get("data", {}) if isinstance(body, dict) else {}
+            story = data.get("Story", data) if isinstance(data, dict) else {}
+            tapd_id = str(story.get("id") or "")
+            if not tapd_id:
+                raise BusinessError(502, "TAPD-5020", "TAPD创建需求成功响应中缺少需求ID")
+            tapd_url = ""
+            tapd_status = _tapd_status_to_poc(story, "新")
+        else:
+            tapd_id = f"TAPD-{datetime.now().strftime('%Y%m%d')}-{demand_id:05d}-{idx:02d}"
+            tapd_url = f"https://tapd.example.local/requirements/{tapd_id}"
+            tapd_status = "新"
         conn.execute(
             """INSERT INTO tapd_requirements
             (demand_id,split_key,system_name,allocation_id,tapd_id,tapd_url,tapd_status,sync_status,payload_json,created_at,last_sync_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (demand_id, split_key, system_name, allocation_id, tapd_id, tapd_url, "新", "成功", json.dumps(payload, ensure_ascii=False), now, now),
+            (demand_id, split_key, system_name, allocation_id, tapd_id, tapd_url, tapd_status, "成功", json.dumps(payload, ensure_ascii=False), now, now),
         )
-        _integration_log(conn, "tapd", "out", "create_requirement", tapd_id, True, f"按{strategy}策略创建TAPD需求：{system_name}", request_id)
+        _integration_log(conn, "tapd", "out", "create_requirement", tapd_id, True, f"{mode}模式按{strategy}策略创建TAPD需求：{system_name}", request_id)
         created.append(dict(conn.execute("SELECT * FROM tapd_requirements WHERE tapd_id=?", (tapd_id,)).fetchone()))
     first = created[0]
     conn.execute(
-        """UPDATE demands SET status='已创建',current_node='TAPD已创建',tapd_id=?,tapd_url=?,tapd_status='新',
+        """UPDATE demands SET status='已创建',current_node='TAPD已创建',tapd_id=?,tapd_url=?,tapd_status=?,
            tapd_sync_status='成功',tapd_last_sync_at=?,updated_at=? WHERE id=?""",
-        (first["tapd_id"], first["tapd_url"], now_iso(), now_iso(), demand_id),
+        (first["tapd_id"], first["tapd_url"], first["tapd_status"], now_iso(), now_iso(), demand_id),
     )
     return created
-
 
 def schedule_tapd_retry(conn, demand_id: int, request_id: str = ""):
     existing = conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? AND status='等待重试' ORDER BY id DESC LIMIT 1", (demand_id,)).fetchone()
@@ -620,7 +830,10 @@ def run_scheduled_tapd_sync(force: bool = False):
             last = _parse_iso(d["tapd_last_sync_at"])
             if not force and last and (now - last).total_seconds() < interval:
                 continue
-            payload = build_mock_sync_payload(conn, d["id"], d["tapd_status"] or "新")
+            if tapd_runtime_config(conn)["mode"] == "live":
+                payload = build_live_sync_payload(conn, d["id"], d["tapd_id"])
+            else:
+                payload = build_mock_sync_payload(conn, d["id"], d["tapd_status"] or "新")
             apply_tapd_payload(conn, d["id"], payload, "定时任务", "background")
             synced += 1
     return synced
@@ -643,12 +856,16 @@ class SettingsPayload(BaseModel):
     tapd_split_strategy: Optional[str] = None
     tapd_sync_interval_seconds: Optional[int] = None
     tapd_retry_seconds: Optional[int] = None
+    tapd_mode: Optional[str] = None
+    tapd_workspace_id: Optional[str] = None
+    tapd_base_url: Optional[str] = None
 
 
 @router.get("/poc/settings")
 def poc_settings():
     with connect() as conn:
         rows = {r["code"]: r["value"] for r in conn.execute("SELECT code,value FROM system_settings")}
+        rows.update({"tapd_credentials_ready": tapd_runtime_config(conn)["credentials_ready"], "tapd_api_user_masked": tapd_runtime_config(conn)["api_user_masked"]})
         return {"code": 0, "data": rows}
 
 
@@ -670,7 +887,39 @@ def update_poc_settings(payload: SettingsPayload, x_role: Optional[str] = Header
             if payload.tapd_retry_seconds < 1:
                 raise BusinessError(400, "REQ-4001", "TAPD重试间隔不能小于1秒")
             conn.execute("UPDATE system_settings SET value=?,updated_at=? WHERE code='tapd_retry_seconds'", (str(payload.tapd_retry_seconds), now))
+        if payload.tapd_mode is not None:
+            if payload.tapd_mode not in ("mock", "live"):
+                raise BusinessError(400, "REQ-4001", "TAPD运行模式仅支持mock/live")
+            conn.execute("UPDATE system_settings SET value=?,updated_at=? WHERE code='tapd_mode'", (payload.tapd_mode, now))
+        if payload.tapd_workspace_id is not None:
+            conn.execute("UPDATE system_settings SET value=?,updated_at=? WHERE code='tapd_workspace_id'", (payload.tapd_workspace_id.strip(), now))
+        if payload.tapd_base_url is not None:
+            base = payload.tapd_base_url.strip().rstrip("/") or "https://api.tapd.cn"
+            if not base.startswith("https://"):
+                raise BusinessError(400, "REQ-4001", "TAPD API地址必须使用HTTPS")
+            conn.execute("UPDATE system_settings SET value=?,updated_at=? WHERE code='tapd_base_url'", (base, now))
     return {"code": 0, "message": "POC集成策略已更新"}
+
+
+@router.post("/tapd/test-connection")
+def tapd_test_connection(x_role: Optional[str] = Header(None)):
+    if (x_role or "applicant") != "admin":
+        raise BusinessError(403, "AUTH-4030", "仅系统管理员可测试TAPD连接")
+    with connect() as conn:
+        return {"code": 0, "message": "TAPD连接测试完成", "data": test_tapd_connection(conn)}
+
+
+@router.get("/tapd/overview")
+def tapd_overview():
+    with connect() as conn:
+        cfg = tapd_runtime_config(conn)
+        req_count = conn.execute("SELECT COUNT(*) c FROM tapd_requirements").fetchone()["c"]
+        success_runs = conn.execute("SELECT COUNT(*) c FROM tapd_sync_runs WHERE success=1").fetchone()["c"]
+        failed_runs = conn.execute("SELECT COUNT(*) c FROM tapd_sync_runs WHERE success=0").fetchone()["c"]
+        waiting_retry = conn.execute("SELECT COUNT(*) c FROM tapd_retry_jobs WHERE status='等待重试'").fetchone()["c"]
+        tasks = [dict(r) for r in conn.execute("""SELECT t.*,d.demand_no,d.title demand_title FROM tapd_tasks t JOIN demands d ON d.id=t.demand_id ORDER BY t.id DESC LIMIT 12""")]
+        runs = [dict(r) for r in conn.execute("""SELECT r.*,d.demand_no,d.title demand_title FROM tapd_sync_runs r JOIN demands d ON d.id=r.demand_id ORDER BY r.id DESC LIMIT 12""")]
+        return {"code": 0, "data": {"config": cfg, "requirement_count": req_count, "success_runs": success_runs, "failed_runs": failed_runs, "waiting_retry": waiting_retry, "recent_tasks": tasks, "recent_runs": runs}}
 
 
 @router.get("/demands/{demand_id}/oa-tasks")

@@ -23,7 +23,7 @@ from .v4 import router as v4_router, init_v4_db
 from .poc import (
     router as poc_router, init_poc_db, background_worker, create_oa_task, complete_oa_task,
     previous_nodes_for, create_tapd_requirements, schedule_tapd_retry, apply_tapd_payload,
-    build_mock_sync_payload, get_setting
+    build_mock_sync_payload, build_live_sync_payload, tapd_runtime_config, get_setting
 )
 from .rules import (
     APPROVAL_FLOW,
@@ -67,11 +67,11 @@ async def lifespan(_app: FastAPI):
             pass
 
 
-app = FastAPI(title="TRM 科技资源管理系统", version="4.3.0", description="完整科技资源管理与需求全生命周期管理系统", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app = FastAPI(title="TRM 科技资源管理系统", version="4.6.0", description="完整科技资源管理与需求全生命周期管理系统", lifespan=lifespan)
 app.include_router(extended_router)
 app.include_router(v4_router)
 app.include_router(poc_router)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.middleware("http")
@@ -854,7 +854,11 @@ def sync_tapd(demand_id: int, request: Request, tapd_status: Optional[str] = Que
             tapd_status = statuses[min(statuses.index(current) + 1, len(statuses) - 1)] if current in statuses else "开发中"
         if tapd_status not in TAPD_STATUS_MAP:
             raise BusinessError(400, "REQ-4001", "无效TAPD状态")
-        payload = build_mock_sync_payload(conn, demand_id, tapd_status)
+        if tapd_runtime_config(conn)["mode"] == "live":
+            payload = build_live_sync_payload(conn, demand_id, d.get("tapd_id"))
+            tapd_status = payload.status
+        else:
+            payload = build_mock_sync_payload(conn, demand_id, tapd_status)
         result = apply_tapd_payload(conn, demand_id, payload, "手动同步", getattr(request.state, "request_id", ""))
         conn.execute("UPDATE tapd_requirements SET tapd_status=?,sync_status='成功',last_sync_at=? WHERE demand_id=?", (tapd_status, now_iso(), demand_id))
         conn.execute("INSERT INTO tapd_events(demand_id,event_type,success,attempt,request_id,message,created_at) VALUES (?,?,?,?,?,?,?)",

@@ -9,6 +9,8 @@ services:
     healthCheckPath: /api/health
     autoDeployTrigger: commit
     envVars:
+      - key: PYTHON_VERSION
+        value: "3.13.5"
       - key: TRM_DB_PATH
         value: /tmp/trm_system.db
       - key: TRM_UPLOAD_DIR
