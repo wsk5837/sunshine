@@ -1,0 +1,10 @@
+{
+  "name": "TRM科技资源管理",
+  "description": "查询TRM预算、项目、需求，并在用户确认后受控创建项目或需求草稿",
+  "type": "http_streamable",
+  "endpoint": "https://<TRM公网域名>/mcp/",
+  "enabled": true,
+  "headers": {
+    "Authorization": "Bearer <TRM_MCP_API_TOKEN>"
+  }
+}

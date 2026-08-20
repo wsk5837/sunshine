@@ -22,6 +22,7 @@ from .extended import router as extended_router, init_extended_db, project_detai
 from .v4 import router as v4_router, init_v4_db
 from .auth import router as auth_router, init_auth_db, resolve_session, get_role_labels, get_demo_users
 from .ai_gateway import AIServiceError, public_ai_config, run_agent_message
+from .trm_mcp import init_trm_mcp_db, mcp_asgi_app, public_mcp_status
 from .poc import (
     router as poc_router, init_poc_db, background_worker, create_oa_task, complete_oa_task,
     previous_nodes_for, create_tapd_requirements, schedule_tapd_retry, apply_tapd_payload,
@@ -59,15 +60,17 @@ async def lifespan(_app: FastAPI):
     init_v4_db()
     init_auth_db()
     init_poc_db()
-    worker = asyncio.create_task(background_worker())
-    try:
-        yield
-    finally:
-        worker.cancel()
+    init_trm_mcp_db()
+    async with mcp_asgi_app.run():
+        worker = asyncio.create_task(background_worker())
         try:
-            await worker
-        except asyncio.CancelledError:
-            pass
+            yield
+        finally:
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="TRM 科技资源管理系统", version="4.9.0", description="完整科技资源管理、需求全生命周期与AI智能体集成系统", lifespan=lifespan)
@@ -76,6 +79,7 @@ app.include_router(v4_router)
 app.include_router(auth_router)
 app.include_router(poc_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/mcp", mcp_asgi_app, name="trm-mcp")
 
 
 @app.middleware("http")
@@ -401,6 +405,15 @@ def root_javascript():
 @app.get("/api/health")
 def health():
     return {"code": 0, "message": "ok", "timestamp": now_iso()}
+
+
+@app.get("/api/mcp/status")
+def mcp_status(x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
+    """Expose only non-secret MCP readiness information to signed-in administrators."""
+    _actor, role = actor_context(x_user, x_role)
+    if role != "admin":
+        raise BusinessError(403, "AUTH-4030", "仅系统管理员可查看MCP服务状态")
+    return {"code": 0, "data": public_mcp_status()}
 
 
 @app.get("/api/meta")

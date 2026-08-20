@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from .db import connect, now_iso, row_to_dict
 from .rules import BusinessError, ROLE_LABELS
 from .auth import get_role_labels
+from .trm_mcp import public_mcp_status
 
 router = APIRouter(prefix="/api", tags=["V4完整平台能力"])
 
@@ -170,6 +171,11 @@ def init_v4_db():
         # 固定集成能力配置。AI运行时使用已核对的 G.AIOS 公共运行接口，
         # 默认调用已发布的 default 智能体；可在集成配置或环境变量中替换。
         now = now_iso()
+        public_base = os.getenv("TRM_PUBLIC_BASE_URL", "").rstrip("/")
+        if not public_base and os.getenv("RENDER_EXTERNAL_HOSTNAME"):
+            public_base = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
+        if not public_base:
+            public_base = "http://127.0.0.1:8000"
         for code, name, mode, base_url, agent_id, desc in [
             ("oa", "OA审批集成", "mock", "", "", "立项、需求、合同、结算审批待办推送与状态回写"),
             ("tapd", "TAPD需求集成", "mock", "", "", "终审后创建需求、Webhook/定时/手动回读"),
@@ -178,6 +184,12 @@ def init_v4_db():
                 os.getenv("TRM_AI_BASE_URL", "https://adk.gazellio.com"),
                 os.getenv("TRM_AI_AGENT_ID", "default"),
                 "项目360机器人、AI问答与悬浮助手统一接入 Gazellio G.AIOS",
+            ),
+            (
+                "mcp", "TRM MCP工具服务", "live",
+                f"{public_base}/mcp/",
+                "",
+                "供G.AIOS智能体查询TRM数据，并在用户确认后幂等创建项目或需求草稿",
             ),
         ]:
             conn.execute(
@@ -623,6 +635,14 @@ def check_integration(code: str, request: Request,
                 status, message, success = "正常", f"G.AIOS运行接口可达，智能体标识：{cfg['agent_id']}", 1
             except Exception as exc:
                 status, message, success = "异常", f"G.AIOS连通性检查失败：{str(exc)[:160]}", 0
+        elif code == "mcp":
+            state = public_mcp_status()
+            if not state["enabled"]:
+                status, message, success = "未配置", "MCP端点已封装，但未配置TRM_MCP_API_TOKEN", 0
+            elif not state["write_enabled"]:
+                status, message, success = "只读", "MCP鉴权已就绪，9个工具可发现；写操作开关当前关闭", 1
+            else:
+                status, message, success = "正常", "MCP鉴权与写操作已就绪，支持受控创建项目/需求", 1
         else:
             # 其他第三方系统没有提供只读健康端点时，不伪造真实调用成功。
             status, message, success = "待验证", "已配置Live地址；真实鉴权凭据由部署环境注入后执行连通性验证", 1

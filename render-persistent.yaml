@@ -19,3 +19,9 @@ services:
         value: /var/data/trm_system.db
       - key: TRM_UPLOAD_DIR
         value: /var/data/uploads
+      - key: TRM_MCP_API_TOKEN
+        sync: false
+      - key: TRM_MCP_WRITE_ENABLED
+        value: "false"
+      - key: TRM_MCP_ALLOWED_ORIGINS
+        value: https://adk.gazellio.com
