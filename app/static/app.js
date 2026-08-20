@@ -2,8 +2,10 @@ const state = {
   meta: null,
   v4meta: null,
   role: 'applicant',
-  actorId: 'lili11-ghq',
-  userDisplay: '李莉 lili11-ghq',
+  actorId: '',
+  userDisplay: '',
+  sessionToken: localStorage.getItem('trm_session') || '',
+  currentUserData: null,
   currentDemandId: null,
   pendingFiles: [],
   openGroups: new Set(),
@@ -83,14 +85,18 @@ function closeDrawer() {
 }
 
 function currentUser() {
-  return state.meta?.demoUsers?.[state.role] || { id: state.actorId, name: state.userDisplay, dept: '' };
+  if (state.currentUserData) return {
+    id: state.currentUserData.username,
+    name: `${state.currentUserData.display_name} ${state.currentUserData.username}`,
+    dept: state.currentUserData.department || ''
+  };
+  return { id: state.actorId, name: state.userDisplay, dept: '' };
 }
 
 function requestHeaders(extra = {}) {
   return {
     'Content-Type': 'application/json',
-    'X-Role': state.role,
-    'X-User': state.actorId,
+    ...(state.sessionToken ? { 'X-Session': state.sessionToken } : {}),
     ...extra
   };
 }
@@ -99,8 +105,7 @@ async function api(path, options = {}) {
   const opts = { ...options };
   if (options.body instanceof FormData) {
     opts.headers = {
-      'X-Role': state.role,
-      'X-User': state.actorId,
+      ...(state.sessionToken ? { 'X-Session': state.sessionToken } : {}),
       ...(options.headers || {})
     };
   } else {
@@ -114,6 +119,10 @@ async function api(path, options = {}) {
     data = {};
   }
   if (!response.ok) {
+    if (response.status === 401 && path !== '/api/auth/login') {
+      clearSession();
+      showLogin('登录已失效，请重新登录');
+    }
     const error = new Error(data.message || `请求失败 ${response.status}`);
     error.data = data;
     error.status = response.status;
@@ -132,8 +141,10 @@ function parseRoute() {
 }
 
 function navigate(path, query = {}) {
-  const group = routeGroup(String(path).split('/')[0]);
-  if (group) state.openGroups.add(group);
+  const base = String(path).split('/')[0];
+  const group = routeGroup(base);
+  state.openGroups = group ? new Set([group]) : new Set();
+  if (base === 'demand-form' && !query.id) { state.currentDemandId = null; state.pendingFiles = []; }
   const qs = new URLSearchParams();
   Object.entries(query).forEach(([key, value]) => {
     if (value !== undefined && value !== null && value !== '') qs.set(key, value);
@@ -346,27 +357,35 @@ async function loadNotifications(draw = false) {
   }
 }
 
+function hasPermission(permission) {
+  const permissions = state.currentUserData?.permissions || [];
+  return permissions.includes('*') || permissions.includes(permission);
+}
+
+function applyMenuPermissions() {
+  $$('[data-permission]').forEach((item) => {
+    item.classList.toggle('permission-hidden', !hasPermission(item.dataset.permission));
+  });
+  $$('.nav-group').forEach((group) => {
+    const children = $$('.nav-sub', group);
+    if (!children.length) return;
+    const visible = children.some((item) => !item.classList.contains('permission-hidden'));
+    group.classList.toggle('permission-hidden', !visible);
+  });
+}
+
 function updateUserUI() {
   const user = currentUser();
-  state.actorId = user.id;
-  state.userDisplay = user.name;
-  $('#userName').textContent = user.name;
-  $('#userRoleLabel').textContent = state.meta.roles[state.role];
-  $('#userAvatar').textContent = user.name.trim().slice(0, 1);
-  $('#roleOptions').innerHTML = Object.entries(state.meta.roles).map(([role, label]) => {
-    const info = state.meta.demoUsers[role];
-    return `<button class="role-option ${role === state.role ? 'active' : ''}" type="button" data-role="${role}"><strong>${esc(label)}</strong><small>${esc(info.name)}</small></button>`;
-  }).join('');
-  $$('.role-option').forEach((button) => button.addEventListener('click', async () => {
-    state.role = button.dataset.role;
-    updateUserUI();
-    $('#userMenu').classList.add('hidden');
-    $('#userTrigger').setAttribute('aria-expanded', 'false');
-    toast(`已切换身份：${state.meta.roles[state.role]}`, 'success');
-    await loadNotifications(false);
-    renderRoute();
-  }));
+  $('#userName').textContent = user.name || state.actorId;
+  $('#userRoleLabel').textContent = state.currentUserData?.role_label || state.meta?.roles?.[state.role] || state.role;
+  $('#userAvatar').textContent = (state.currentUserData?.display_name || state.actorId || 'U').trim().slice(0, 1);
+  $('#menuUserName').textContent = state.currentUserData?.display_name || '当前用户';
+  $('#menuUserDept').textContent = state.currentUserData?.department || '—';
+  $('#menuUsername').textContent = state.currentUserData?.username || '—';
+  $('#menuRole').textContent = state.currentUserData?.role_label || state.role;
+  applyMenuPermissions();
 }
+
 
 function routeGroup(base) {
   const groups = {
@@ -376,7 +395,7 @@ function routeGroup(base) {
     settlement: new Set(['settlement-form','settlement-approvals','settlement-list','settlement-detail']),
     indicator: new Set(['indicator-list','indicator-data','indicator-board']),
     contract: new Set(['contract-list','contract-detail','payment-plans','contract-approvals']),
-    system: new Set(['integrations','audit'])
+    system: new Set(['users','roles','integrations','audit'])
   };
   return Object.entries(groups).find(([, routes]) => routes.has(base))?.[0] || null;
 }
@@ -401,14 +420,14 @@ function bindShell() {
     const groupToggle = event.target.closest('[data-group-toggle]');
     if (groupToggle) {
       const name = groupToggle.dataset.groupToggle;
-      if (state.openGroups.has(name)) state.openGroups.delete(name); else state.openGroups.add(name);
+      state.openGroups = state.openGroups.has(name) ? new Set() : new Set([name]);
       updateNav(parseRoute().path);
       return;
     }
     const routeButton = event.target.closest('[data-route]');
     if (!routeButton) return;
     const group = routeButton.closest('.nav-group')?.dataset.group;
-    if (group) state.openGroups.add(group);
+    state.openGroups = group ? new Set([group]) : new Set();
     navigate(routeButton.dataset.route);
   });
 
@@ -438,14 +457,15 @@ function bindShell() {
     }
   });
 
+  $('#changePasswordBtn').addEventListener('click', openChangePassword);
+  $('#openProfileBtn').addEventListener('click', openAccountProfile);
+
   $('#logoutBtn').addEventListener('click', () => {
-    showModal(`<h3 id="modalTitle">退出登录</h3><div class="callout warn">当前部署使用本地演示账号体系；接入企业SSO后可替换为统一认证会话。</div><p>可以将当前演示身份重置为需求申请人并返回首页。</p><div class="modal-actions">${btn('取消', 'btn', 'cancelLogout')}${btn('重置并返回首页', 'btn primary', 'confirmLogout')}</div>`);
+    showModal(`<h3 id="modalTitle">退出登录</h3><p>确认退出当前账号？退出后需要重新输入账号和密码。</p><div class="modal-actions">${btn('取消', 'btn', 'cancelLogout')}${btn('确认退出', 'btn primary', 'confirmLogout')}</div>`);
     $('#cancelLogout').addEventListener('click', closeModal);
     $('#confirmLogout').addEventListener('click', async () => {
-      state.role = 'applicant';
-      updateUserUI();
-      closeModal();
-      navigate('dashboard');
+      try { await api('/api/auth/logout', { method: 'POST' }); } catch {}
+      clearSession(); closeModal(); showLogin();
     });
   });
 
@@ -455,24 +475,70 @@ function bindShell() {
   window.addEventListener('hashchange', renderRoute);
 }
 
-async function init() {
-  const [meta, v4meta] = await Promise.all([api('/api/meta'), api('/api/v4/meta')]);
-  state.meta = meta.data;
-  state.v4meta = v4meta.data;
-  updateUserUI();
-  bindShell();
-  await loadNotifications(false);
-  if (!location.hash) {
-    location.hash = '#/dashboard';
-  } else {
-    const initialGroup = routeGroup(parseRoute().path.split('/')[0]);
-    if (initialGroup) state.openGroups.add(initialGroup);
-    await renderRoute();
-  }
+function clearSession() {
+  state.sessionToken = ''; state.currentUserData = null; state.actorId = ''; state.userDisplay = ''; state.role = 'applicant';
+  localStorage.removeItem('trm_session');
 }
+
+function showLogin(message = '') {
+  $('#appShell').classList.add('hidden');
+  $('#loginScreen').classList.remove('hidden');
+  $('#loginError').textContent = message;
+  $('#loginError').classList.toggle('hidden', !message);
+  setTimeout(() => $('#loginUsername')?.focus(), 30);
+}
+
+function showApp() {
+  $('#loginScreen').classList.add('hidden');
+  $('#appShell').classList.remove('hidden');
+}
+
+async function rawLogin(username, password) {
+  const response = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.message || '登录失败');
+  return data.data;
+}
+
+function bindLogin() {
+  const submit = async () => {
+    const username = $('#loginUsername').value.trim(), password = $('#loginPassword').value;
+    if (!username || !password) { showLogin('请输入账号和密码'); return; }
+    $('#loginSubmit').disabled = true; $('#loginSubmit').textContent = '正在登录...';
+    try {
+      const result = await rawLogin(username, password);
+      state.sessionToken = result.token; localStorage.setItem('trm_session', result.token); state.currentUserData = result.user;
+      await bootstrapAuthenticatedApp();
+    } catch (error) { showLogin(error.message); }
+    finally { $('#loginSubmit').disabled = false; $('#loginSubmit').textContent = '登录系统'; }
+  };
+  $('#loginSubmit').addEventListener('click', submit);
+  ['loginUsername','loginPassword'].forEach(id => $('#'+id).addEventListener('keydown', e => { if (e.key === 'Enter') submit(); }));
+}
+
+async function bootstrapAuthenticatedApp() {
+  const me = (await api('/api/auth/me')).data;
+  state.currentUserData = me; state.actorId = me.username; state.userDisplay = `${me.display_name} ${me.username}`; state.role = me.role_code;
+  const [meta, v4meta] = await Promise.all([api('/api/meta'), api('/api/v4/meta')]);
+  state.meta = meta.data; state.v4meta = v4meta.data;
+  updateUserUI(); showApp();
+  await loadNotifications(false);
+  if (!location.hash || location.hash === '#/login') location.hash = '#/dashboard';
+  else { const initialGroup = routeGroup(parseRoute().path.split('/')[0]); state.openGroups = initialGroup ? new Set([initialGroup]) : new Set(); await renderRoute(); }
+}
+
+async function init() {
+  bindLogin(); bindShell();
+  if (!state.sessionToken) { showLogin(); return; }
+  try { await bootstrapAuthenticatedApp(); }
+  catch (error) { clearSession(); showLogin(error.message || '登录已失效，请重新登录'); }
+}
+
 
 async function renderRoute() {
   const route = parseRoute();
+  const routeActiveGroup = routeGroup(route.path.split('/')[0]);
+  state.openGroups = routeActiveGroup ? new Set([routeActiveGroup]) : new Set();
   updateNav(route.path);
   heroActions.innerHTML = '';
   appView.innerHTML = '<div class="empty">加载中...</div>';
@@ -513,6 +579,8 @@ async function renderRoute() {
       'contract-detail': () => renderContractDetail(Number(id)),
       'payment-plans': renderPaymentPlans,
       'contract-approvals': renderContractApprovals,
+      users: renderUsers,
+      roles: renderRoles,
       integrations: renderIntegrations,
       audit: renderAudit
     };
@@ -525,7 +593,7 @@ async function renderRoute() {
 }
 
 async function renderDashboard() {
-  setPage({ title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: `${btn(`${icon('plus')} 新建需求`, 'btn primary', 'dashNew')}${btn('导出汇总','btn','dashExport')}` });
+  setPage({ title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: `${hasPermission('demand.create')?btn(`${icon('plus')} 新建需求`, 'btn primary', 'dashNew'):''}${btn('导出汇总','btn','dashExport')}` });
   const [platformResp, demandResp, pendingResp, noteResp, tapdResp] = await Promise.all([
     api('/api/platform-dashboard'), api('/api/dashboard'), api('/api/approvals/pending'), api('/api/notifications'), api('/api/tapd/overview')
   ]);
@@ -548,7 +616,7 @@ async function renderDashboard() {
   <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">快捷入口</div><div class="quick-grid">${btn('新建立项','btn','quickIni')}${btn('新建需求','btn primary','quickDemand')}${btn('项目台账','btn','quickProject')}${btn('合同台账','btn','quickContract')}${btn('预算管理','btn','quickBudget')}${btn('TAPD同步中心','btn','quickTapd')}</div></div><div class="section"><div class="section-title">最近立项</div>${simpleTable(['立项编号','名称','状态','当前节点'],p.recent_initiatives.map(x=>[x.initiative_no,x.title,statusPill(x.status),x.current_node]))}</div></div>`;
   bindCommonDemandActions(appView);
   $$('.dash-approve').forEach(b=>b.addEventListener('click',()=>navigate(`approval/${b.dataset.id}`)));
-  $('#dashNew').addEventListener('click',()=>navigate('demand-form'));
+  if($('#dashNew'))$('#dashNew').addEventListener('click',()=>navigate('demand-form'));
   if ($('#dashExport')) $('#dashExport').addEventListener('click',()=>window.open('/api/exports/platform-summary.csv','_blank'));
   $('#quickDemand').addEventListener('click',()=>navigate('demand-form')); $('#quickIni').addEventListener('click',()=>navigate('initiative-form')); $('#quickProject').addEventListener('click',()=>navigate('project-list')); $('#quickContract').addEventListener('click',()=>navigate('contract-list')); $('#quickBudget').addEventListener('click',()=>navigate('budget')); $('#quickTapd').addEventListener('click',()=>navigate('tapd'));
 }
@@ -585,12 +653,13 @@ async function renderValueOverview() {
 async function renderDemandForm() {
   const route = parseRoute();
   const idFromQuery = Number(route.query.get('id') || 0);
-  if (idFromQuery) state.currentDemandId = idFromQuery;
-  let demand = state.currentDemandId ? (await api(`/api/demands/${state.currentDemandId}`)).data : null;
+  state.currentDemandId = idFromQuery || null;
+  if (!idFromQuery) state.pendingFiles = [];
+  let demand = idFromQuery ? (await api(`/api/demands/${idFromQuery}`)).data : null;
   const editable = !demand || ['草稿', '已驳回'].includes(demand.status);
   const allowed = ['applicant', 'admin'].includes(state.role);
   const actions = `${btn('保存草稿', 'btn', 'saveDraftTop', (!editable || !allowed) ? 'disabled' : '')}${btn('提交', 'btn primary', 'submitTop', (!editable || !allowed) ? 'disabled' : '')}`;
-  setPage({ title: '需求申请', iconName: 'demand', crumbs: ['需求申请'], actions });
+  setPage({ title: demand ? '编辑需求' : '新建需求', iconName: 'demand', crumbs: ['需求管理','需求列表'], actions });
 
   const user = currentUser();
   const priority = demand?.priority || '低';
@@ -827,7 +896,7 @@ async function submitDemand(demandId, confirmWarning = false) {
 }
 
 async function renderDemandList() {
-  setPage({ title: '需求查询', iconName: 'search', crumbs: ['需求管理'], actions: `${btn('导出当前结果','btn','exportDemandList')}${btn(`${icon('plus')} 新建需求`, 'btn primary', 'newDemandFromList')}` });
+  setPage({ title: '需求列表', iconName: 'search', crumbs: ['需求管理'], actions: `${btn('导出当前结果','btn','exportDemandList')}${hasPermission('demand.create')?btn(`${icon('plus')} 新建需求`, 'btn primary', 'newDemandFromList'):''}` });
   const route = parseRoute();
   const q = route.query.get('q') || '';
   const status = route.query.get('status') || '';
@@ -838,7 +907,7 @@ async function renderDemandList() {
     ${demandTable(result.items)}
   </div>`;
   bindCommonDemandActions(appView);
-  $('#newDemandFromList').addEventListener('click', () => { state.currentDemandId = null; navigate('demand-form'); });
+  if ($('#newDemandFromList')) $('#newDemandFromList').addEventListener('click', () => { state.currentDemandId = null; state.pendingFiles=[]; navigate('demand-form'); });
   $('#runDemandSearch').addEventListener('click', () => navigate('demand-list', { q: $('#demandSearch').value.trim(), status: $('#demandStatus').value }));
   $('#resetDemandSearch').addEventListener('click', () => navigate('demand-list'));
   $('#demandSearch').addEventListener('keydown', (event) => { if (event.key === 'Enter') $('#runDemandSearch').click(); });
@@ -850,7 +919,7 @@ function exportDemandCsv(items) {
   items.forEach((d) => rows.push([d.demand_no || '草稿', d.title, d.applicant, d.priority, d.status, d.budget_amount, d.estimated_amount, d.tapd_status || '']));
   const csv = '\ufeff' + rows.map((row) => row.map((cell) => `"${String(cell ?? '').replaceAll('"','""')}"`).join(',')).join('\n');
   const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-  const a = document.createElement('a'); a.href = url; a.download = `需求查询_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
+  const a = document.createElement('a'); a.href = url; a.download = `需求列表_${new Date().toISOString().slice(0,10)}.csv`; a.click(); URL.revokeObjectURL(url);
 }
 
 async function renderDemandDetail(id, query) {
@@ -1250,7 +1319,7 @@ async function renderInitiativeForm(){
   let item=id?(await api(`/api/initiatives/${id}`)).data:null;
   const budgets=(await api('/api/budget-ledger')).data;
   const projectTypes=state.v4meta?.project_types||['系统建设','智能化改造','基础设施','咨询服务','研发创新'];
-  setPage({title:'立项申请',iconName:'send',crumbs:['立项申请'],actions:`${btn('保存草稿','btn','iniSave')}${item?btn('删除草稿','btn danger','iniDelete'):''}${btn('提交审批','btn primary','iniSubmit',item&& !['草稿','已驳回'].includes(item.status)?'disabled':'')}`});
+  setPage({title:'新建立项',iconName:'send',crumbs:['立项管理','立项列表'],actions:`${btn('保存草稿','btn','iniSave')}${item?btn('删除草稿','btn danger','iniDelete'):''}${btn('提交审批','btn primary','iniSubmit',item&& !['草稿','已驳回'].includes(item.status)?'disabled':'')}`});
   appView.innerHTML=`<div class="section"><div class="section-title">立项基本信息</div>
     <div class="grid-3"><div><label>立项编号</label><input class="field" value="${esc(item?.initiative_no||'提交后自动生成')}" disabled></div><div><label>项目类型</label><select id="iniType" class="select">${projectTypes.map(x=>`<option ${x===item?.project_type?'selected':''}>${x}</option>`).join('')}</select></div><div><label>紧急程度</label><select id="iniUrgency" class="select">${['高','中','低'].map(x=>`<option ${x===(item?.urgency||'中')?'selected':''}>${x}</option>`).join('')}</select></div></div>
     <div class="form-row"><div class="label required">立项名称</div><input id="iniTitle" class="field" maxlength="100" value="${esc(item?.title||'')}"></div>
@@ -1275,22 +1344,22 @@ async function renderInitiativeForm(){
 }
 
 async function renderInitiativeList(){
-  setPage({title:'立项查询',iconName:'send',crumbs:['立项申请'],actions:btn(`${icon('plus')} 新建立项`,'btn primary','iniNew')});
+  setPage({title:'立项列表',iconName:'send',crumbs:['立项管理'],actions:hasPermission('initiative.create')?btn(`${icon('plus')} 新建立项`,'btn primary','iniNew'):''});
   const items=(await api('/api/initiatives')).data;
   appView.innerHTML=`<div class="section"><div class="toolbar"><input id="iniSearch" class="field" style="max-width:320px" placeholder="搜索立项编号/名称/申请人"><select id="iniStatus" class="select" style="max-width:180px"><option value="">全部状态</option>${['草稿','审批中','已通过','已驳回'].map(x=>`<option>${x}</option>`).join('')}</select></div><div class="table-wrap"><table class="table"><thead><tr><th>立项编号</th><th>立项名称</th><th>项目类型</th><th>申请人</th><th>预估预算</th><th>状态</th><th>当前节点</th><th>操作</th></tr></thead><tbody id="iniRows"></tbody></table></div></div>`;
   const draw=()=>{const q=$('#iniSearch').value.trim().toLowerCase(),st=$('#iniStatus').value;const rows=items.filter(x=>(!q||`${x.initiative_no} ${x.title} ${x.applicant}`.toLowerCase().includes(q))&&(!st||x.status===st));$('#iniRows').innerHTML=rows.map(x=>`<tr><td>${x.initiative_no}</td><td>${esc(x.title)}</td><td>${esc(x.project_type||'系统建设')}</td><td>${esc(x.applicant)}</td><td>¥${money(x.estimated_budget)}</td><td>${statusPill(x.status)}</td><td>${esc(x.current_node)}</td><td><button class="link iniView" data-id="${x.id}">详情</button>${['草稿','已驳回'].includes(x.status)?` <button class="link iniEdit" data-id="${x.id}">编辑</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="subtle">暂无匹配数据</td></tr>';$$('.iniView').forEach(b=>b.addEventListener('click',()=>navigate(`initiative-detail/${b.dataset.id}`)));$$('.iniEdit').forEach(b=>b.addEventListener('click',()=>navigate('initiative-form',{id:b.dataset.id})));};
-  $('#iniSearch').addEventListener('input',draw);$('#iniStatus').addEventListener('change',draw);$('#iniNew').addEventListener('click',()=>navigate('initiative-form'));draw();
+  $('#iniSearch').addEventListener('input',draw);$('#iniStatus').addEventListener('change',draw);if($('#iniNew'))$('#iniNew').addEventListener('click',()=>navigate('initiative-form'));draw();
 }
 async function renderInitiativeDetail(id){
   const x=(await api(`/api/initiatives/${id}`)).data;
   const actions=[];if(['草稿','已驳回'].includes(x.status))actions.push(btn('编辑','btn','iniEditDetail'));if(x.status==='已通过'&&['project_manager','admin'].includes(state.role))actions.push(btn('生成项目','btn primary','iniConvert'));
-  setPage({title:'立项详情',iconName:'send',crumbs:['立项申请','立项查询'],actions:actions.join('')});
+  setPage({title:'立项详情',iconName:'send',crumbs:['立项管理','立项列表'],actions:actions.join('')});
   appView.innerHTML=`<div class="grid-2"><div class="section"><div class="section-title">${esc(x.initiative_no)} · ${esc(x.title)}</div><div class="detail-grid"><div><span>项目类型</span><b>${esc(x.project_type||'系统建设')}</b></div><div><span>紧急程度</span><b>${esc(x.urgency||'中')}</b></div><div><span>申请人</span><b>${esc(x.applicant)}</b></div><div><span>所属部门</span><b>${esc(x.department)}</b></div><div><span>项目负责人</span><b>${esc(x.owner)}</b></div><div><span>Sponsor</span><b>${esc(x.sponsor||'—')}</b></div><div><span>预估预算</span><b>¥${money(x.estimated_budget)}</b></div><div><span>计划周期</span><b>${x.planned_start||'—'} ~ ${x.planned_end||'—'}</b></div><div><span>状态</span><b>${statusPill(x.status)}</b></div><div><span>当前节点</span><b>${esc(x.current_node)}</b></div></div></div><div class="section"><div class="section-title">审批记录</div>${approvalRecords(x.approvals)}</div></div>
   <div class="section" style="margin-top:12px"><div class="section-title">立项论证</div><div class="detail-block"><b>建设背景</b><p>${esc(x.background||'—')}</p><b>建设目标</b><p>${esc(x.objectives||'—')}</p><b>建设范围</b><p>${esc(x.scope||'—')}</p><b>预期收益</b><p>${esc(x.expected_benefit||'—')}</p><b>补充说明</b><p>${esc(x.description||'—')}</p></div></div>`;
   if($('#iniEditDetail'))$('#iniEditDetail').addEventListener('click',()=>navigate('initiative-form',{id}));
   if($('#iniConvert'))$('#iniConvert').addEventListener('click',async()=>{try{const r=await api(`/api/initiatives/${id}/convert-project`,{method:'POST'});toast(r.message,'success');navigate(`project-detail/${r.data.project_id}`);}catch(e){toast(e.message,'error')}});
 }
-async function renderInitiativeApprovals(){setPage({title:'立项审批',iconName:'approve',crumbs:['立项申请']});const items=(await api('/api/initiative-approvals/pending')).data;appView.innerHTML=`<div class="section"><div class="section-title">我的立项审批待办</div>${simpleTable(['立项编号','名称','预算','当前节点','操作'],items.map(x=>[x.initiative_no,esc(x.title),`¥${money(x.estimated_budget)}`,x.current_node,`<button class="link iniApprove" data-id="${x.id}">处理</button>`]))}</div>`;$$('.iniApprove').forEach(b=>b.addEventListener('click',async()=>{const x=(await api(`/api/initiatives/${b.dataset.id}`)).data;showModal(`<h3 id="modalTitle">${esc(x.current_node)}</h3><div class="callout">${esc(x.initiative_no)} · ${esc(x.title)} · ¥${money(x.estimated_budget)}</div><textarea id="iniComment" class="textarea" placeholder="审批意见"></textarea><div class="modal-actions">${btn('驳回','btn danger','iniReject')}${btn('通过','btn primary','iniPass')}</div>`);for(const [id,action] of [['iniReject','驳回'],['iniPass','通过']])$('#'+id).addEventListener('click',async()=>{await api(`/api/initiatives/${x.id}/approve`,{method:'POST',body:JSON.stringify({action,comment:$('#iniComment').value})});closeModal();toast(`已${action}`,'success');renderInitiativeApprovals();});}));}
+async function renderInitiativeApprovals(){setPage({title:'立项审批',iconName:'approve',crumbs:['立项管理']});const items=(await api('/api/initiative-approvals/pending')).data;appView.innerHTML=`<div class="section"><div class="section-title">我的立项审批待办</div>${simpleTable(['立项编号','名称','预算','当前节点','操作'],items.map(x=>[x.initiative_no,esc(x.title),`¥${money(x.estimated_budget)}`,x.current_node,`<button class="link iniApprove" data-id="${x.id}">处理</button>`]))}</div>`;$$('.iniApprove').forEach(b=>b.addEventListener('click',async()=>{const x=(await api(`/api/initiatives/${b.dataset.id}`)).data;showModal(`<h3 id="modalTitle">${esc(x.current_node)}</h3><div class="callout">${esc(x.initiative_no)} · ${esc(x.title)} · ¥${money(x.estimated_budget)}</div><textarea id="iniComment" class="textarea" placeholder="审批意见"></textarea><div class="modal-actions">${btn('驳回','btn danger','iniReject')}${btn('通过','btn primary','iniPass')}</div>`);for(const [id,action] of [['iniReject','驳回'],['iniPass','通过']])$('#'+id).addEventListener('click',async()=>{await api(`/api/initiatives/${x.id}/approve`,{method:'POST',body:JSON.stringify({action,comment:$('#iniComment').value})});closeModal();toast(`已${action}`,'success');renderInitiativeApprovals();});}));}
 
 async function renderProjectList(){setPage({title:'项目台账',iconName:'project',crumbs:['项目管理'],actions:['project_manager','admin'].includes(state.role)?btn(`${icon('plus')} 新建项目`,'btn primary','projectNew'):''});const items=(await api('/api/projects')).data;appView.innerHTML=`<div class="section"><div class="table-wrap"><table class="table"><thead><tr><th>项目编号</th><th>项目名称</th><th>项目经理</th><th>部门</th><th>预算</th><th>状态</th><th>进度</th><th>周期</th><th>操作</th></tr></thead><tbody>${items.map(x=>`<tr><td>${x.project_no}</td><td>${esc(x.name)}</td><td>${esc(x.manager)}</td><td>${esc(x.department)}</td><td>¥${money(x.total_budget)}</td><td>${statusPill(x.status)}</td><td>${progressCell(x.progress)}</td><td>${x.start_date||'—'} ~ ${x.end_date||'—'}</td><td><button class="link pView" data-id="${x.id}">项目详情</button></td></tr>`).join('')}</tbody></table></div></div>`;$$('.pView').forEach(b=>b.addEventListener('click',()=>navigate(`project-detail/${b.dataset.id}`)));if($('#projectNew'))$('#projectNew').addEventListener('click',()=>openProjectForm());}
 async function openProjectForm(item={}){const budgets=(await api('/api/budget-ledger')).data;showModal(`<h3 id="modalTitle">${item.id?'编辑':'新建'}项目</h3><div class="form-row"><div class="label required">项目名称</div><input id="pName" class="field" value="${esc(item.name||'')}"></div><div class="grid-2"><div><label>项目经理</label><input id="pManager" class="field" value="${esc(item.manager||'王卫嘉')}"></div><div><label>部门</label><input id="pDept" class="field" value="${esc(item.department||'数字化管理部')}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>关联预算</label><select id="pBudget" class="select"><option value="">请选择</option>${budgets.map(b=>`<option value="${b.id}" ${b.id===item.budget_id?'selected':''}>${esc(b.budget_no)} · ${esc(b.budget_name)}</option>`).join('')}</select></div><div><label>项目预算</label><input id="pTotal" type="number" class="field" value="${item.total_budget||0}"></div></div><div class="grid-3" style="margin-top:10px"><div><label>状态</label><select id="pStatus" class="select">${['规划中','实施中','暂停','已完成'].map(s=>`<option ${s===item.status?'selected':''}>${s}</option>`).join('')}</select></div><div><label>进度</label><input id="pProgress" type="number" min="0" max="100" class="field" value="${item.progress||0}"></div><div><label>开始日期</label><input id="pStart" type="date" class="field" value="${item.start_date||''}"></div></div><div style="margin-top:10px"><label>结束日期</label><input id="pEnd" type="date" class="field" value="${item.end_date||''}"></div><div style="margin-top:10px"><label>项目说明</label><textarea id="pDesc" class="textarea">${esc(item.description||'')}</textarea></div><div class="modal-actions">${btn('取消','btn','pCancel')}${btn('保存','btn primary','pSave')}</div>`);$('#pCancel').addEventListener('click',closeModal);$('#pSave').addEventListener('click',async()=>{const p={name:$('#pName').value,manager:$('#pManager').value,department:$('#pDept').value,budget_id:Number($('#pBudget').value)||null,total_budget:Number($('#pTotal').value),status:$('#pStatus').value,progress:Number($('#pProgress').value),start_date:$('#pStart').value||null,end_date:$('#pEnd').value||null,description:$('#pDesc').value};const r=await api(item.id?`/api/projects/${item.id}`:'/api/projects',{method:item.id?'PUT':'POST',body:JSON.stringify(p)});closeModal();toast(r.message,'success');renderProjectList();});}
@@ -1352,6 +1421,61 @@ async function renderContractDetail(id){
 async function openPaymentForm(contractId,item={}){showModal(`<h3 id="modalTitle">${item.id?'编辑':'新增'}付款计划</h3><div class="grid-2"><input id="payType" class="field" placeholder="付款类型，如里程碑款" value="${esc(item.payment_type||'')}"><input id="payAmount" type="number" class="field" placeholder="金额" value="${item.amount||0}"></div><div class="grid-2" style="margin-top:10px"><input id="payDate" type="date" class="field" value="${item.planned_date||''}"><select id="payStatus" class="select">${['待支付','已支付','延期'].map(v=>`<option ${v===item.status?'selected':''}>${v}</option>`).join('')}</select></div><input id="payActual" type="date" class="field" style="margin-top:10px" value="${item.actual_date||''}"><input id="payDesc" class="field" style="margin-top:10px" placeholder="说明" value="${esc(item.description||'')}"><div class="modal-actions">${btn('取消','btn','payCancel')}${btn('保存','btn primary','paySave')}</div>`);$('#payCancel').addEventListener('click',closeModal);$('#paySave').addEventListener('click',async()=>{try{const payload={payment_type:$('#payType').value,amount:Number($('#payAmount').value),planned_date:$('#payDate').value||null,actual_date:$('#payActual').value||null,status:$('#payStatus').value,description:$('#payDesc').value};await api(item.id?`/api/payment-plans/${item.id}`:`/api/contracts/${contractId}/payments`,{method:item.id?'PUT':'POST',body:JSON.stringify(payload)});closeModal();renderContractDetail(contractId);}catch(e){toast(e.message,'error')}});}
 async function renderPaymentPlans(){setPage({title:'收付款计划',iconName:'contract',crumbs:['合同管理']});const contracts=(await api('/api/contracts')).data;const details=await Promise.all(contracts.map(x=>api(`/api/contracts/${x.id}`)));const rows=[];details.forEach((r,i)=>r.data.payments.forEach(p=>rows.push([contracts[i].contract_no,esc(contracts[i].name),p.plan_no,p.payment_type,`¥${money(p.amount)}`,p.planned_date||'—',p.actual_date||'—',statusPill(p.status)])));appView.innerHTML=`<div class="section">${simpleTable(['合同编号','合同名称','计划编号','类型','金额','计划日期','实际日期','状态'],rows)}</div>`;}
 async function renderContractApprovals(){setPage({title:'合同审批',iconName:'approve',crumbs:['合同管理']});const items=(await api('/api/contract-approvals/pending')).data;appView.innerHTML=`<div class="section"><div class="section-title">我的合同审批待办</div>${simpleTable(['合同编号','合同名称','供应商','金额','当前节点','操作'],items.map(x=>[x.contract_no,esc(x.name),esc(x.supplier),`¥${money(x.total_amount)}`,x.current_node,`<button class="link cApprove" data-id="${x.id}">处理</button>`]))}</div>`;$$('.cApprove').forEach(b=>b.addEventListener('click',()=>openGenericApproval('合同',b.dataset.id,`/api/contracts/${b.dataset.id}/approve`,renderContractApprovals)));}
+
+
+function openAccountProfile() {
+  const u = state.currentUserData || {};
+  showModal(`<h3 id="modalTitle">账号信息</h3>
+    <div class="profile-card"><div class="profile-avatar">${esc((u.display_name||u.username||'U').slice(0,1))}</div><div><strong>${esc(u.display_name||'—')}</strong><p>${esc(u.username||'—')} · ${esc(u.role_label||'—')}</p></div></div>
+    <div class="detail-grid"><div><span>所属部门</span><b>${esc(u.department||'—')}</b></div><div><span>邮箱</span><b>${esc(u.email||'—')}</b></div><div><span>手机</span><b>${esc(u.phone||'—')}</b></div><div><span>账号状态</span><b>正常</b></div></div>
+    <div class="modal-actions">${btn('关闭','btn primary','profileClose')}</div>`);
+  $('#profileClose').addEventListener('click', closeModal);
+}
+
+function openChangePassword() {
+  showModal(`<h3 id="modalTitle">修改密码</h3><div class="form-stack">
+    <div><label>原密码</label><input id="oldPwd" class="field" type="password" autocomplete="current-password"></div>
+    <div><label>新密码</label><input id="newPwd" class="field" type="password" autocomplete="new-password" placeholder="至少8位"></div>
+    <div><label>确认新密码</label><input id="confirmPwd" class="field" type="password" autocomplete="new-password"></div>
+    </div><div class="modal-actions">${btn('取消','btn','pwdCancel')}${btn('确认修改','btn primary','pwdSave')}</div>`);
+  $('#pwdCancel').addEventListener('click', closeModal);
+  $('#pwdSave').addEventListener('click', async () => {
+    const next = $('#newPwd').value;
+    if (next.length < 8) return toast('新密码至少8位','error');
+    if (next !== $('#confirmPwd').value) return toast('两次输入的新密码不一致','error');
+    try { const r = await api('/api/auth/change-password',{method:'POST',body:JSON.stringify({old_password:$('#oldPwd').value,new_password:next})}); closeModal(); toast(r.message,'success'); }
+    catch(e){ toast(e.message,'error'); }
+  });
+}
+
+async function renderUsers(){
+  setPage({title:'用户管理',iconName:'user',crumbs:['系统管理'],actions:btn(`${icon('plus')} 新增用户`,'btn primary','userNew')});
+  const [usersResp,rolesResp]=await Promise.all([api('/api/system/users'),api('/api/system/roles')]);
+  const users=usersResp.data,roles=rolesResp.data.filter(r=>r.status==='启用');
+  appView.innerHTML=`<div class="section"><div class="toolbar"><div class="filters"><input id="userSearch" class="field" style="max-width:300px" placeholder="账号 / 姓名 / 部门"><select id="userRoleFilter" class="select" style="max-width:190px"><option value="">全部角色</option>${roles.map(r=>`<option value="${esc(r.code)}">${esc(r.label)}</option>`).join('')}</select><select id="userStatusFilter" class="select" style="max-width:140px"><option value="">全部状态</option><option>启用</option><option>停用</option></select></div><div class="subtle">共 ${users.length} 个账号</div></div>
+  <div class="table-wrap"><table class="table"><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>角色</th><th>联系方式</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody id="userRows"></tbody></table></div></div>`;
+  const draw=()=>{const q=$('#userSearch').value.trim().toLowerCase(),role=$('#userRoleFilter').value,st=$('#userStatusFilter').value;const rows=users.filter(u=>(!q||`${u.username} ${u.display_name} ${u.department}`.toLowerCase().includes(q))&&(!role||u.role_code===role)&&(!st||u.status===st));$('#userRows').innerHTML=rows.map(u=>`<tr><td><span class="detail-no">${esc(u.username)}</span></td><td>${esc(u.display_name)}</td><td>${esc(u.department||'—')}</td><td>${esc(u.role_label)}</td><td><div>${esc(u.email||'—')}</div><div class="subtle">${esc(u.phone||'')}</div></td><td>${statusPill(u.status)}</td><td>${esc(u.last_login||'从未登录')}</td><td><div class="action-group"><button class="link userEdit" data-id="${u.id}">编辑</button><button class="link userReset" data-id="${u.id}">重置密码</button></div></td></tr>`).join('')||'<tr><td colspan="8" class="empty">暂无匹配账号</td></tr>';$$('.userEdit').forEach(b=>b.addEventListener('click',()=>openUserForm(users.find(u=>u.id===Number(b.dataset.id)),roles)));$$('.userReset').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('确认将该账号密码重置为系统演示初始密码？'))return;try{const r=await api(`/api/system/users/${b.dataset.id}/reset-password`,{method:'POST'});toast(r.message,'success');}catch(e){toast(e.message,'error')}}));};
+  ['userSearch','userRoleFilter','userStatusFilter'].forEach(id=>$('#'+id).addEventListener(id==='userSearch'?'input':'change',draw));$('#userNew').addEventListener('click',()=>openUserForm(null,roles));draw();
+}
+
+function openUserForm(item,roles){
+  const isEdit=Boolean(item);
+  showModal(`<h3 id="modalTitle">${isEdit?'编辑用户':'新增用户'}</h3><div class="grid-2"><div><label>登录账号 *</label><input id="uUsername" class="field" value="${esc(item?.username||'')}" ${item?.username==='admin'?'disabled':''}></div><div><label>姓名 *</label><input id="uDisplay" class="field" value="${esc(item?.display_name||'')}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>所属部门</label><input id="uDept" class="field" value="${esc(item?.department||'')}"></div><div><label>角色 *</label><select id="uRole" class="select">${roles.map(r=>`<option value="${esc(r.code)}" ${r.code===item?.role_code?'selected':''}>${esc(r.label)}</option>`).join('')}</select></div></div><div class="grid-2" style="margin-top:10px"><div><label>邮箱</label><input id="uEmail" class="field" value="${esc(item?.email||'')}"></div><div><label>手机</label><input id="uPhone" class="field" value="${esc(item?.phone||'')}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>账号状态</label><select id="uStatus" class="select"><option ${item?.status!=='停用'?'selected':''}>启用</option><option ${item?.status==='停用'?'selected':''}>停用</option></select></div><div><label>${isEdit?'新密码（留空不修改）':'初始密码'}</label><input id="uPassword" class="field" type="password" placeholder="${isEdit?'留空保持原密码':'默认 Demo@123'}"></div></div><div class="modal-actions">${btn('取消','btn','uCancel')}${btn('保存','btn primary','uSave')}</div>`);
+  $('#uCancel').addEventListener('click',closeModal);$('#uSave').addEventListener('click',async()=>{const payload={username:(item?.username==='admin'?'admin':$('#uUsername').value.trim()),display_name:$('#uDisplay').value.trim(),department:$('#uDept').value,email:$('#uEmail').value,phone:$('#uPhone').value,role_code:$('#uRole').value,status:$('#uStatus').value,password:$('#uPassword').value||null};if(!payload.username||!payload.display_name)return toast('请填写账号和姓名','error');try{const r=await api(isEdit?`/api/system/users/${item.id}`:'/api/system/users',{method:isEdit?'PUT':'POST',body:JSON.stringify(payload)});closeModal();toast(r.message,'success');renderUsers();}catch(e){toast(e.message,'error')}});
+}
+
+async function renderRoles(){
+  setPage({title:'角色管理',iconName:'settings',crumbs:['系统管理'],actions:btn(`${icon('plus')} 新增角色`,'btn primary','roleNew')});
+  const [rolesResp,permResp]=await Promise.all([api('/api/system/roles'),api('/api/system/permissions')]);const roles=rolesResp.data,permissions=permResp.data;
+  appView.innerHTML=`<div class="section"><div class="section-title">角色与权限</div><div class="section-subtitle">角色权限决定登录后可见的功能菜单；内置审批角色同时用于需求和立项审批节点匹配。</div><div class="role-card-grid">${roles.map(r=>`<div class="role-card"><div class="toolbar"><div><strong>${esc(r.label)}</strong><div class="subtle">${esc(r.code)}</div></div>${statusPill(r.status)}</div><p>${esc(r.description||'—')}</p><div class="role-card-meta"><span>用户数 <b>${r.user_count}</b></span><span>权限 <b>${r.permissions.includes('*')?'全部':r.permissions.length}</b></span><span>${r.built_in?'系统内置':'自定义'}</span></div><button class="btn roleEdit" data-code="${esc(r.code)}">配置权限</button></div>`).join('')}</div></div>`;
+  $$('.roleEdit').forEach(b=>b.addEventListener('click',()=>openRoleForm(roles.find(r=>r.code===b.dataset.code),permissions)));$('#roleNew').addEventListener('click',()=>openRoleForm(null,permissions));
+}
+
+function openRoleForm(item,permissions){
+  const edit=Boolean(item),selected=new Set(item?.permissions||[]),all=selected.has('*');
+  showModal(`<h3 id="modalTitle">${edit?'配置角色':'新增角色'}</h3><div class="grid-2"><div><label>角色编码 *</label><input id="rCode" class="field" value="${esc(item?.code||'')}" ${edit?'disabled':''} placeholder="如 reviewer"></div><div><label>角色名称 *</label><input id="rLabel" class="field" value="${esc(item?.label||'')}"></div></div><div style="margin-top:10px"><label>角色说明</label><textarea id="rDesc" class="textarea">${esc(item?.description||'')}</textarea></div><div class="grid-2" style="margin-top:10px"><div><label>状态</label><select id="rStatus" class="select"><option ${item?.status!=='停用'?'selected':''}>启用</option><option ${item?.status==='停用'?'selected':''}>停用</option></select></div><label class="permission-all"><input id="rAll" type="checkbox" ${all?'checked':''}> 授予全部功能权限</label></div><div class="permission-grid" id="permissionGrid">${Object.entries(permissions).map(([code,label])=>`<label><input type="checkbox" class="permCheck" value="${esc(code)}" ${all||selected.has(code)?'checked':''} ${all?'disabled':''}><span>${esc(label)}</span><small>${esc(code)}</small></label>`).join('')}</div><div class="modal-actions">${btn('取消','btn','rCancel')}${btn('保存','btn primary','rSave')}</div>`,true);
+  $('#rAll').addEventListener('change',e=>$$('.permCheck').forEach(c=>{c.disabled=e.target.checked;c.checked=e.target.checked;}));$('#rCancel').addEventListener('click',closeModal);$('#rSave').addEventListener('click',async()=>{const perms=$('#rAll').checked?['*']:$$('.permCheck:checked').map(c=>c.value);const payload={code:edit?item.code:$('#rCode').value.trim(),label:$('#rLabel').value.trim(),description:$('#rDesc').value,permissions:perms,status:$('#rStatus').value};if(!payload.code||!payload.label)return toast('请填写角色编码和名称','error');try{const r=await api(edit?`/api/system/roles/${encodeURIComponent(item.code)}`:'/api/system/roles',{method:edit?'PUT':'POST',body:JSON.stringify(payload)});closeModal();toast(r.message,'success');if(item?.code===state.role){state.currentUserData=(await api('/api/auth/me')).data;updateUserUI();}renderRoles();}catch(e){toast(e.message,'error')}});
+}
 
 async function renderIntegrations(){
   setPage({title:'集成配置',iconName:'settings',crumbs:['系统管理']});const items=(await api('/api/integrations')).data;appView.innerHTML=`<div class="grid-3">${items.map(x=>`<div class="metric"><div class="toolbar"><div><div class="k">${esc(x.code.toUpperCase())}</div><div class="v" style="font-size:17px">${esc(x.name)}</div></div>${statusPill(x.enabled?x.status:'停用')}</div><div class="sub">模式：${esc(x.mode)} · ${x.base_url?esc(x.base_url):'本地适配器'}</div><div class="sub" style="margin-top:6px">${esc(x.description)}</div><div class="action-group" style="margin-top:12px"><button class="btn intCheck" data-code="${x.code}">连通性检查</button>${state.role==='admin'?`<button class="btn primary intEdit" data-code="${x.code}">配置</button>`:''}</div></div>`).join('')}</div><div class="section" style="margin-top:12px"><div class="section-title">集成运行说明</div><div class="detail-block"><p>Mock 模式使用系统内置适配器，所有创建、审批、回读、错误码、重试与审计链路均实际执行并落库；Live 模式用于部署时接入真实 OA、TAPD 或 AI 服务地址，不会在缺少凭据时伪造第三方成功结果。</p></div></div>`;$$('.intCheck').forEach(b=>b.addEventListener('click',async()=>{try{const r=await api(`/api/integrations/${b.dataset.code}/check`,{method:'POST'});toast(r.message,'success');renderIntegrations();}catch(e){toast(e.message,'error')}}));$$('.intEdit').forEach(b=>b.addEventListener('click',()=>{const x=items.find(i=>i.code===b.dataset.code);showModal(`<h3 id="modalTitle">配置 ${esc(x.name)}</h3><div class="grid-2"><select id="intMode" class="select"><option ${x.mode==='mock'?'selected':''}>mock</option><option ${x.mode==='live'?'selected':''}>live</option></select><select id="intEnabled" class="select"><option value="1" ${x.enabled?'selected':''}>启用</option><option value="0" ${!x.enabled?'selected':''}>停用</option></select></div><input id="intUrl" class="field" style="margin-top:10px" value="${esc(x.base_url||'')}" placeholder="Live模式服务地址"><div class="modal-actions">${btn('取消','btn','intCancel')}${btn('保存','btn primary','intSave')}</div>`);$('#intCancel').addEventListener('click',closeModal);$('#intSave').addEventListener('click',async()=>{try{await api(`/api/integrations/${x.code}`,{method:'PUT',body:JSON.stringify({mode:$('#intMode').value,base_url:$('#intUrl').value,enabled:$('#intEnabled').value==='1'})});closeModal();renderIntegrations();}catch(e){toast(e.message,'error')}});}));

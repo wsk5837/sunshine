@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from .db import connect, now_iso, row_to_dict
 from .rules import APPROVAL_FLOW, BusinessError, ROLE_LABELS, TAPD_STATUS_MAP
+from .auth import get_role_labels
 
 router = APIRouter(prefix="/api", tags=["POC完整能力"])
 
@@ -52,7 +53,7 @@ def _now_dt():
 
 def _actor(x_user: Optional[str], x_role: Optional[str]):
     role = x_role or "applicant"
-    if role not in ROLE_LABELS:
+    if role not in get_role_labels():
         raise BusinessError(403, "AUTH-4030", "无效角色或无权限")
     return x_user or "lili11-ghq", role
 

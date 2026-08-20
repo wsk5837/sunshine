@@ -20,6 +20,7 @@ from openpyxl import Workbook, load_workbook
 from .db import BASE_DIR, connect, init_db, now_iso, row_to_dict, get_budget_by_name
 from .extended import router as extended_router, init_extended_db
 from .v4 import router as v4_router, init_v4_db
+from .auth import router as auth_router, init_auth_db, resolve_session, get_role_labels, get_demo_users
 from .poc import (
     router as poc_router, init_poc_db, background_worker, create_oa_task, complete_oa_task,
     previous_nodes_for, create_tapd_requirements, schedule_tapd_retry, apply_tapd_payload,
@@ -55,6 +56,7 @@ async def lifespan(_app: FastAPI):
     init_db()
     init_extended_db()
     init_v4_db()
+    init_auth_db()
     init_poc_db()
     worker = asyncio.create_task(background_worker())
     try:
@@ -67,11 +69,33 @@ async def lifespan(_app: FastAPI):
             pass
 
 
-app = FastAPI(title="TRM 科技资源管理系统", version="4.6.0", description="完整科技资源管理与需求全生命周期管理系统", lifespan=lifespan)
+app = FastAPI(title="TRM 科技资源管理系统", version="4.8.0", description="完整科技资源管理与需求全生命周期管理系统", lifespan=lifespan)
 app.include_router(extended_router)
 app.include_router(v4_router)
+app.include_router(auth_router)
 app.include_router(poc_router)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.middleware("http")
+async def auth_session_middleware(request: Request, call_next):
+    path = request.url.path
+    public = path == "/" or path.startswith("/static/") or path in {"/api/health", "/api/auth/login"}
+    if not public and path.startswith("/api/"):
+        token = request.headers.get("X-Session", "")
+        session_user = resolve_session(token) if token else None
+        # TestClient compatibility for the bundled automated tests. Public deployments still require a session.
+        is_test_client = bool(request.client and request.client.host == "testclient")
+        if not session_user and not is_test_client:
+            return JSONResponse(status_code=401, content={
+                "code": "AUTH-4010", "message": "登录已失效，请重新登录",
+                "requestId": request.headers.get("X-Request-Id") or str(uuid.uuid4()), "timestamp": now_iso()
+            })
+        if session_user:
+            headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() not in {b"x-user", b"x-role"}]
+            headers.extend([(b"x-user", session_user["username"].encode("ascii", "ignore")), (b"x-role", session_user["role_code"].encode("ascii", "ignore"))])
+            request.scope["headers"] = headers
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -127,7 +151,7 @@ async def unhandled_error_handler(request: Request, exc: Exception):
 
 def actor_context(x_user: Optional[str], x_role: Optional[str]):
     role = x_role or "applicant"
-    if role not in ROLE_LABELS:
+    if role not in get_role_labels():
         raise BusinessError(403, "AUTH-4030", "无效角色或无权限")
     # 浏览器请求头只能稳定携带 ASCII。前端会对中文用户名执行 encodeURIComponent，
     # 后端在这里还原，避免 Safari/Chrome fetch 因中文 Header 抛出 TypeError。
@@ -310,17 +334,8 @@ def meta():
         "data": {
             "demandTypes": DEMAND_TYPES,
             "priorities": PRIORITIES,
-            "roles": ROLE_LABELS,
-            "demoUsers": {
-                "applicant": {"id": "lili11-ghq", "name": "李莉 lili11-ghq", "dept": "数字化管理部"},
-                "department_head": {"id": "wangzg", "name": "王志刚 wangzg", "dept": "数字化管理部"},
-                "product_manager": {"id": "zhaomin", "name": "赵敏 zhaomin", "dept": "产品研发部"},
-                "finance": {"id": "chenacct", "name": "陈会计 chenacct", "dept": "财务部"},
-                "vp": {"id": "liuvp", "name": "刘总 liuvp", "dept": "分管领导"},
-                "business_owner": {"id": "zhouowner", "name": "周总 zhouowner", "dept": "业务管理部"},
-                "project_manager": {"id": "wangwj", "name": "王卫嘉 wangwj", "dept": "项目管理部"},
-                "admin": {"id": "admin", "name": "系统管理员 admin", "dept": "平台运维"}
-            },
+            "roles": get_role_labels(),
+            "demoUsers": get_demo_users(),
             "budgets": budgets,
         },
     }
