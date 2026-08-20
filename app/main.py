@@ -18,9 +18,10 @@ from pydantic import BaseModel, Field
 from openpyxl import Workbook, load_workbook
 
 from .db import BASE_DIR, connect, init_db, now_iso, row_to_dict, get_budget_by_name
-from .extended import router as extended_router, init_extended_db
+from .extended import router as extended_router, init_extended_db, project_detail
 from .v4 import router as v4_router, init_v4_db
 from .auth import router as auth_router, init_auth_db, resolve_session, get_role_labels, get_demo_users
+from .ai_gateway import AIServiceError, public_ai_config, run_agent_message
 from .poc import (
     router as poc_router, init_poc_db, background_worker, create_oa_task, complete_oa_task,
     previous_nodes_for, create_tapd_requirements, schedule_tapd_retry, apply_tapd_payload,
@@ -69,7 +70,7 @@ async def lifespan(_app: FastAPI):
             pass
 
 
-app = FastAPI(title="TRM 科技资源管理系统", version="4.8.0", description="完整科技资源管理与需求全生命周期管理系统", lifespan=lifespan)
+app = FastAPI(title="TRM 科技资源管理系统", version="4.9.0", description="完整科技资源管理、需求全生命周期与AI智能体集成系统", lifespan=lifespan)
 app.include_router(extended_router)
 app.include_router(v4_router)
 app.include_router(auth_router)
@@ -313,11 +314,88 @@ class AllocationPayload(BaseModel):
 
 class AIQueryPayload(BaseModel):
     question: str
+    session_id: str = Field(default="", max_length=200)
+    project_id: Optional[int] = None
+    source: str = Field(default="assistant", max_length=40)
+
+
+def build_ai_fact_context(question: str, role: str, project_id: Optional[int] = None) -> str:
+    """构建受控、紧凑的系统事实快照，供外部智能体回答业务问题。"""
+    facts: dict[str, Any] = {
+        "data_scope": "当前TRM业务数据库只读快照",
+        "current_role": ROLE_LABELS.get(role, role),
+    }
+    if project_id:
+        detail = project_detail(project_id)["data"]
+        facts["selected_project"] = {
+            key: detail.get(key)
+            for key in (
+                "id", "project_no", "name", "manager", "department", "status", "health",
+                "progress", "start_date", "end_date", "description", "total_budget",
+            )
+        }
+        facts["budget"] = detail.get("budget")
+        facts["tasks"] = detail.get("tasks", [])[:100]
+        facts["milestones"] = detail.get("milestones", [])[:60]
+        facts["demands"] = [
+            {key: item.get(key) for key in (
+                "id", "demand_no", "title", "demand_type", "priority", "status",
+                "current_node", "estimated_amount", "estimated_hours", "actual_hours",
+                "tapd_id", "tapd_status", "planned_online_date",
+            )}
+            for item in detail.get("demands", [])[:100]
+        ]
+        facts["contracts"] = detail.get("contracts", [])[:50]
+        facts["settlements"] = detail.get("settlements", [])[:50]
+        facts["business_values"] = detail.get("values", [])[:50]
+    else:
+        with connect() as conn:
+            demand_rows = conn.execute("SELECT * FROM demands ORDER BY id DESC LIMIT 80").fetchall()
+            demands = [dict(row) for row in demand_rows]
+            req_match = re.search(r"REQ-\d{8}-\d{4}", question.upper())
+            if req_match:
+                target_row = conn.execute(
+                    "SELECT * FROM demands WHERE UPPER(demand_no)=?",
+                    (req_match.group(0),),
+                ).fetchone()
+                if target_row:
+                    target = demand_dict(conn, target_row)
+                    facts["matched_demand"] = target
+            facts["recent_demands"] = [
+                {key: item.get(key) for key in (
+                    "id", "demand_no", "title", "demand_type", "priority", "applicant",
+                    "applicant_dept", "status", "current_node", "budget_sources",
+                    "estimated_amount", "estimated_hours", "actual_hours", "tapd_id",
+                    "tapd_status", "planned_online_date", "created_at", "submitted_at",
+                )}
+                for item in demands[:30]
+            ]
+            facts["budgets"] = [dict(row) for row in conn.execute(
+                "SELECT budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year FROM budgets ORDER BY year DESC,id LIMIT 30"
+            )]
+            facts["projects"] = [dict(row) for row in conn.execute(
+                "SELECT id,project_no,name,manager,department,total_budget,status,progress,start_date,end_date FROM projects ORDER BY updated_at DESC LIMIT 30"
+            )]
+
+    serialized = json.dumps(facts, ensure_ascii=False, default=str)
+    # 防止异常数据量放大模型输入；优先保留前部的项目/命中需求与核心概况。
+    return serialized[:60000]
 
 
 @app.get("/")
 def root():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/app.css", include_in_schema=False)
+def root_stylesheet():
+    """兼容 index.html 的相对资源路径和直接访问根页面。"""
+    return FileResponse(STATIC_DIR / "app.css", media_type="text/css")
+
+
+@app.get("/app.js", include_in_schema=False)
+def root_javascript():
+    return FileResponse(STATIC_DIR / "app.js", media_type="application/javascript")
 
 
 @app.get("/api/health")
@@ -926,6 +1004,71 @@ def audit_logs(page: int = 1, page_size: int = 50):
     return {"code":0,"data":[dict(r) for r in rows]}
 
 
+@app.get("/api/ai/config")
+def ai_runtime_config():
+    """前端只读取非敏感运行状态，不返回任何后台账号或管理凭据。"""
+    try:
+        config = public_ai_config()
+    except AIServiceError as exc:
+        raise BusinessError(500, "AI-5001", str(exc)) from exc
+    return {"code": 0, "data": config}
+
+
+@app.post("/api/ai/chat")
+async def ai_chat(
+    payload: AIQueryPayload,
+    request: Request,
+    x_user: Optional[str] = Header(None),
+    x_role: Optional[str] = Header(None),
+):
+    """统一智能体入口：AI问答页、项目360机器人和悬浮助手共同使用。"""
+    question = (payload.question or "").strip()
+    if not question:
+        raise BusinessError(400, "REQ-4002", "AI问答内容不能为空")
+    if len(question) > MAX_AI_LEN:
+        raise BusinessError(400, "REQ-4003", "AI问答单次问题不能超过1000个字符")
+    actor, role = actor_context(x_user, x_role)
+    context = build_ai_fact_context(question, role, payload.project_id)
+    business_type = "project360" if payload.project_id else "assistant"
+    business_id = str(payload.project_id or "")
+    try:
+        result = await run_agent_message(
+            question=question,
+            user_id=actor,
+            session_id=payload.session_id,
+            context=context,
+            source=payload.source or business_type,
+        )
+    except AIServiceError as exc:
+        with connect() as conn:
+            conn.execute(
+                """INSERT INTO integration_logs(integration_code,direction,business_type,business_id,success,message,request_id,created_at)
+                   VALUES ('ai','out',?,?,0,?,?,?)""",
+                (business_type, business_id, str(exc)[:500], getattr(request.state, "request_id", ""), now_iso()),
+            )
+            audit(
+                conn, request, actor, role, "调用AI智能体", "ai_session", payload.session_id or "new",
+                result="失败", details={"source": payload.source, "project_id": payload.project_id, "error": str(exc)[:300]},
+            )
+        raise BusinessError(502, "AI-5020", str(exc)) from exc
+
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO integration_logs(integration_code,direction,business_type,business_id,success,message,request_id,created_at)
+               VALUES ('ai','out',?,?,1,?,?,?)""",
+            (business_type, business_id, f"智能体 {result['agent_id']} 调用成功", getattr(request.state, "request_id", ""), now_iso()),
+        )
+        audit(
+            conn, request, actor, role, "调用AI智能体", "ai_session", result.get("session_id") or "new",
+            details={"source": payload.source, "project_id": payload.project_id, "agent_id": result["agent_id"]},
+        )
+    return {
+        "code": 0,
+        "message": "智能体回答成功",
+        "data": {**result, "scope": "当前账号可访问的TRM系统事实数据", "role": ROLE_LABELS.get(role, role)},
+    }
+
+
 @app.post("/api/ai/query")
 def ai_query(payload: AIQueryPayload, x_role: Optional[str] = Header(None)):
     q = (payload.question or "").strip()
@@ -1056,4 +1199,3 @@ def ai_query(payload: AIQueryPayload, x_role: Optional[str] = Header(None)):
         else:
             answer = "我可以基于系统数据回答五类POC问题：单条需求完整信息、项目批量需求状态与工时统计、部门月度/季度预算执行趋势、需求当前环节与预计完成时间、历史处理方式与平均交付周期。"
     return {"code": 0, "data": {"answer": answer, "scope": "系统事实数据", "role": ROLE_LABELS.get(role, role)}}
-

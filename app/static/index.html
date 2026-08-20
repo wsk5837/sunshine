@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="light" />
   <title>TRM 科技资源管理系统 - 需求全生命周期管理</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="./app.css" />
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -124,10 +124,31 @@
     <div id="notificationList" class="notification-list"></div>
   </aside>
 
+  <section class="ai-float-widget hidden" id="aiAssistantWidget" aria-label="TRM AI助手">
+    <aside class="ai-float-panel hidden" id="aiAssistantPanel" role="dialog" aria-label="TRM AI助手对话窗口">
+      <div class="ai-float-head">
+        <div class="ai-float-identity"><span class="ai-float-logo"><svg><use href="#i-ai"></use></svg></span><div><strong>TRM AI助手</strong><small><i></i><span id="aiProviderLabel">Gazellio G.AIOS · 已连接</span></small></div></div>
+        <button class="icon-only" id="aiAssistantClose" type="button" aria-label="关闭AI助手"><svg><use href="#i-close"></use></svg></button>
+      </div>
+      <div class="ai-float-history" id="aiAssistantHistory" aria-live="polite"></div>
+      <div class="ai-float-suggestions" id="aiAssistantSuggestions">
+        <button type="button">查询需求状态</button><button type="button">分析项目风险</button><button type="button">查看预算执行率</button>
+      </div>
+      <div class="ai-float-compose">
+        <textarea id="aiAssistantInput" maxlength="1000" rows="2" placeholder="问需求、项目、预算或审批进度…"></textarea>
+        <button id="aiAssistantSend" type="button" aria-label="发送问题"><svg><use href="#i-send"></use></svg></button>
+      </div>
+      <div class="ai-float-note">AI回答仅供辅助决策，关键业务结论请以系统记录为准</div>
+    </aside>
+    <button class="ai-float-toggle" id="aiAssistantToggle" type="button" aria-label="打开TRM AI助手" aria-expanded="false">
+      <span class="ai-float-pulse"></span><svg><use href="#i-ai"></use></svg><b>AI</b>
+    </button>
+  </section>
+
   <div class="modal-backdrop hidden" id="modalBackdrop">
     <div class="modal" id="modalBox" role="dialog" aria-modal="true" aria-labelledby="modalTitle"></div>
   </div>
   <div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
-  <script src="/static/app.js"></script>
+  <script src="./app.js"></script>
 </body>
 </html>

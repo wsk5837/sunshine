@@ -1,10 +1,12 @@
 import csv
 import io
 import json
+import os
 from datetime import datetime
 from typing import Optional
 from urllib.parse import unquote
 
+import httpx
 from fastapi import APIRouter, Header, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -161,18 +163,45 @@ def init_v4_db():
             """
         )
 
-        # 固定集成能力配置。mock 表示无需伪造真实外部凭证即可完整演示；提供配置后可切 live。
+        # V4.9：AI集成增加公开智能体标识。这里只保存非敏感 agent_id，
+        # 不保存后台管理员账号、密码或管理端 Token。
+        _add_column(conn, "integration_configs", "agent_id", "TEXT DEFAULT ''")
+
+        # 固定集成能力配置。AI运行时使用已核对的 G.AIOS 公共运行接口，
+        # 默认调用已发布的 default 智能体；可在集成配置或环境变量中替换。
         now = now_iso()
-        for code, name, desc in [
-            ("oa", "OA审批集成", "立项、需求、合同、结算审批待办推送与状态回写"),
-            ("tapd", "TAPD需求集成", "终审后创建需求、Webhook/定时/手动回读"),
-            ("ai", "AI问答服务", "需求与项目事实查询；可配置外部模型服务"),
+        for code, name, mode, base_url, agent_id, desc in [
+            ("oa", "OA审批集成", "mock", "", "", "立项、需求、合同、结算审批待办推送与状态回写"),
+            ("tapd", "TAPD需求集成", "mock", "", "", "终审后创建需求、Webhook/定时/手动回读"),
+            (
+                "ai", "AI问答服务", "live",
+                os.getenv("TRM_AI_BASE_URL", "https://adk.gazellio.com"),
+                os.getenv("TRM_AI_AGENT_ID", "default"),
+                "项目360机器人、AI问答与悬浮助手统一接入 Gazellio G.AIOS",
+            ),
         ]:
             conn.execute(
-                """INSERT OR IGNORE INTO integration_configs(code,name,mode,base_url,enabled,status,description,updated_at)
-                   VALUES (?,?, 'mock','',1,'正常',?,?)""",
-                (code, name, desc, now),
+                """INSERT OR IGNORE INTO integration_configs(code,name,mode,base_url,agent_id,enabled,status,description,updated_at)
+                   VALUES (?,?,?,?,?,1,'正常',?,?)""",
+                (code, name, mode, base_url, agent_id, desc, now),
             )
+        # 从 V4.8 升级且仍保持旧版默认 Mock/空地址时，自动启用本次新增的真实AI适配器。
+        conn.execute(
+            """UPDATE integration_configs
+               SET mode='live',base_url=?,agent_id=CASE WHEN COALESCE(agent_id,'')='' THEN ? ELSE agent_id END,
+                   description=?,updated_at=?
+               WHERE code='ai' AND mode='mock' AND COALESCE(base_url,'')=''""",
+            (
+                os.getenv("TRM_AI_BASE_URL", "https://adk.gazellio.com"),
+                os.getenv("TRM_AI_AGENT_ID", "default"),
+                "项目360机器人、AI问答与悬浮助手统一接入 Gazellio G.AIOS",
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE integration_configs SET agent_id=? WHERE code='ai' AND COALESCE(agent_id,'')=''",
+            (os.getenv("TRM_AI_AGENT_ID", "default"),),
+        )
 
         # 为种子项目补一条风险与交付物，让首次打开不是空壳。
         p = conn.execute("SELECT id FROM projects ORDER BY id LIMIT 1").fetchone()
@@ -253,6 +282,7 @@ class SettlementItemPayload(BaseModel):
 class IntegrationPayload(BaseModel):
     mode: str = "mock"
     base_url: str = ""
+    agent_id: str = ""
     enabled: bool = True
 
 
@@ -560,7 +590,13 @@ def update_integration(code: str, payload: IntegrationPayload, request: Request,
     with connect() as conn:
         if not conn.execute("SELECT id FROM integration_configs WHERE code=?", (code,)).fetchone():
             raise BusinessError(404, "REQ-4040", "集成配置不存在")
-        conn.execute("UPDATE integration_configs SET mode=?,base_url=?,enabled=?,updated_at=? WHERE code=?", (payload.mode, payload.base_url, 1 if payload.enabled else 0, now_iso(), code))
+        agent_id = payload.agent_id.strip() if code == "ai" else ""
+        if code == "ai" and payload.mode == "live" and not agent_id:
+            raise BusinessError(400, "REQ-4002", "AI Live模式必须配置智能体标识")
+        conn.execute(
+            "UPDATE integration_configs SET mode=?,base_url=?,agent_id=?,enabled=?,updated_at=? WHERE code=?",
+            (payload.mode, payload.base_url.rstrip("/"), agent_id, 1 if payload.enabled else 0, now_iso(), code),
+        )
         _audit(conn, request, actor, role, "更新集成配置", "integration", code)
         return {"code": 0, "message": "集成配置已更新"}
 
@@ -577,8 +613,18 @@ def check_integration(code: str, request: Request,
             status, message, success = "停用", "当前集成已停用", 0
         elif cfg["mode"] == "mock":
             status, message, success = "正常", "Mock适配器可用，业务链路可完整演示", 1
+        elif code == "ai":
+            try:
+                url = f"{str(cfg['base_url']).rstrip('/')}/docs/openapi/agent-runtime.yaml"
+                response = httpx.get(url, timeout=8, follow_redirects=False)
+                response.raise_for_status()
+                if "/adk/run_stream" not in response.text:
+                    raise ValueError("OpenAPI中缺少运行接口")
+                status, message, success = "正常", f"G.AIOS运行接口可达，智能体标识：{cfg['agent_id']}", 1
+            except Exception as exc:
+                status, message, success = "异常", f"G.AIOS连通性检查失败：{str(exc)[:160]}", 0
         else:
-            # 不在服务端伪造第三方成功；live模式在没有真实凭据时明确报告“待验证”。
+            # 其他第三方系统没有提供只读健康端点时，不伪造真实调用成功。
             status, message, success = "待验证", "已配置Live地址；真实鉴权凭据由部署环境注入后执行连通性验证", 1
         conn.execute("UPDATE integration_configs SET last_check_at=?,status=?,updated_at=? WHERE code=?", (now_iso(), status, now_iso(), code))
         conn.execute("INSERT INTO integration_logs(integration_code,direction,business_type,business_id,success,message,request_id,created_at) VALUES (?,?,?,?,?,?,?,?)", (code, "out", "health_check", "", success, message, getattr(request.state, "request_id", ""), now_iso()))

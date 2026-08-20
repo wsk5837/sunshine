@@ -11,8 +11,12 @@ const state = {
   openGroups: new Set(),
   sidebarCollapsed: false,
   detailTab: 'basic',
+  aiSessionId: '',
+  aiBusy: false,
+  aiProvider: 'Gazellio G.AIOS',
+  projectAiSessions: {},
   chat: [
-    { type: 'ai', text: '你好，我是需求管理智能助手。我可以基于系统数据查询需求、审批记录、预算执行、TAPD进度与历史统计。' }
+    { type: 'ai', text: '你好，我是TRM AI助手。我已连接企业智能体，可以基于系统数据查询需求、审批、预算、TAPD进度、项目风险与历史统计。' }
   ]
 };
 
@@ -129,6 +133,32 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+async function askAiAgent(question, { projectId = null, source = 'assistant' } = {}) {
+  const sessionId = projectId ? (state.projectAiSessions[projectId] || '') : state.aiSessionId;
+  try {
+    const result = await api('/api/ai/chat', {
+      method: 'POST',
+      body: JSON.stringify({ question, session_id: sessionId, project_id: projectId, source })
+    });
+    if (projectId) state.projectAiSessions[projectId] = result.data.session_id || sessionId;
+    else state.aiSessionId = result.data.session_id || sessionId;
+    state.aiProvider = result.data.provider || 'Gazellio G.AIOS';
+    return { ...result.data, fallback: false };
+  } catch (remoteError) {
+    if (remoteError.status === 401) throw remoteError;
+    const fallback = projectId
+      ? await api(`/api/project360/${projectId}/query`, { method: 'POST', body: JSON.stringify({ question }) })
+      : await api('/api/ai/query', { method: 'POST', body: JSON.stringify({ question }) });
+    return {
+      answer: fallback.data.answer,
+      session_id: sessionId,
+      provider: 'TRM本地知识引擎',
+      fallback: true,
+      warning: remoteError.message
+    };
+  }
 }
 
 function parseRoute() {
@@ -386,6 +416,68 @@ function updateUserUI() {
   applyMenuPermissions();
 }
 
+function renderAiAssistantWidget() {
+  const history = $('#aiAssistantHistory');
+  if (!history) return;
+  history.innerHTML = state.chat.map((msg) => `<div class="bubble ${msg.type}">${esc(msg.text)}${msg.type==='ai'&&msg.provider?`<span class="ai-message-meta">${esc(msg.provider)}${msg.fallback?' · 本地降级':''}</span>`:''}</div>`).join('')
+    + (state.aiBusy ? '<div class="bubble ai"><span class="ai-float-typing" aria-label="AI正在思考"><i></i><i></i><i></i></span></div>' : '');
+  $('#aiAssistantSend').disabled = state.aiBusy;
+  $('#aiProviderLabel').textContent = `${state.aiProvider}${state.aiProvider.includes('本地')?' · 降级':' · 已连接'}`;
+  requestAnimationFrame(() => { history.scrollTop = history.scrollHeight; });
+}
+
+async function sendFloatingAiQuestion() {
+  const input = $('#aiAssistantInput');
+  const question = input.value.trim();
+  if (!question || state.aiBusy) return;
+  state.chat.push({type:'user',text:question});
+  input.value = '';
+  state.aiBusy = true;
+  renderAiAssistantWidget();
+  try {
+    const result = await askAiAgent(question, {source:'floating-assistant'});
+    state.aiProvider = result.provider;
+    state.chat.push({type:'ai',text:result.answer,provider:result.provider,fallback:result.fallback});
+    if (result.fallback) toast(`外部智能体暂不可用，已切换本地知识引擎：${result.warning}`,'warn');
+  } catch (error) {
+    state.chat.push({type:'ai',text:`对话失败：${error.message}`,provider:'系统提示'});
+  } finally {
+    state.aiBusy = false;
+    renderAiAssistantWidget();
+    if (parseRoute().path === 'ai') renderAI();
+  }
+}
+
+function bindAiAssistant() {
+  $('#aiAssistantToggle').addEventListener('click', () => {
+    const panel = $('#aiAssistantPanel');
+    const willOpen = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !willOpen);
+    $('#aiAssistantToggle').setAttribute('aria-expanded', String(willOpen));
+    if (willOpen) {
+      renderAiAssistantWidget();
+      setTimeout(() => $('#aiAssistantInput').focus(), 60);
+    }
+  });
+  $('#aiAssistantClose').addEventListener('click', () => {
+    $('#aiAssistantPanel').classList.add('hidden');
+    $('#aiAssistantToggle').setAttribute('aria-expanded', 'false');
+    $('#aiAssistantToggle').focus();
+  });
+  $('#aiAssistantSend').addEventListener('click', sendFloatingAiQuestion);
+  $('#aiAssistantInput').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      sendFloatingAiQuestion();
+    }
+  });
+  $$('#aiAssistantSuggestions button').forEach((button) => button.addEventListener('click', () => {
+    $('#aiAssistantInput').value = button.textContent;
+    sendFloatingAiQuestion();
+  }));
+  renderAiAssistantWidget();
+}
+
 
 function routeGroup(base) {
   const groups = {
@@ -477,11 +569,14 @@ function bindShell() {
 
 function clearSession() {
   state.sessionToken = ''; state.currentUserData = null; state.actorId = ''; state.userDisplay = ''; state.role = 'applicant';
+  state.aiSessionId = ''; state.projectAiSessions = {}; state.aiBusy = false;
   localStorage.removeItem('trm_session');
 }
 
 function showLogin(message = '') {
   $('#appShell').classList.add('hidden');
+  $('#aiAssistantWidget').classList.add('hidden');
+  $('#aiAssistantPanel').classList.add('hidden');
   $('#loginScreen').classList.remove('hidden');
   $('#loginError').textContent = message;
   $('#loginError').classList.toggle('hidden', !message);
@@ -491,6 +586,7 @@ function showLogin(message = '') {
 function showApp() {
   $('#loginScreen').classList.add('hidden');
   $('#appShell').classList.remove('hidden');
+  $('#aiAssistantWidget').classList.remove('hidden');
 }
 
 async function rawLogin(username, password) {
@@ -528,7 +624,13 @@ async function bootstrapAuthenticatedApp() {
 }
 
 async function init() {
-  bindLogin(); bindShell();
+  bindLogin(); bindShell(); bindAiAssistant();
+  if (location.protocol === 'file:') {
+    showLogin('当前是直接文件打开方式，后端接口尚未启动。请返回项目根目录，双击“启动系统.command”，系统会自动打开正确地址。');
+    $('#loginSubmit').disabled = true;
+    $('#loginSubmit').textContent = '请先启动系统服务';
+    return;
+  }
   if (!state.sessionToken) { showLogin(); return; }
   try { await bootstrapAuthenticatedApp(); }
   catch (error) { clearSession(); showLogin(error.message || '登录已失效，请重新登录'); }
@@ -633,10 +735,18 @@ async function renderProject360() {
   const d=(await api(`/api/project360/${selected}`)).data;
   appView.innerHTML=`<div class="section"><div class="toolbar"><div><div class="section-title">项目选择</div><div class="section-subtitle">选择项目后，360视图实时汇总需求、预算、任务、合同、结算与业务价值。</div></div><select id="p360Select" class="select" style="max-width:360px">${projects.map(p=>`<option value="${p.id}" ${p.id===selected?'selected':''}>${esc(p.project_no)} · ${esc(p.name)}</option>`).join('')}</select></div></div>
   <div class="grid-4"><div class="metric"><div class="k">项目状态</div><div class="v">${esc(d.status)}</div><div class="sub">经理 ${esc(d.manager)}</div></div><div class="metric"><div class="k">总体进度</div><div class="v">${d.progress}%</div>${progressCell(d.progress,false)}</div><div class="metric"><div class="k">关联需求</div><div class="v">${d.demands.length}</div><div class="sub">合同 ${d.contracts.length} · 结算 ${d.settlements.length}</div></div><div class="metric"><div class="k">预算执行率</div><div class="v">${d.budget?((d.budget.used_budget/d.budget.total_budget)*100).toFixed(1):'0.0'}%</div><div class="sub">${d.budget?`剩余 ¥${money(d.budget.total_budget-d.budget.used_budget)}`:'未关联预算'}</div></div></div>
-  <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">项目任务</div>${simpleTable(['任务','负责人','状态','优先级','进度'],d.tasks.map(x=>[x.title,x.owner,statusPill(x.status),x.priority,progressCell(x.progress)]))}</div><div class="section"><div class="section-title">机器人问项目</div><div class="chat-history" id="p360Chat"><div class="bubble ai">可以问我：项目当前进度、预算、风险、合同和结算情况。</div></div><div class="chat-input"><textarea id="p360Q" placeholder="例如：这个项目当前有哪些风险？"></textarea><button id="p360Ask" class="btn primary">发送</button></div></div></div>
+  <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">项目任务</div>${simpleTable(['任务','负责人','状态','优先级','进度'],d.tasks.map(x=>[x.title,x.owner,statusPill(x.status),x.priority,progressCell(x.progress)]))}</div><div class="section"><div class="toolbar"><div><div class="section-title">项目360 AI机器人</div><div class="section-subtitle">Gazellio智能体将读取当前项目事实快照并保持多轮会话。</div></div><span class="status success">AI已接入</span></div><div class="chat-history" id="p360Chat"><div class="bubble ai">你好，我已获取 ${esc(d.project_no)} 的项目概况。可以问我项目进度、预算、风险、合同、结算与需求情况。</div></div><div class="chat-input"><textarea id="p360Q" maxlength="1000" placeholder="例如：这个项目当前有哪些风险？"></textarea><button id="p360Ask" class="btn primary">发送</button></div></div></div>
   <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">里程碑</div>${simpleTable(['里程碑','计划日期','状态','负责人'],d.milestones.map(x=>[x.name,x.planned_date||'—',statusPill(x.status),x.owner]))}</div><div class="section"><div class="section-title">业务价值</div>${simpleTable(['类型','指标','计划','已实现','状态'],d.values.map(x=>[x.value_type,x.metric_name,`${x.planned_value}${x.unit}`,`${x.realized_value}${x.unit}`,statusPill(x.status)]))}</div></div>`;
   $('#p360Select').addEventListener('change',e=>navigate('project360',{id:e.target.value}));
-  $('#p360Ask').addEventListener('click',async()=>{const q=$('#p360Q').value.trim();if(!q)return;const c=$('#p360Chat');c.innerHTML+=`<div class="bubble user">${esc(q)}</div>`;const r=await api(`/api/project360/${selected}/query`,{method:'POST',body:JSON.stringify({question:q})});c.innerHTML+=`<div class="bubble ai">${esc(r.data.answer)}</div>`;$('#p360Q').value='';});
+  const askProject=async()=>{
+    const input=$('#p360Q'),button=$('#p360Ask'),q=input.value.trim();if(!q||button.disabled)return;
+    const c=$('#p360Chat');c.innerHTML+=`<div class="bubble user">${esc(q)}</div><div class="bubble ai" id="p360Typing"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>`;input.value='';button.disabled=true;c.scrollTop=c.scrollHeight;
+    try{const result=await askAiAgent(q,{projectId:selected,source:'project360'});$('#p360Typing')?.remove();c.innerHTML+=`<div class="bubble ai">${esc(result.answer)}<span class="ai-message-meta">${esc(result.provider)}${result.fallback?' · 本地降级':''}</span></div>`;if(result.fallback)toast(`外部智能体暂不可用，项目机器人已使用本地回答：${result.warning}`,'warn');}
+    catch(error){$('#p360Typing')?.remove();c.innerHTML+=`<div class="bubble ai">回答失败：${esc(error.message)}</div>`;}
+    finally{button.disabled=false;c.scrollTop=c.scrollHeight;input.focus();}
+  };
+  $('#p360Ask').addEventListener('click',askProject);
+  $('#p360Q').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askProject();}});
 }
 
 async function renderValueOverview() {
@@ -1302,11 +1412,13 @@ async function renderAI() {
     'REQ-20260817-0001 当前卡在哪个环节，预计何时完成？',
     '历史同类需求怎么处理，平均交付周期是多少？'
   ];
-  appView.innerHTML = `${workflow(5)}<div class="ai-layout"><div class="chat"><div class="chat-history" id="chatHistory">${state.chat.map((msg)=>`<div class="bubble ${msg.type}">${esc(msg.text)}</div>`).join('')}</div><div class="chat-input"><textarea id="aiInput" maxlength="1000" placeholder="可查询申请、审批、预算、TAPD进度、项目统计和历史处理数据"></textarea><button class="btn primary" id="aiSend" type="button">发送</button></div></div><aside class="section"><div class="section-title">POC五类推荐问题</div>${recommendations.map((q)=>`<button class="suggestion" type="button">${esc(q)}</button>`).join('')}<div class="callout">当前身份：${esc(state.meta.roles[state.role])}<div class="help">回答基于当前账号可访问的系统事实数据：①单条需求完整信息 ②项目批量统计 ③月/季度预算趋势 ④当前环节与预计完成 ⑤历史追溯与平均周期。</div></div></aside></div>`;
+  appView.innerHTML = `${workflow(5)}<div class="ai-layout"><div class="chat"><div class="ai-page-agent-bar"><div><strong>TRM企业智能体</strong><small>通过本系统后端安全代理连接 Gazellio G.AIOS</small></div><span class="status ${state.aiProvider.includes('本地')?'warn':'success'}">${esc(state.aiProvider)}</span></div><div class="chat-history" id="chatHistory">${state.chat.map((msg)=>`<div class="bubble ${msg.type}">${esc(msg.text)}${msg.type==='ai'&&msg.provider?`<span class="ai-message-meta">${esc(msg.provider)}${msg.fallback?' · 本地降级':''}</span>`:''}</div>`).join('')}${state.aiBusy?'<div class="bubble ai"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>':''}</div><div class="chat-input"><textarea id="aiInput" maxlength="1000" placeholder="可查询申请、审批、预算、TAPD进度、项目统计和历史处理数据"></textarea><button class="btn primary" id="aiSend" type="button" ${state.aiBusy?'disabled':''}>发送</button></div></div><aside class="section"><div class="section-title">POC五类推荐问题</div>${recommendations.map((q)=>`<button class="suggestion" type="button">${esc(q)}</button>`).join('')}<div class="callout">当前身份：${esc(state.meta.roles[state.role])}<div class="help">回答基于当前账号可访问的系统事实数据：①单条需求完整信息 ②项目批量统计 ③月/季度预算趋势 ④当前环节与预计完成 ⑤历史追溯与平均周期。</div></div></aside></div>`;
   const send = async () => {
-    const input = $('#aiInput'); const question = input.value.trim(); if(!question)return;
-    state.chat.push({type:'user',text:question}); input.value=''; renderAI();
-    try{const result=await api('/api/ai/query',{method:'POST',body:JSON.stringify({question})});state.chat.push({type:'ai',text:result.data.answer});renderAI();}catch(error){state.chat.push({type:'ai',text:`查询失败：${error.message}`});renderAI();}
+    const input = $('#aiInput'); const question = input.value.trim(); if(!question||state.aiBusy)return;
+    state.chat.push({type:'user',text:question}); input.value=''; state.aiBusy=true; renderAI(); renderAiAssistantWidget();
+    try{const result=await askAiAgent(question,{source:'ai-page'});state.aiProvider=result.provider;state.chat.push({type:'ai',text:result.answer,provider:result.provider,fallback:result.fallback});if(result.fallback)toast(`外部智能体暂不可用，已切换本地知识引擎：${result.warning}`,'warn');}
+    catch(error){state.chat.push({type:'ai',text:`查询失败：${error.message}`,provider:'系统提示'});}
+    finally{state.aiBusy=false;renderAI();renderAiAssistantWidget();}
   };
   $('#aiSend').addEventListener('click',send);
   $('#aiInput').addEventListener('keydown',(e)=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
@@ -1478,7 +1590,16 @@ function openRoleForm(item,permissions){
 }
 
 async function renderIntegrations(){
-  setPage({title:'集成配置',iconName:'settings',crumbs:['系统管理']});const items=(await api('/api/integrations')).data;appView.innerHTML=`<div class="grid-3">${items.map(x=>`<div class="metric"><div class="toolbar"><div><div class="k">${esc(x.code.toUpperCase())}</div><div class="v" style="font-size:17px">${esc(x.name)}</div></div>${statusPill(x.enabled?x.status:'停用')}</div><div class="sub">模式：${esc(x.mode)} · ${x.base_url?esc(x.base_url):'本地适配器'}</div><div class="sub" style="margin-top:6px">${esc(x.description)}</div><div class="action-group" style="margin-top:12px"><button class="btn intCheck" data-code="${x.code}">连通性检查</button>${state.role==='admin'?`<button class="btn primary intEdit" data-code="${x.code}">配置</button>`:''}</div></div>`).join('')}</div><div class="section" style="margin-top:12px"><div class="section-title">集成运行说明</div><div class="detail-block"><p>Mock 模式使用系统内置适配器，所有创建、审批、回读、错误码、重试与审计链路均实际执行并落库；Live 模式用于部署时接入真实 OA、TAPD 或 AI 服务地址，不会在缺少凭据时伪造第三方成功结果。</p></div></div>`;$$('.intCheck').forEach(b=>b.addEventListener('click',async()=>{try{const r=await api(`/api/integrations/${b.dataset.code}/check`,{method:'POST'});toast(r.message,'success');renderIntegrations();}catch(e){toast(e.message,'error')}}));$$('.intEdit').forEach(b=>b.addEventListener('click',()=>{const x=items.find(i=>i.code===b.dataset.code);showModal(`<h3 id="modalTitle">配置 ${esc(x.name)}</h3><div class="grid-2"><select id="intMode" class="select"><option ${x.mode==='mock'?'selected':''}>mock</option><option ${x.mode==='live'?'selected':''}>live</option></select><select id="intEnabled" class="select"><option value="1" ${x.enabled?'selected':''}>启用</option><option value="0" ${!x.enabled?'selected':''}>停用</option></select></div><input id="intUrl" class="field" style="margin-top:10px" value="${esc(x.base_url||'')}" placeholder="Live模式服务地址"><div class="modal-actions">${btn('取消','btn','intCancel')}${btn('保存','btn primary','intSave')}</div>`);$('#intCancel').addEventListener('click',closeModal);$('#intSave').addEventListener('click',async()=>{try{await api(`/api/integrations/${x.code}`,{method:'PUT',body:JSON.stringify({mode:$('#intMode').value,base_url:$('#intUrl').value,enabled:$('#intEnabled').value==='1'})});closeModal();renderIntegrations();}catch(e){toast(e.message,'error')}});}));
+  setPage({title:'集成配置',iconName:'settings',crumbs:['系统管理']});
+  const items=(await api('/api/integrations')).data;
+  appView.innerHTML=`<div class="grid-3">${items.map(x=>`<div class="metric"><div class="toolbar"><div><div class="k">${esc(x.code.toUpperCase())}</div><div class="v" style="font-size:17px">${esc(x.name)}</div></div>${statusPill(x.enabled?x.status:'停用')}</div><div class="sub">模式：${esc(x.mode)} · ${x.base_url?esc(x.base_url):'本地适配器'}</div>${x.code==='ai'?`<div class="sub" style="margin-top:6px">智能体：<span class="detail-no">${esc(x.agent_id||'未配置')}</span></div>`:''}<div class="sub" style="margin-top:6px">${esc(x.description)}</div><div class="action-group" style="margin-top:12px"><button class="btn intCheck" data-code="${x.code}">连通性检查</button>${state.role==='admin'?`<button class="btn primary intEdit" data-code="${x.code}">配置</button>`:''}</div></div>`).join('')}</div><div class="section" style="margin-top:12px"><div class="section-title">集成运行说明</div><div class="detail-block"><p>AI Live 模式由本系统后端代理调用 Gazellio G.AIOS，浏览器不会接触后台管理员账号。项目360机器人、AI问答页和右下角悬浮助手共用该配置；外部服务异常时保留原有本地规则问答作为降级能力。</p></div></div>`;
+  $$('.intCheck').forEach(b=>b.addEventListener('click',async()=>{try{const r=await api(`/api/integrations/${b.dataset.code}/check`,{method:'POST'});toast(r.message,'success');renderIntegrations();}catch(e){toast(e.message,'error')}}));
+  $$('.intEdit').forEach(b=>b.addEventListener('click',()=>{
+    const x=items.find(i=>i.code===b.dataset.code);
+    showModal(`<h3 id="modalTitle">配置 ${esc(x.name)}</h3><div class="grid-2"><select id="intMode" class="select"><option ${x.mode==='mock'?'selected':''}>mock</option><option ${x.mode==='live'?'selected':''}>live</option></select><select id="intEnabled" class="select"><option value="1" ${x.enabled?'selected':''}>启用</option><option value="0" ${!x.enabled?'selected':''}>停用</option></select></div><input id="intUrl" class="field" style="margin-top:10px" value="${esc(x.base_url||'')}" placeholder="Live模式服务地址">${x.code==='ai'?`<input id="intAgentId" class="field" style="margin-top:10px" value="${esc(x.agent_id||'')}" placeholder="G.AIOS 智能体公开标识（agent_id）"><div class="help">仅填写公开 agent_id，不要填写后台用户名、密码或管理员 Token。</div>`:''}<div class="modal-actions">${btn('取消','btn','intCancel')}${btn('保存','btn primary','intSave')}</div>`);
+    $('#intCancel').addEventListener('click',closeModal);
+    $('#intSave').addEventListener('click',async()=>{try{await api(`/api/integrations/${x.code}`,{method:'PUT',body:JSON.stringify({mode:$('#intMode').value,base_url:$('#intUrl').value,agent_id:$('#intAgentId')?.value||'',enabled:$('#intEnabled').value==='1'})});closeModal();toast('集成配置已保存','success');renderIntegrations();}catch(e){toast(e.message,'error')}});
+  }));
 }
 
 
