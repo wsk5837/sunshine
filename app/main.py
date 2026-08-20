@@ -325,9 +325,16 @@ class AIQueryPayload(BaseModel):
 
 def build_ai_fact_context(question: str, role: str, project_id: Optional[int] = None) -> str:
     """构建受控、紧凑的系统事实快照，供外部智能体回答业务问题。"""
+    mcp_state = public_mcp_status()
     facts: dict[str, Any] = {
-        "data_scope": "当前TRM业务数据库只读快照",
+        "data_scope": "TRM事实查询使用只读快照；业务写操作必须通过已授权的TRM MCP工具执行",
         "current_role": ROLE_LABELS.get(role, role),
+        "mcp_action_capabilities": {
+            "server_ready": mcp_state["enabled"],
+            "write_enabled": mcp_state["write_enabled"],
+            "supported_writes": ["创建项目", "创建需求草稿"],
+            "required_flow": "查询有效数据 -> prepare预览 -> 用户明确确认 -> create幂等写入",
+        },
     }
     if project_id:
         detail = project_detail(project_id)["data"]
