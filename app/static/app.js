@@ -138,6 +138,57 @@ async function api(path, options = {}) {
   return data;
 }
 
+function downloadFilename(disposition, fallback) {
+  const extended = String(disposition || '').match(/filename\*=UTF-8''([^;]+)/i);
+  if (extended) {
+    try { return decodeURIComponent(extended[1]); } catch {}
+  }
+  const regular = String(disposition || '').match(/filename="?([^";]+)"?/i);
+  return regular?.[1] || fallback;
+}
+
+async function downloadProtectedFile(path, fallbackFilename, trigger = null) {
+  if (trigger?.disabled) return;
+  if (trigger) {
+    trigger.disabled = true;
+    trigger.setAttribute('aria-busy', 'true');
+  }
+  try {
+    const response = await fetch(path, {
+      headers: state.sessionToken ? { 'X-Session': state.sessionToken } : {}
+    });
+    if (!response.ok) {
+      let data = {};
+      try { data = await response.json(); } catch {}
+      if (response.status === 401) {
+        clearSession();
+        showLogin('登录已失效，请重新登录');
+        return;
+      }
+      if (response.status === 403) schedulePermissionRefresh();
+      throw new Error(response.status === 403 ? '' : (data.message || `下载失败 ${response.status}`));
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = downloadFilename(response.headers.get('Content-Disposition'), fallbackFilename || '下载文件');
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('文件已开始下载', 'success');
+  } catch (error) {
+    if (error.message) toast(error.message, 'error');
+  } finally {
+    if (trigger) {
+      trigger.disabled = false;
+      trigger.removeAttribute('aria-busy');
+    }
+  }
+}
+
 function schedulePermissionRefresh() {
   if (state.permissionRefreshPending || !state.sessionToken) return;
   state.permissionRefreshPending = true;
@@ -332,7 +383,7 @@ function amountCalculationTooltip(items = [], totalAmount = 0) {
     ? items.map((fp) => `<span class="calc-line"><span>${esc(fp.fp_no || '未编号')} · ${esc(fp.name || fp.demand_summary || '功能点')}</span><span>${Number(fp.fp_count || 0).toFixed(2)} FP × ¥${money(fp.unit_price)} = <strong>¥${money(fp.estimated_amount)}</strong></span></span>`).join('')
     : '<span class="calc-empty">尚无功能点计算明细</span>';
   return `<span class="calc-tooltip" tabindex="0">
-    <span class="calc-tooltip-trigger" aria-label="聚焦查看功能点金额计算过程">¥ ${money(totalAmount)}</span>
+    <span class="calc-tooltip-trigger" aria-label="悬停或聚焦查看功能点金额计算过程">¥ ${money(totalAmount)}</span>
     <span class="calc-tooltip-panel" role="tooltip"><span class="calc-title">功能点金额计算</span><span class="calc-breakdown-list">${lines}</span><span class="calc-total">合计：¥ ${money(totalAmount)}</span></span>
   </span>`;
 }
@@ -637,6 +688,13 @@ function updateNav(routePath) {
 }
 
 function bindShell() {
+  document.addEventListener('click', (event) => {
+    const trigger = event.target.closest('[data-protected-download]');
+    if (!trigger) return;
+    event.preventDefault();
+    downloadProtectedFile(trigger.dataset.protectedDownload, trigger.dataset.filename || '下载文件', trigger);
+  });
+
   $('#sideNav').addEventListener('click', (event) => {
     const groupToggle = event.target.closest('[data-group-toggle]');
     if (groupToggle) {
@@ -897,7 +955,7 @@ async function renderDashboard() {
   bindCommonDemandActions(appView);
   $$('.dash-approve').forEach(b=>b.addEventListener('click',()=>navigate(`approval/${b.dataset.id}`)));
   if($('#dashNew'))$('#dashNew').addEventListener('click',()=>navigate('demand-form'));
-  if ($('#dashExport')) $('#dashExport').addEventListener('click',()=>window.open('/api/exports/platform-summary.csv','_blank'));
+  if ($('#dashExport')) $('#dashExport').addEventListener('click',(event)=>downloadProtectedFile('/api/exports/platform-summary.csv','trm-platform-summary.csv',event.currentTarget));
   const quickRoutes = { quickDemand:'demand-form', quickIni:'initiative-form', quickProject:hasPermission('project')?'project-list':'project360', quickContract:'contract-list', quickBudget:'budget', quickTapd:'tapd' };
   Object.entries(quickRoutes).forEach(([id, route]) => { if ($(`#${id}`)) $(`#${id}`).addEventListener('click',()=>navigate(route)); });
 }
@@ -983,7 +1041,7 @@ async function renderDemandForm() {
               <input type="file" id="fileInput" hidden multiple accept=".doc,.docx,.xls,.xlsx,.pdf,.png,.jpg,.jpeg,.zip">
             </div>
             <div id="pendingFileList">${pendingFileRows()}</div>
-            ${demand?.attachments?.length ? `<div class="file-list" style="margin-top:8px">${demand.attachments.map((file) => `<div class="file-row"><span class="file-name">📎 ${esc(file.original_name)} <span class="status gray">${esc(file.category)}</span></span><span>${fmtSize(file.file_size)}</span><span class="action-group"><a class="link" href="/api/attachments/${file.id}/download" target="_blank">下载</a>${editable ? `<button class="link attachment-delete" data-id="${file.id}" type="button">删除</button>` : ''}</span></div>`).join('')}</div>` : ''}
+            ${demand?.attachments?.length ? `<div class="file-list" style="margin-top:8px">${demand.attachments.map((file) => `<div class="file-row"><span class="file-name">📎 ${esc(file.original_name)} <span class="status gray">${esc(file.category)}</span></span><span>${fmtSize(file.file_size)}</span><span class="action-group"><button class="link" type="button" data-protected-download="/api/attachments/${file.id}/download" data-filename="${esc(file.original_name)}">下载</button>${editable ? `<button class="link attachment-delete" data-id="${file.id}" type="button">删除</button>` : ''}</span></div>`).join('')}</div>` : ''}
           </div></div>
           <div class="rules-line"><span><b>*</b> 预算金额 &gt; 5万元：强制要求上传预算依据附件</span><span><b>*</b> 同一项目未关闭需求 &gt; 10条：提交时给出预警提示</span></div>
         </div>
@@ -1247,14 +1305,14 @@ async function renderDemandDetail(id, query) {
 
 function renderDemandDetailTab(demand, tab) {
   if (tab === 'approval') return `<div class="grid-2"><div><div class="section flat"><div class="section-title">审批记录</div>${approvalRecords(demand.approvals)}</div></div><aside><div class="section flat"><div class="section-title">审批节点</div>${approvalFlow(demand)}</div></aside></div>`;
-  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
+  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
   if (tab === 'budget') return `<div class="section flat"><div class="section-title">预算校验</div>${budgetSnapshot(demand.budget_snapshot)}<div class="section-title" style="margin-top:18px">费用分摊</div>${allocationTable(demand.allocations)}</div>`;
   if (tab === 'tapd') {
     const reqs = demand.tapd_requirements || [];
     const tasks = demand.tapd_tasks || [];
     const costs = demand.tapd_costs || [];
     const reqRows = reqs.map(r=>[
-      esc(r.system_name), esc(r.tapd_id), r.tapd_url ? `<a class="link" href="${esc(r.tapd_url)}" target="_blank">打开TAPD</a>` : '—',
+      esc(r.system_name), esc(r.tapd_id), r.tapd_url ? `<a class="link" href="${esc(r.tapd_url)}" target="_blank" rel="noopener noreferrer">打开TAPD</a>` : '—',
       esc(r.tapd_status||'—'), statusPill(r.sync_status||'未同步'), esc(r.last_sync_at||'—')
     ]);
     const taskRows = tasks.map(t=>[
@@ -1279,7 +1337,7 @@ function renderDemandDetailTab(demand, tab) {
   const functionPointSummary = (hasPermission('function_points') || hasPermission('demand.evaluate'))
     ? `<div>预估功能点</div><div><button class="link fp-summary-link go-fp-detail" type="button">${functionPointTotal(demand.function_points).toFixed(2)} FP · 查看评估详情</button></div><div>预估金额</div><div>${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div>`
     : '';
-  return `<div class="info-grid interactive-info-grid"><div>需求编号</div><div>${esc(demand.demand_no || '提交后生成')}</div><div>需求类型</div><div>${esc(demand.demand_type)}</div><div>需求标题</div><div>${esc(demand.title)}</div><div>申请人</div><div>${esc(demand.applicant)}</div><div>优先级</div><div>${esc(demand.priority)}</div><div>当前节点</div><div>${esc(demand.current_node)}</div><div>预算出处</div><div>${(demand.budget_sources || []).map((x)=>`<span class="tag">${esc(x)}</span>`).join(' ') || '—'}</div><div>申请预算金额</div><div>¥ ${money(demand.budget_amount)}</div>${functionPointSummary}<div>需求描述</div><div>${esc(demand.description || '—')}</div></div><div class="section-title" style="margin-top:18px">附件</div>${demand.attachments.length ? `<div class="file-list">${demand.attachments.map((file)=>`<div class="file-row"><span class="file-name">📎 ${esc(file.original_name)} <span class="status gray">${esc(file.category)}</span></span><span>${fmtSize(file.file_size)}</span><a class="link" href="/api/attachments/${file.id}/download" target="_blank">下载</a></div>`).join('')}</div>` : '<div class="empty" style="min-height:80px">暂无附件</div>'}`;
+  return `<div class="info-grid interactive-info-grid"><div>需求编号</div><div>${esc(demand.demand_no || '提交后生成')}</div><div>需求类型</div><div>${esc(demand.demand_type)}</div><div>需求标题</div><div>${esc(demand.title)}</div><div>申请人</div><div>${esc(demand.applicant)}</div><div>优先级</div><div>${esc(demand.priority)}</div><div>当前节点</div><div>${esc(demand.current_node)}</div><div>预算出处</div><div>${(demand.budget_sources || []).map((x)=>`<span class="tag">${esc(x)}</span>`).join(' ') || '—'}</div><div>申请预算金额</div><div>¥ ${money(demand.budget_amount)}</div>${functionPointSummary}<div>需求描述</div><div>${esc(demand.description || '—')}</div></div><div class="section-title" style="margin-top:18px">附件</div>${demand.attachments.length ? `<div class="file-list">${demand.attachments.map((file)=>`<div class="file-row"><span class="file-name">📎 ${esc(file.original_name)} <span class="status gray">${esc(file.category)}</span></span><span>${fmtSize(file.file_size)}</span><button class="link" type="button" data-protected-download="/api/attachments/${file.id}/download" data-filename="${esc(file.original_name)}">下载</button></div>`).join('')}</div>` : '<div class="empty" style="min-height:80px">暂无附件</div>'}`;
 }
 
 function bindDetailTabActions(demand, tab) {
@@ -1322,7 +1380,7 @@ async function renderApprovalDetail(id) {
     <div class="section"><div class="section-title">历史审批记录</div>${approvalRecords(demand.approvals)}</div>
   </div><aside class="approval-actions">
     <div class="section"><div class="section-title">审批流程</div>${approvalFlow(demand)}</div>
-    ${canApprove ? `<div class="section"><div class="section-title">审批处理</div><div class="callout ${currentOa ? 'success' : 'warn'}" style="margin-bottom:10px">${currentOa ? `OA待办 ${esc(currentOa.external_task_id)} · 截止 ${esc(String(currentOa.due_at||'').replace('T',' ').slice(0,16))}` : '当前节点未发现活动OA待办，请检查OA集成状态。'}</div><label class="subtle" for="approvalComment">审批意见</label><textarea id="approvalComment" class="textarea" placeholder="请输入审批意见"></textarea><label class="subtle" for="approvalReturnTo" style="display:block;margin-top:10px">驳回退回节点</label><select id="approvalReturnTo" class="select">${returnTargets.map(x=>`<option>${esc(x)}</option>`).join('')}</select><div class="help">支持驳回到任意前置节点；选择“需求申请”时退回申请人修改后重新提交。</div><div class="modal-actions">${btn('驳回','btn danger','rejectApproval')}${btn('通过','btn primary','passApproval')}</div></div>` : ''}
+    ${canApprove ? `<div class="section"><div class="section-title">审批处理</div><div class="callout ${currentOa ? 'success' : 'warn'}" style="margin-bottom:10px">${currentOa ? `OA待办 ${esc(currentOa.external_task_id)} · 截止 ${esc(String(currentOa.due_at||'').replace('T',' ').slice(0,16))}` : '当前节点未发现活动OA待办，请检查OA集成状态。'}</div><label class="subtle" for="approvalComment">审批意见</label><textarea id="approvalComment" class="textarea" placeholder="请输入审批意见"></textarea><label class="subtle" for="approvalReturnTo" style="display:block;margin-top:10px">驳回退回节点</label><select id="approvalReturnTo" class="select">${returnTargets.map(x=>`<option>${esc(x)}</option>`).join('')}</select><div class="help">POC支持驳回到任意前置节点；选择“需求申请”时退回申请人修改后重新提交。</div><div class="modal-actions">${btn('驳回','btn danger','rejectApproval')}${btn('通过','btn primary','passApproval')}</div></div>` : ''}
   </aside></div>`;
   $('#approvalBack').addEventListener('click', () => navigate('approvals'));
   $('#approvalFullDetail').addEventListener('click', () => navigate(`demand-detail/${id}`, { tab: 'approval' }));
@@ -1361,7 +1419,7 @@ async function renderProductEval(query) {
   appView.innerHTML = `${workflow(2)}<div class="fp-layout">
     <aside class="section"><div class="section-title">待评估需求</div><div class="demand-selector-list">${demands.map((d) => `<button class="demand-selector-card ${d.id===demand.id?'active':''}" type="button" data-id="${d.id}"><strong>${esc(d.demand_no || '草稿')} · ${esc(d.title)}</strong><span class="status ${statusClass(d.status)}">${esc(d.status)}</span><div class="help">预估 ¥${money(d.estimated_amount || d.budget_amount)}</div></button>`).join('')}</div></aside>
     <div>
-      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
+      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
       <div class="section"><div class="toolbar"><div class="section-title" style="margin:0">功能点评估明细</div>${editable ? btn('添加功能点','btn small primary','addFunctionPointInline') : ''}</div>${functionPointTable(demand.function_points, editable)}</div>
       <div class="section"><div class="section-title">费用分摊</div>${editable ? allocationEditor(demand) : allocationTable(demand.allocations)}</div>
       <div class="section"><div class="section-title">预算校验与执行率</div>${budgetSnapshot(demand.budget_snapshot)}</div>
@@ -1389,8 +1447,8 @@ function bindProductEval(demand, editable) {
   const goAdd = () => { navigate('function-points', { demandId: demand.id }); };
   $('#addFunctionPoint')?.addEventListener('click', goAdd);
   $('#addFunctionPointInline')?.addEventListener('click', goAdd);
-  $('#fpTemplate')?.addEventListener('click', () => { location.href = '/api/function-points/template'; });
-  $('#fpExport')?.addEventListener('click', () => { location.href = `/api/demands/${demand.id}/function-points/export`; });
+  $('#fpTemplate')?.addEventListener('click', (event) => downloadProtectedFile('/api/function-points/template','function_point_template.xlsx',event.currentTarget));
+  $('#fpExport')?.addEventListener('click', (event) => downloadProtectedFile(`/api/demands/${demand.id}/function-points/export`,`function_points_${demand.id}.xlsx`,event.currentTarget));
   $('#fpImport')?.addEventListener('click', () => $('#fpImportFile').click());
   $('#fpImportFile')?.addEventListener('change', importFunctionPoints);
   $$('.fp-detail').forEach((button) => button.addEventListener('click', () => openFunctionPointDetail(demand, Number(button.dataset.id))));
@@ -1488,7 +1546,7 @@ async function renderFunctionPointCatalog(query) {
   $('#catalogSearch').addEventListener('click', () => navigate('function-points', { demandId, q:$('#catalogQ').value.trim(), system:$('#catalogSystem').value }));
   $('#catalogQ').addEventListener('keydown', (e) => { if(e.key==='Enter') $('#catalogSearch').click(); });
   $('#catalogNew').addEventListener('click', () => navigate('function-point-new', { demandId }));
-  $('#catalogTemplate').addEventListener('click', () => { location.href='/api/function-points/template'; });
+  $('#catalogTemplate').addEventListener('click', (event) => downloadProtectedFile('/api/function-points/template','function_point_template.xlsx',event.currentTarget));
   if ($('#fpBackEval')) $('#fpBackEval').addEventListener('click', () => navigate('product-eval',{id:demandId}));
   $$('[data-link-catalog]').forEach((button) => button.addEventListener('click', async () => {
     try { await api(`/api/demands/${demandId}/function-points/link`, { method:'POST', body:JSON.stringify({catalog_id:Number(button.dataset.linkCatalog)}) }); toast('已有功能点已关联','success'); navigate('product-eval',{id:demandId}); } catch(error){ toast(error.message,'error'); }
@@ -1623,7 +1681,7 @@ async function renderAI() {
     'REQ-20260817-0001 当前卡在哪个环节，预计何时完成？',
     '历史同类需求怎么处理，平均交付周期是多少？'
   ];
-  appView.innerHTML = `${workflow(5)}<div class="ai-layout"><div class="chat"><div class="ai-page-agent-bar"><div><strong>TRM企业智能体</strong><small>通过本系统后端安全代理连接 Gazellio G.AIOS</small></div><span class="status ${state.aiProvider.includes('本地')?'warn':'success'}">${esc(state.aiProvider)}</span></div><div class="chat-history" id="chatHistory">${state.chat.map((msg)=>`<div class="bubble ${msg.type}">${esc(msg.text)}${msg.type==='ai'&&msg.provider?`<span class="ai-message-meta">${esc(msg.provider)}${msg.fallback?' · 本地降级':''}</span>`:''}</div>`).join('')}${state.aiBusy?'<div class="bubble ai"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>':''}</div><div class="chat-input"><textarea id="aiInput" maxlength="1000" placeholder="可查询申请、审批、预算、TAPD进度、项目统计和历史处理数据"></textarea><button class="btn primary" id="aiSend" type="button" ${state.aiBusy?'disabled':''}>发送</button></div></div><aside class="section"><div class="section-title">推荐问题</div>${recommendations.map((q)=>`<button class="suggestion" type="button">${esc(q)}</button>`).join('')}<div class="callout">当前角色：${esc(currentRoleLabels())}<div class="help">回答基于当前账号可访问的系统事实数据：①单条需求完整信息 ②项目批量统计 ③月/季度预算趋势 ④当前环节与预计完成 ⑤历史追溯与平均周期。</div></div></aside></div>`;
+  appView.innerHTML = `${workflow(5)}<div class="ai-layout"><div class="chat"><div class="ai-page-agent-bar"><div><strong>TRM企业智能体</strong><small>通过本系统后端安全代理连接 Gazellio G.AIOS</small></div><span class="status ${state.aiProvider.includes('本地')?'warn':'success'}">${esc(state.aiProvider)}</span></div><div class="chat-history" id="chatHistory">${state.chat.map((msg)=>`<div class="bubble ${msg.type}">${esc(msg.text)}${msg.type==='ai'&&msg.provider?`<span class="ai-message-meta">${esc(msg.provider)}${msg.fallback?' · 本地降级':''}</span>`:''}</div>`).join('')}${state.aiBusy?'<div class="bubble ai"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>':''}</div><div class="chat-input"><textarea id="aiInput" maxlength="1000" placeholder="可查询申请、审批、预算、TAPD进度、项目统计和历史处理数据"></textarea><button class="btn primary" id="aiSend" type="button" ${state.aiBusy?'disabled':''}>发送</button></div></div><aside class="section"><div class="section-title">POC五类推荐问题</div>${recommendations.map((q)=>`<button class="suggestion" type="button">${esc(q)}</button>`).join('')}<div class="callout">当前角色：${esc(currentRoleLabels())}<div class="help">回答基于当前账号可访问的系统事实数据：①单条需求完整信息 ②项目批量统计 ③月/季度预算趋势 ④当前环节与预计完成 ⑤历史追溯与平均周期。</div></div></aside></div>`;
   const send = async () => {
     const input = $('#aiInput'); const question = input.value.trim(); if(!question||state.aiBusy)return;
     state.chat.push({type:'user',text:question}); input.value=''; state.aiBusy=true; renderAI(); renderAiAssistantWidget();
