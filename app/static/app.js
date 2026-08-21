@@ -14,6 +14,7 @@ const state = {
   aiSessionId: '',
   aiBusy: false,
   aiProvider: 'Gazellio G.AIOS',
+  permissionRefreshPending: false,
   projectAiSessions: {},
   chat: [
     { type: 'ai', text: '你好，我是TRM AI助手。我已连接企业智能体，可以基于系统数据查询需求、审批、预算、TAPD进度、项目风险与历史统计。' }
@@ -64,6 +65,7 @@ function btn(text, cls = 'btn', id = '', attrs = '') {
 }
 
 function toast(message, type = '') {
+  if (!message) return;
   const node = document.createElement('div');
   node.className = `toast ${type}`;
   node.textContent = message;
@@ -127,12 +129,47 @@ async function api(path, options = {}) {
       clearSession();
       showLogin('登录已失效，请重新登录');
     }
-    const error = new Error(data.message || `请求失败 ${response.status}`);
+    const error = new Error(response.status === 403 ? '' : (data.message || `请求失败 ${response.status}`));
     error.data = data;
     error.status = response.status;
+    if (response.status === 403) schedulePermissionRefresh();
     throw error;
   }
   return data;
+}
+
+function schedulePermissionRefresh() {
+  if (state.permissionRefreshPending || !state.sessionToken) return;
+  state.permissionRefreshPending = true;
+  setTimeout(async () => {
+    try {
+      const response = await fetch('/api/auth/me', { headers: requestHeaders() });
+      if (response.status === 401) {
+        clearSession();
+        showLogin('登录已失效，请重新登录');
+        return;
+      }
+      if (!response.ok) return;
+      const result = await response.json();
+      const me = result.data;
+      state.currentUserData = me;
+      state.actorId = me.username;
+      state.userDisplay = `${me.display_name} ${me.username}`;
+      state.role = me.role_code;
+      closeModal();
+      closeDrawer();
+      updateUserUI();
+      const base = parseRoute().path.split('/')[0];
+      const target = canAccessRoute(base) ? base : defaultAccessibleRoute(base);
+      if (!target) return;
+      if (target !== base) window.history.replaceState(null, '', `#/${target}`);
+      await renderRoute();
+    } catch (error) {
+      console.warn('权限状态刷新失败', error);
+    } finally {
+      state.permissionRefreshPending = false;
+    }
+  }, 0);
 }
 
 async function askAiAgent(question, { projectId = null, source = 'assistant' } = {}) {
@@ -147,7 +184,7 @@ async function askAiAgent(question, { projectId = null, source = 'assistant' } =
     state.aiProvider = result.data.provider || 'Gazellio G.AIOS';
     return { ...result.data, fallback: false };
   } catch (remoteError) {
-    if (remoteError.status === 401) throw remoteError;
+    if ([401, 403].includes(remoteError.status)) throw remoteError;
     const fallback = projectId
       ? await api(`/api/project360/${projectId}/query`, { method: 'POST', body: JSON.stringify({ question }) })
       : await api('/api/ai/query', { method: 'POST', body: JSON.stringify({ question }) });
@@ -360,7 +397,7 @@ function roleCanApprove(demand) {
     '分管总审批': 'vp',
     '终审': 'business_owner'
   };
-  return Boolean(roleByNode[demand?.current_node] && hasRole(roleByNode[demand.current_node]));
+  return hasPermission('demand.approve') && Boolean(roleByNode[demand?.current_node] && hasRole(roleByNode[demand.current_node]));
 }
 
 function bindCommonDemandActions(root = document) {
@@ -393,7 +430,7 @@ async function loadNotifications(draw = false) {
         try { await api(`/api/notifications/${item.dataset.id}/read`, { method: 'POST' }); } catch {}
         closeDrawer();
         await loadNotifications(false);
-        if (item.dataset.demand) navigate(`demand-detail/${item.dataset.demand}`);
+        if (item.dataset.demand && canAccessRoute('demand-detail')) navigate(`demand-detail/${item.dataset.demand}`);
       }));
     }
   } catch (error) {
@@ -406,6 +443,68 @@ function hasPermission(permission) {
   return permissions.includes('*') || permissions.includes(permission);
 }
 
+const ROUTE_ACCESS_RULES = {
+  dashboard: { all: ['dashboard'] },
+  project360: { any: ['project360', 'project'] },
+  value: { all: ['value'] },
+  budget: { all: ['budget'] },
+  'initiative-form': { all: ['initiative.create', 'initiative.list'] },
+  'initiative-list': { all: ['initiative.list'] },
+  'initiative-detail': { all: ['initiative.list'] },
+  'initiative-approvals': { all: ['initiative.approve', 'initiative.list'] },
+  'demand-form': { all: ['demand.create'] },
+  'demand-list': { all: ['demand.list'] },
+  'demand-detail': { all: ['demand.list'] },
+  approvals: { all: ['demand.approve', 'demand.list'] },
+  approval: { all: ['demand.approve', 'demand.list'] },
+  'product-eval': { all: ['demand.evaluate', 'demand.list'] },
+  'function-points': { all: ['demand.list'], any: ['function_points', 'demand.evaluate'] },
+  'function-point-new': { all: ['demand.list'], any: ['function_points', 'demand.evaluate'] },
+  tapd: { all: ['tapd'] },
+  ai: { all: ['ai'] },
+  'project-list': { all: ['project'] },
+  'project-detail': { all: ['project'] },
+  'project-tasks': { all: ['project'] },
+  milestones: { all: ['project'] },
+  'project-governance': { all: ['project'] },
+  'settlement-form': { all: ['settlement'] },
+  'settlement-list': { all: ['settlement'] },
+  'settlement-detail': { all: ['settlement'] },
+  'settlement-approvals': { all: ['settlement'] },
+  'indicator-list': { all: ['indicator'] },
+  'indicator-data': { all: ['indicator'] },
+  'indicator-board': { all: ['indicator'] },
+  'contract-list': { all: ['contract'] },
+  'contract-detail': { all: ['contract'] },
+  'payment-plans': { all: ['contract'] },
+  'contract-approvals': { all: ['contract'] },
+  users: { all: ['system.users'] },
+  roles: { all: ['system.roles'] },
+  integrations: { all: ['system.integrations'] },
+  audit: { all: ['system.audit'] }
+};
+
+const ROUTE_FALLBACK_ORDER = [
+  'dashboard', 'project360', 'value', 'budget', 'initiative-list', 'demand-list',
+  'approvals', 'product-eval', 'function-points', 'tapd', 'ai', 'project-list',
+  'settlement-list', 'indicator-board', 'contract-list', 'users', 'roles',
+  'integrations', 'audit'
+];
+
+function canAccessRoute(base) {
+  const rule = ROUTE_ACCESS_RULES[base];
+  if (!rule) return false;
+  const allAllowed = (rule.all || []).every((permission) => hasPermission(permission));
+  const anyAllowed = !rule.any?.length || rule.any.some((permission) => hasPermission(permission));
+  return allAllowed && anyAllowed;
+}
+
+function defaultAccessibleRoute(exclude = '') {
+  return ROUTE_FALLBACK_ORDER.find((route) => route !== exclude && canAccessRoute(route))
+    || ROUTE_FALLBACK_ORDER.find((route) => canAccessRoute(route))
+    || '';
+}
+
 function hasRole(role) {
   const roles = state.currentUserData?.role_codes || [state.role];
   return roles.includes('admin') || roles.includes(role);
@@ -416,8 +515,10 @@ function currentRoleLabels() {
 }
 
 function applyMenuPermissions() {
-  $$('[data-permission]').forEach((item) => {
-    item.classList.toggle('permission-hidden', !hasPermission(item.dataset.permission));
+  $$('[data-permission], [data-route]').forEach((item) => {
+    const declaredAllowed = !item.dataset.permission || hasPermission(item.dataset.permission);
+    const routeAllowed = !item.dataset.route || canAccessRoute(item.dataset.route);
+    item.classList.toggle('permission-hidden', !declaredAllowed || !routeAllowed);
   });
   $$('.nav-group').forEach((group) => {
     const children = $$('.nav-sub', group);
@@ -468,7 +569,7 @@ async function sendFloatingAiQuestion() {
     state.chat.push({type:'ai',text:result.answer,provider:result.provider,fallback:result.fallback});
     if (result.fallback) toast(`外部智能体暂不可用，已切换本地知识引擎：${result.warning}`,'warn');
   } catch (error) {
-    state.chat.push({type:'ai',text:`对话失败：${error.message}`,provider:'系统提示'});
+    if (error.status !== 403) state.chat.push({type:'ai',text:`对话失败：${error.message}`,provider:'系统提示'});
   } finally {
     state.aiBusy = false;
     renderAiAssistantWidget();
@@ -667,9 +768,15 @@ async function init() {
 
 async function renderRoute() {
   const route = parseRoute();
-  if (route.path.split('/')[0] === 'ai' && !hasPermission('ai')) {
-    toast('当前角色未授权使用AI助手', 'error');
-    navigate('dashboard');
+  const [base, id] = route.path.split('/');
+  if (!canAccessRoute(base)) {
+    const fallback = defaultAccessibleRoute(base);
+    heroActions.innerHTML = '';
+    appView.innerHTML = '';
+    if (fallback) {
+      window.history.replaceState(null, '', `#/${fallback}`);
+      await renderRoute();
+    }
     return;
   }
   const routeActiveGroup = routeGroup(route.path.split('/')[0]);
@@ -678,7 +785,6 @@ async function renderRoute() {
   heroActions.innerHTML = '';
   appView.innerHTML = '<div class="empty">加载中...</div>';
   try {
-    const [base, id] = route.path.split('/');
     const renderers = {
       dashboard: renderDashboard,
       project360: renderProject360,
@@ -719,16 +825,32 @@ async function renderRoute() {
       integrations: renderIntegrations,
       audit: renderAudit
     };
-    const renderer = renderers[base] || renderDashboard;
+    const renderer = renderers[base];
+    if (!renderer) return;
     await renderer();
   } catch (error) {
+    if (error.status === 403) {
+      try {
+        state.currentUserData = (await api('/api/auth/me')).data;
+        state.role = state.currentUserData.role_code;
+        updateUserUI();
+      } catch {}
+      const fallback = defaultAccessibleRoute(base);
+      heroActions.innerHTML = '';
+      appView.innerHTML = '';
+      if (fallback) {
+        window.history.replaceState(null, '', `#/${fallback}`);
+        await renderRoute();
+      }
+      return;
+    }
     console.error('页面加载失败', error);
     appView.innerHTML = `<div class="callout danger"><strong>页面加载失败</strong><div style="margin-top:6px">${esc(error.message)}</div>${error.data?.requestId ? `<div class="help">requestId：${esc(error.data.requestId)}</div>` : ''}</div>`;
   }
 }
 
 async function renderDashboard() {
-  const canApprove = hasPermission('demand.approve');
+  const canApprove = canAccessRoute('approvals');
   const canViewDemands = hasPermission('demand.list');
   const canViewProjects = hasPermission('project360') || hasPermission('project');
   const canViewBudget = hasPermission('budget');
@@ -759,9 +881,9 @@ async function renderDashboard() {
     `<div class="section"><div class="toolbar"><div><div class="section-title">风险与提醒</div><div class="section-subtitle">只展示当前账号可见的定向消息</div></div></div><div class="notice-list">${notes.length?notes.map(n=>`<div class="notice-item"><span class="status ${n.level==='warning'?'warn':n.level==='error'?'danger':''}">${esc(n.level||'info')}</span><div><strong>${esc(n.title)}</strong><small>${esc(n.content||'')}</small></div></div>`).join(''):'<div class="empty">当前暂无提醒</div>'}</div></div>`
   ].filter(Boolean);
   const quickButtons = [
-    hasPermission('initiative.create') ? btn('新建立项','btn','quickIni') : '',
+    canAccessRoute('initiative-form') ? btn('新建立项','btn','quickIni') : '',
     hasPermission('demand.create') ? btn('新建需求','btn primary','quickDemand') : '',
-    canViewProjects ? btn('项目台账','btn','quickProject') : '',
+    hasPermission('project') ? btn('项目台账','btn','quickProject') : (hasPermission('project360') ? btn('项目360视图','btn','quickProject') : ''),
     hasPermission('contract') ? btn('合同台账','btn','quickContract') : '',
     canViewBudget ? btn('预算管理','btn','quickBudget') : '',
     canViewTapd ? btn('TAPD同步中心','btn','quickTapd') : ''
@@ -776,7 +898,7 @@ async function renderDashboard() {
   $$('.dash-approve').forEach(b=>b.addEventListener('click',()=>navigate(`approval/${b.dataset.id}`)));
   if($('#dashNew'))$('#dashNew').addEventListener('click',()=>navigate('demand-form'));
   if ($('#dashExport')) $('#dashExport').addEventListener('click',()=>window.open('/api/exports/platform-summary.csv','_blank'));
-  const quickRoutes = { quickDemand:'demand-form', quickIni:'initiative-form', quickProject:'project-list', quickContract:'contract-list', quickBudget:'budget', quickTapd:'tapd' };
+  const quickRoutes = { quickDemand:'demand-form', quickIni:'initiative-form', quickProject:hasPermission('project')?'project-list':'project360', quickContract:'contract-list', quickBudget:'budget', quickTapd:'tapd' };
   Object.entries(quickRoutes).forEach(([id, route]) => { if ($(`#${id}`)) $(`#${id}`).addEventListener('click',()=>navigate(route)); });
 }
 
@@ -790,36 +912,40 @@ async function renderProject360() {
   const selected=Number(parseRoute().query.get('id')||projects[0]?.id||0);
   if(!selected){appView.innerHTML='<div class="empty">暂无项目，请先在项目管理中新建项目。</div>';return;}
   const d=(await api(`/api/project360/${selected}`)).data;
+  const aiPanel=hasPermission('ai')?`<div class="section"><div class="toolbar"><div><div class="section-title">项目360 AI机器人</div><div class="section-subtitle">Gazellio智能体将读取当前项目事实快照并保持多轮会话。</div></div><span class="status success">AI已接入</span></div><div class="chat-history" id="p360Chat"><div class="bubble ai">你好，我已获取 ${esc(d.project_no)} 的项目概况。可以问我项目进度、预算、风险、合同、结算与需求情况。</div></div><div class="chat-input"><textarea id="p360Q" maxlength="1000" placeholder="例如：这个项目当前有哪些风险？"></textarea><button id="p360Ask" class="btn primary">发送</button></div></div>`:'';
   appView.innerHTML=`<div class="section"><div class="toolbar"><div><div class="section-title">项目选择</div><div class="section-subtitle">选择项目后，360视图实时汇总需求、预算、任务、合同、结算与业务价值。</div></div><select id="p360Select" class="select" style="max-width:360px">${projects.map(p=>`<option value="${p.id}" ${p.id===selected?'selected':''}>${esc(p.project_no)} · ${esc(p.name)}</option>`).join('')}</select></div></div>
   <div class="grid-4"><div class="metric"><div class="k">项目状态</div><div class="v">${esc(d.status)}</div><div class="sub">经理 ${esc(d.manager)}</div></div><div class="metric"><div class="k">总体进度</div><div class="v">${d.progress}%</div>${progressCell(d.progress,false)}</div><div class="metric"><div class="k">关联需求</div><div class="v">${d.demands.length}</div><div class="sub">合同 ${d.contracts.length} · 结算 ${d.settlements.length}</div></div><div class="metric"><div class="k">预算执行率</div><div class="v">${d.budget?((d.budget.used_budget/d.budget.total_budget)*100).toFixed(1):'0.0'}%</div><div class="sub">${d.budget?`剩余 ¥${money(d.budget.total_budget-d.budget.used_budget)}`:'未关联预算'}</div></div></div>
-  <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">项目任务</div>${simpleTable(['任务','负责人','状态','优先级','进度'],d.tasks.map(x=>[x.title,x.owner,statusPill(x.status),x.priority,progressCell(x.progress)]))}</div><div class="section"><div class="toolbar"><div><div class="section-title">项目360 AI机器人</div><div class="section-subtitle">Gazellio智能体将读取当前项目事实快照并保持多轮会话。</div></div><span class="status success">AI已接入</span></div><div class="chat-history" id="p360Chat"><div class="bubble ai">你好，我已获取 ${esc(d.project_no)} 的项目概况。可以问我项目进度、预算、风险、合同、结算与需求情况。</div></div><div class="chat-input"><textarea id="p360Q" maxlength="1000" placeholder="例如：这个项目当前有哪些风险？"></textarea><button id="p360Ask" class="btn primary">发送</button></div></div></div>
+  <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">项目任务</div>${simpleTable(['任务','负责人','状态','优先级','进度'],d.tasks.map(x=>[x.title,x.owner,statusPill(x.status),x.priority,progressCell(x.progress)]))}</div>${aiPanel}</div>
   <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">里程碑</div>${simpleTable(['里程碑','计划日期','状态','负责人'],d.milestones.map(x=>[x.name,x.planned_date||'—',statusPill(x.status),x.owner]))}</div><div class="section"><div class="section-title">业务价值</div>${simpleTable(['类型','指标','计划','已实现','状态'],d.values.map(x=>[x.value_type,x.metric_name,`${x.planned_value}${x.unit}`,`${x.realized_value}${x.unit}`,statusPill(x.status)]))}</div></div>`;
   $('#p360Select').addEventListener('change',e=>navigate('project360',{id:e.target.value}));
   const askProject=async()=>{
     const input=$('#p360Q'),button=$('#p360Ask'),q=input.value.trim();if(!q||button.disabled)return;
     const c=$('#p360Chat');c.innerHTML+=`<div class="bubble user">${esc(q)}</div><div class="bubble ai" id="p360Typing"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>`;input.value='';button.disabled=true;c.scrollTop=c.scrollHeight;
     try{const result=await askAiAgent(q,{projectId:selected,source:'project360'});$('#p360Typing')?.remove();c.innerHTML+=`<div class="bubble ai">${esc(result.answer)}<span class="ai-message-meta">${esc(result.provider)}${result.fallback?' · 本地降级':''}</span></div>`;if(result.fallback)toast(`外部智能体暂不可用，项目机器人已使用本地回答：${result.warning}`,'warn');}
-    catch(error){$('#p360Typing')?.remove();c.innerHTML+=`<div class="bubble ai">回答失败：${esc(error.message)}</div>`;}
+    catch(error){$('#p360Typing')?.remove();if(error.status!==403)c.innerHTML+=`<div class="bubble ai">回答失败：${esc(error.message)}</div>`;}
     finally{button.disabled=false;c.scrollTop=c.scrollHeight;input.focus();}
   };
-  $('#p360Ask').addEventListener('click',askProject);
-  $('#p360Q').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askProject();}});
+  if ($('#p360Ask')) $('#p360Ask').addEventListener('click',askProject);
+  if ($('#p360Q')) $('#p360Q').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();askProject();}});
 }
 
 async function renderValueOverview() {
   setPage({ title: '业务价值总览', iconName: 'grid', crumbs: ['经营分析'], actions: btn(`${icon('plus')} 新增价值指标`,'btn primary','newValue') });
-  const items=(await api('/api/business-values')).data; const projects=(await api('/api/projects')).data;
+  const items=(await api('/api/business-values')).data;
+  const canLinkProject=hasPermission('project360') || hasPermission('project');
+  const projects=canLinkProject ? (await api('/api/projects')).data : [];
   const planned=items.reduce((s,x)=>s+Number(x.planned_value||0),0),realized=items.reduce((s,x)=>s+Number(x.realized_value||0),0);
   appView.innerHTML=`<div class="grid-4"><div class="metric"><div class="k">价值指标</div><div class="v">${items.length}</div><div class="sub">跨项目持续跟踪</div></div><div class="metric"><div class="k">目标汇总</div><div class="v">${planned.toFixed(1)}</div><div class="sub">不同单位仅作条目汇总</div></div><div class="metric"><div class="k">已实现汇总</div><div class="v">${realized.toFixed(1)}</div><div class="sub">实时维护</div></div><div class="metric"><div class="k">平均达成</div><div class="v">${items.length?(items.reduce((s,x)=>s+(Number(x.planned_value)?Number(x.realized_value)/Number(x.planned_value)*100:0),0)/items.length).toFixed(1):0}%</div><div class="sub">按指标条目平均</div></div></div>
   <div class="section" style="margin-top:12px"><div class="section-title">业务价值指标台账</div><div class="table-wrap"><table class="table"><thead><tr><th>项目</th><th>价值类型</th><th>指标</th><th>计划值</th><th>已实现</th><th>达成率</th><th>周期</th><th>负责人</th><th>状态</th><th>操作</th></tr></thead><tbody>${items.map(x=>`<tr><td>${esc(x.project_no||'—')} ${esc(x.project_name||'')}</td><td>${esc(x.value_type)}</td><td>${esc(x.metric_name)}</td><td>${x.planned_value}${esc(x.unit)}</td><td>${x.realized_value}${esc(x.unit)}</td><td>${x.planned_value?(x.realized_value/x.planned_value*100).toFixed(1):0}%</td><td>${esc(x.period)}</td><td>${esc(x.owner)}</td><td>${statusPill(x.status)}</td><td><button class="link value-edit" data-id="${x.id}">编辑</button> <button class="link value-del" data-id="${x.id}">删除</button></td></tr>`).join('')}</tbody></table></div></div>`;
-  const open=(item={})=>showModal(`<h3 id="modalTitle">${item.id?'编辑':'新增'}业务价值指标</h3><div class="form-row"><div class="label">项目</div><select id="vProject" class="select"><option value="">不指定</option>${projects.map(p=>`<option value="${p.id}" ${p.id===item.project_id?'selected':''}>${esc(p.project_no)} · ${esc(p.name)}</option>`).join('')}</select></div><div class="form-row"><div class="label required">价值类型</div><input id="vType" class="field" value="${esc(item.value_type||'效率')}"></div><div class="form-row"><div class="label required">指标名称</div><input id="vName" class="field" value="${esc(item.metric_name||'')}"></div><div class="grid-2"><div><label>计划值</label><input id="vPlan" type="number" class="field" value="${item.planned_value||0}"></div><div><label>已实现</label><input id="vReal" type="number" class="field" value="${item.realized_value||0}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>单位</label><input id="vUnit" class="field" value="${esc(item.unit||'%')}"></div><div><label>周期</label><input id="vPeriod" class="field" value="${esc(item.period||'2026Q3')}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>负责人</label><input id="vOwner" class="field" value="${esc(item.owner||'')}"></div><div><label>状态</label><select id="vStatus" class="select">${['跟踪中','已达成','暂停'].map(s=>`<option ${s===item.status?'selected':''}>${s}</option>`).join('')}</select></div></div><div class="modal-actions">${btn('取消','btn','vCancel')}${btn('保存','btn primary','vSave')}</div>`);
-  const bindSave=(item={})=>{ $('#vCancel').addEventListener('click',closeModal);$('#vSave').addEventListener('click',async()=>{const payload={project_id:Number($('#vProject').value)||null,value_type:$('#vType').value,metric_name:$('#vName').value,planned_value:Number($('#vPlan').value),realized_value:Number($('#vReal').value),unit:$('#vUnit').value,period:$('#vPeriod').value,owner:$('#vOwner').value,status:$('#vStatus').value};await api(item.id?`/api/business-values/${item.id}`:'/api/business-values',{method:item.id?'PUT':'POST',body:JSON.stringify(payload)});closeModal();toast('已保存','success');renderValueOverview();});};
+  const open=(item={})=>showModal(`<h3 id="modalTitle">${item.id?'编辑':'新增'}业务价值指标</h3>${canLinkProject?`<div class="form-row"><div class="label">项目</div><select id="vProject" class="select"><option value="">不指定</option>${projects.map(p=>`<option value="${p.id}" ${p.id===item.project_id?'selected':''}>${esc(p.project_no)} · ${esc(p.name)}</option>`).join('')}</select></div>`:''}<div class="form-row"><div class="label required">价值类型</div><input id="vType" class="field" value="${esc(item.value_type||'效率')}"></div><div class="form-row"><div class="label required">指标名称</div><input id="vName" class="field" value="${esc(item.metric_name||'')}"></div><div class="grid-2"><div><label>计划值</label><input id="vPlan" type="number" class="field" value="${item.planned_value||0}"></div><div><label>已实现</label><input id="vReal" type="number" class="field" value="${item.realized_value||0}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>单位</label><input id="vUnit" class="field" value="${esc(item.unit||'%')}"></div><div><label>周期</label><input id="vPeriod" class="field" value="${esc(item.period||'2026Q3')}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>负责人</label><input id="vOwner" class="field" value="${esc(item.owner||'')}"></div><div><label>状态</label><select id="vStatus" class="select">${['跟踪中','已达成','暂停'].map(s=>`<option ${s===item.status?'selected':''}>${s}</option>`).join('')}</select></div></div><div class="modal-actions">${btn('取消','btn','vCancel')}${btn('保存','btn primary','vSave')}</div>`);
+  const bindSave=(item={})=>{ $('#vCancel').addEventListener('click',closeModal);$('#vSave').addEventListener('click',async()=>{const payload={project_id:Number($('#vProject')?.value)||null,value_type:$('#vType').value,metric_name:$('#vName').value,planned_value:Number($('#vPlan').value),realized_value:Number($('#vReal').value),unit:$('#vUnit').value,period:$('#vPeriod').value,owner:$('#vOwner').value,status:$('#vStatus').value};await api(item.id?`/api/business-values/${item.id}`:'/api/business-values',{method:item.id?'PUT':'POST',body:JSON.stringify(payload)});closeModal();toast('已保存','success');renderValueOverview();});};
   $('#newValue').addEventListener('click',()=>{open();bindSave();});$$('.value-edit').forEach(b=>b.addEventListener('click',()=>{const item=items.find(x=>x.id===Number(b.dataset.id));open(item);bindSave(item);}));$$('.value-del').forEach(b=>b.addEventListener('click',async()=>{await api(`/api/business-values/${b.dataset.id}`,{method:'DELETE'});renderValueOverview();}));
 }
 
 async function renderDemandForm() {
   const route = parseRoute();
   const idFromQuery = Number(route.query.get('id') || 0);
+  if (idFromQuery && !hasPermission('demand.list')) return navigate('demand-form');
   state.currentDemandId = idFromQuery || null;
   if (!idFromQuery) state.pendingFiles = [];
   let demand = idFromQuery ? (await api(`/api/demands/${idFromQuery}`)).data : null;
@@ -833,7 +959,6 @@ async function renderDemandForm() {
   const selectedBudgets = demand?.budget_sources || [];
   const amount = Number(demand?.budget_amount || 0);
   appView.innerHTML = `${workflow(stageForDemand(demand))}
-    ${!allowed ? `<div class="callout warn" style="margin-bottom:12px">当前账号未授予“新建需求”权限，可以查看页面，但保存与提交按钮已禁用。</div>` : ''}
     ${demand && !editable ? `<div class="callout warn" style="margin-bottom:12px">该需求当前状态为“${esc(demand.status)}”，申请信息已进入流程，不允许直接修改。可前往需求详情查看审批、预算与TAPD进度。</div>` : ''}
     <div class="grid-2">
       <div>
@@ -1094,11 +1219,18 @@ async function renderDemandDetail(id, query) {
   state.currentDemandId = id;
   const demand = (await api(`/api/demands/${id}`)).data;
   await loadNotifications(false);
-  const tab = query.get('tab') || 'basic';
+  const tabs = [
+    ['basic','基本信息'],
+    ['approval','审批记录'],
+    ...((hasPermission('function_points') || hasPermission('demand.evaluate')) ? [['fp','功能点评估']] : []),
+    ...((hasPermission('budget') || hasPermission('demand.evaluate')) ? [['budget','预算与分摊']] : []),
+    ...(hasPermission('tapd') ? [['tapd','TAPD与工时']] : [])
+  ];
+  const requestedTab = query.get('tab') || 'basic';
+  const tab = tabs.some(([key]) => key === requestedTab) ? requestedTab : 'basic';
   state.detailTab = tab;
   const actions = `${btn(`${icon('back')} 返回列表`,'btn','backToList')}${(demand.status === '草稿' || demand.status === '已驳回') && hasPermission('demand.create') ? btn('编辑需求','btn','editDemandDetail') : ''}${roleCanApprove(demand) ? btn('进入当前审批','btn primary','gotoApproval') : ''}${demand.tapd_id && hasPermission('tapd') ? btn('同步TAPD状态','btn primary','detailSyncTapd') : ''}`;
   setPage({ title: '需求详情', iconName: 'demand', crumbs: ['需求管理', demand.demand_no || '草稿'], actions });
-  const tabs = [['basic','基本信息'],['approval','审批记录'],['fp','功能点评估'],['budget','预算与分摊'],['tapd','TAPD与工时']];
   appView.innerHTML = `${workflow(stageForDemand(demand))}
     <div class="section">
       <div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no || '草稿')}</div><h2 class="detail-title">${esc(demand.title)}</h2><div class="detail-meta"><span>申请人：${esc(demand.applicant)}</span><span>优先级：${esc(demand.priority)}</span><span>类型：${esc(demand.demand_type)}</span></div></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div>
@@ -1144,7 +1276,10 @@ function renderDemandDetailTab(demand, tab) {
     <div class="section flat" style="margin-top:12px"><div class="section-title">任务关联花费信息</div>${costRows.length ? simpleTable(['花费日期','花费工时','花费创建人','花费描述','关联任务'],costRows) : '<div class="empty">暂无花费回读数据</div>'}</div>
     <div class="grid-2" style="margin-top:12px"><div class="section flat"><div class="section-title">工时偏差</div><div class="info-grid" style="grid-template-columns:120px 1fr"><div>预估工时</div><div>${Number(demand.estimated_hours||0).toFixed(1)} h</div><div>实际工时</div><div>${Number(demand.actual_hours||0).toFixed(1)} h</div><div>偏差率</div><div>${deviation.toFixed(1)}%</div></div><div class="callout ${deviation>30?'warn':'success'}" style="margin-top:10px">${deviationMessage}</div></div><div class="section flat"><div class="section-title">同步记录</div>${(demand.tapd_sync_runs||[]).length ? simpleTable(['来源','变更数','结果','说明','时间'],demand.tapd_sync_runs.map(x=>[esc(x.source),x.changed_count,x.success?'成功':'失败',esc(x.message),esc(x.created_at)])) : '<div class="empty">暂无同步记录</div>'}</div></div>`;
   }
-  return `<div class="info-grid interactive-info-grid"><div>需求编号</div><div>${esc(demand.demand_no || '提交后生成')}</div><div>需求类型</div><div>${esc(demand.demand_type)}</div><div>需求标题</div><div>${esc(demand.title)}</div><div>申请人</div><div>${esc(demand.applicant)}</div><div>优先级</div><div>${esc(demand.priority)}</div><div>当前节点</div><div>${esc(demand.current_node)}</div><div>预算出处</div><div>${(demand.budget_sources || []).map((x)=>`<span class="tag">${esc(x)}</span>`).join(' ') || '—'}</div><div>申请预算金额</div><div>¥ ${money(demand.budget_amount)}</div><div>预估功能点</div><div><button class="link fp-summary-link go-fp-detail" type="button">${functionPointTotal(demand.function_points).toFixed(2)} FP · 查看评估详情</button></div><div>预估金额</div><div>${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div><div>需求描述</div><div>${esc(demand.description || '—')}</div></div><div class="section-title" style="margin-top:18px">附件</div>${demand.attachments.length ? `<div class="file-list">${demand.attachments.map((file)=>`<div class="file-row"><span class="file-name">📎 ${esc(file.original_name)} <span class="status gray">${esc(file.category)}</span></span><span>${fmtSize(file.file_size)}</span><a class="link" href="/api/attachments/${file.id}/download" target="_blank">下载</a></div>`).join('')}</div>` : '<div class="empty" style="min-height:80px">暂无附件</div>'}`;
+  const functionPointSummary = (hasPermission('function_points') || hasPermission('demand.evaluate'))
+    ? `<div>预估功能点</div><div><button class="link fp-summary-link go-fp-detail" type="button">${functionPointTotal(demand.function_points).toFixed(2)} FP · 查看评估详情</button></div><div>预估金额</div><div>${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div>`
+    : '';
+  return `<div class="info-grid interactive-info-grid"><div>需求编号</div><div>${esc(demand.demand_no || '提交后生成')}</div><div>需求类型</div><div>${esc(demand.demand_type)}</div><div>需求标题</div><div>${esc(demand.title)}</div><div>申请人</div><div>${esc(demand.applicant)}</div><div>优先级</div><div>${esc(demand.priority)}</div><div>当前节点</div><div>${esc(demand.current_node)}</div><div>预算出处</div><div>${(demand.budget_sources || []).map((x)=>`<span class="tag">${esc(x)}</span>`).join(' ') || '—'}</div><div>申请预算金额</div><div>¥ ${money(demand.budget_amount)}</div>${functionPointSummary}<div>需求描述</div><div>${esc(demand.description || '—')}</div></div><div class="section-title" style="margin-top:18px">附件</div>${demand.attachments.length ? `<div class="file-list">${demand.attachments.map((file)=>`<div class="file-row"><span class="file-name">📎 ${esc(file.original_name)} <span class="status gray">${esc(file.category)}</span></span><span>${fmtSize(file.file_size)}</span><a class="link" href="/api/attachments/${file.id}/download" target="_blank">下载</a></div>`).join('')}</div>` : '<div class="empty" style="min-height:80px">暂无附件</div>'}`;
 }
 
 function bindDetailTabActions(demand, tab) {
@@ -1172,7 +1307,8 @@ async function renderApprovalDetail(id) {
   setPage({ title: '需求审批', iconName: 'approve', crumbs: ['需求申请', demand.demand_no || '草稿'], actions: `${btn(`${icon('back')} 返回待办`,'btn','approvalBack')}${btn('查看完整详情','btn','approvalFullDetail')}` });
   let special = '';
   if (demand.current_node === '产品经理审批') {
-    special = `<div class="callout ${demand.function_points.length ? 'success' : 'warn'}">产品经理节点必须完成至少1条功能点评估。当前已关联 ${demand.function_points.length} 条，预估金额 ¥${money(demand.estimated_amount)}。<div style="margin-top:8px">${btn('进入费用评估与预算','btn secondary','goProductEval')}</div></div>`;
+    const evaluationEntry = canAccessRoute('product-eval') ? `<div style="margin-top:8px">${btn('进入费用评估与预算','btn secondary','goProductEval')}</div>` : '';
+    special = `<div class="callout ${demand.function_points.length ? 'success' : 'warn'}">产品经理节点必须完成至少1条功能点评估。当前已关联 ${demand.function_points.length} 条，预估金额 ¥${money(demand.estimated_amount)}。${evaluationEntry}</div>`;
   }
   if (demand.current_node === '财务审批') {
     special = `<div>${budgetSnapshot(demand.budget_snapshot)}</div>`;
@@ -1186,7 +1322,7 @@ async function renderApprovalDetail(id) {
     <div class="section"><div class="section-title">历史审批记录</div>${approvalRecords(demand.approvals)}</div>
   </div><aside class="approval-actions">
     <div class="section"><div class="section-title">审批流程</div>${approvalFlow(demand)}</div>
-    <div class="section"><div class="section-title">审批处理</div>${canApprove ? `<div class="callout ${currentOa ? 'success' : 'warn'}" style="margin-bottom:10px">${currentOa ? `OA待办 ${esc(currentOa.external_task_id)} · 截止 ${esc(String(currentOa.due_at||'').replace('T',' ').slice(0,16))}` : '当前节点未发现活动OA待办，请检查OA集成状态。'}</div><label class="subtle" for="approvalComment">审批意见</label><textarea id="approvalComment" class="textarea" placeholder="请输入审批意见"></textarea><label class="subtle" for="approvalReturnTo" style="display:block;margin-top:10px">驳回退回节点</label><select id="approvalReturnTo" class="select">${returnTargets.map(x=>`<option>${esc(x)}</option>`).join('')}</select><div class="help">POC支持驳回到任意前置节点；选择“需求申请”时退回申请人修改后重新提交。</div><div class="modal-actions">${btn('驳回','btn danger','rejectApproval')}${btn('通过','btn primary','passApproval')}</div>` : `<div class="callout warn">当前角色无权处理该节点。该节点需要与审批角色同时匹配。</div>`}</div>
+    ${canApprove ? `<div class="section"><div class="section-title">审批处理</div><div class="callout ${currentOa ? 'success' : 'warn'}" style="margin-bottom:10px">${currentOa ? `OA待办 ${esc(currentOa.external_task_id)} · 截止 ${esc(String(currentOa.due_at||'').replace('T',' ').slice(0,16))}` : '当前节点未发现活动OA待办，请检查OA集成状态。'}</div><label class="subtle" for="approvalComment">审批意见</label><textarea id="approvalComment" class="textarea" placeholder="请输入审批意见"></textarea><label class="subtle" for="approvalReturnTo" style="display:block;margin-top:10px">驳回退回节点</label><select id="approvalReturnTo" class="select">${returnTargets.map(x=>`<option>${esc(x)}</option>`).join('')}</select><div class="help">POC支持驳回到任意前置节点；选择“需求申请”时退回申请人修改后重新提交。</div><div class="modal-actions">${btn('驳回','btn danger','rejectApproval')}${btn('通过','btn primary','passApproval')}</div></div>` : ''}
   </aside></div>`;
   $('#approvalBack').addEventListener('click', () => navigate('approvals'));
   $('#approvalFullDetail').addEventListener('click', () => navigate(`demand-detail/${id}`, { tab: 'approval' }));
@@ -1226,7 +1362,6 @@ async function renderProductEval(query) {
     <aside class="section"><div class="section-title">待评估需求</div><div class="demand-selector-list">${demands.map((d) => `<button class="demand-selector-card ${d.id===demand.id?'active':''}" type="button" data-id="${d.id}"><strong>${esc(d.demand_no || '草稿')} · ${esc(d.title)}</strong><span class="status ${statusClass(d.status)}">${esc(d.status)}</span><div class="help">预估 ¥${money(d.estimated_amount || d.budget_amount)}</div></button>`).join('')}</div></aside>
     <div>
       <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
-      ${!editable ? `<div class="callout warn" style="margin-bottom:12px">当前账号未授予功能点或费用评估权限，可查看评估结果但不能修改。</div>` : ''}
       <div class="section"><div class="toolbar"><div class="section-title" style="margin:0">功能点评估明细</div>${editable ? btn('添加功能点','btn small primary','addFunctionPointInline') : ''}</div>${functionPointTable(demand.function_points, editable)}</div>
       <div class="section"><div class="section-title">费用分摊</div>${editable ? allocationEditor(demand) : allocationTable(demand.allocations)}</div>
       <div class="section"><div class="section-title">预算校验与执行率</div>${budgetSnapshot(demand.budget_snapshot)}</div>
@@ -1417,10 +1552,21 @@ async function renderBudget() {
 }
 
 async function renderTapd() {
-  setPage({ title: 'TAPD同步中心', iconName: 'sync', crumbs: ['集成中心'], actions: `${hasPermission('system.integrations')?btn('执行后台任务','btn','tapdRunJobs'):''}${btn('刷新','btn','tapdRefresh')}` });
-  const [demandResp, settingResp, overviewResp] = await Promise.all([api('/api/demands?page_size=100'), api('/api/poc/settings'), api('/api/tapd/overview')]);
-  const demands = demandResp.data.items.filter((d)=>d.demand_no);
-  const settings = settingResp.data, overview = overviewResp.data, cfg = overview.config;
+  const canConfigure = hasPermission('system.integrations');
+  const canViewDemands = hasPermission('demand.list');
+  setPage({ title: 'TAPD同步中心', iconName: 'sync', crumbs: ['集成中心'], actions: `${canConfigure?btn('执行后台任务','btn','tapdRunJobs'):''}${btn('刷新','btn','tapdRefresh')}` });
+  const [demandResp, settingResp, overviewResp] = await Promise.all([
+    canViewDemands ? api('/api/demands?page_size=100') : Promise.resolve({ data: { items: [] } }),
+    canConfigure ? api('/api/poc/settings') : Promise.resolve({ data: {} }),
+    api('/api/tapd/overview')
+  ]);
+  const demands = (demandResp.data.items || []).filter((d)=>d.demand_no);
+  const overview = overviewResp.data, cfg = overview.config;
+  const settings = canConfigure ? settingResp.data : {
+    tapd_split_strategy: overview.split_strategy,
+    tapd_sync_interval_seconds: overview.sync_interval_seconds,
+    tapd_retry_seconds: overview.retry_seconds
+  };
   const strategyLabel = settings.tapd_split_strategy==='system_allocation' ? '按系统 + 分摊行' : '按系统';
   const intervalMin = Math.round(Number(settings.tapd_sync_interval_seconds||1800)/60);
   const rows = demands.map((d)=>{
@@ -1431,6 +1577,12 @@ async function renderTapd() {
   }).join('');
   const taskRows = overview.recent_tasks.map(t=>[esc(t.demand_no),esc(t.external_task_id),esc(t.title),esc(t.creator||'—'),`${Number(t.estimated_hours||0).toFixed(1)}h`,`${Number(t.completed_hours||0).toFixed(1)}h`,`${Number(t.remaining_hours||0).toFixed(1)}h`,esc(t.planned_end||'—')]);
   const runRows = overview.recent_runs.map(r=>[esc(r.demand_no),esc(r.source),r.success?statusPill('成功'):statusPill('失败'),`${r.changed_count} 条`,esc(r.message),esc(r.created_at)]);
+  const configSection = canConfigure ? `<div class="section"><div class="toolbar"><div><div class="section-title">TAPD连接与同步配置</div><div class="section-subtitle">Live模式对接TAPD开放平台；API凭据仅从服务器环境变量读取，不在页面保存明文。</div></div>${btn('测试连接','btn','tapdTest')}</div>
+    <div class="info-grid" style="grid-template-columns:130px 1fr"><div>API地址</div><div>${esc(cfg.base_url)}</div><div>Workspace ID</div><div>${esc(cfg.workspace_id||'未配置')}</div><div>API账号</div><div>${settings.tapd_credentials_ready?`已配置（${esc(settings.tapd_api_user_masked||'')}）`:'未配置'}</div><div>Webhook</div><div>POST /api/tapd/webhook</div></div>
+    <div class="config-grid"><div><label>运行模式</label><select id="tapdMode" class="select"><option value="mock" ${cfg.mode==='mock'?'selected':''}>Mock演示</option><option value="live" ${cfg.mode==='live'?'selected':''}>Live真实TAPD</option></select></div><div><label>Workspace ID</label><input id="tapdWorkspace" class="field" value="${esc(cfg.workspace_id||'')}"></div><div><label>API Base URL</label><input id="tapdBaseUrl" class="field" value="${esc(cfg.base_url)}"></div><div><label>拆分策略</label><select id="tapdStrategy" class="select"><option value="system" ${settings.tapd_split_strategy==='system'?'selected':''}>按系统生成</option><option value="system_allocation" ${settings.tapd_split_strategy==='system_allocation'?'selected':''}>按系统 + 分摊行</option></select></div><div><label>定时回读（秒）</label><input id="tapdInterval" type="number" min="60" class="field" value="${Number(settings.tapd_sync_interval_seconds||1800)}"></div><div><label>失败重试（秒）</label><input id="tapdRetry" type="number" min="1" class="field" value="${Number(settings.tapd_retry_seconds||30)}"></div></div><div style="margin-top:10px">${btn('保存TAPD配置','btn primary','saveTapdConfig')}</div></div>` : '';
+  const apiMappingSection = `<div class="section"><div class="section-title">开放平台接口映射</div><div class="api-list"><div><b>创建/查询需求</b><code>POST /stories · GET /stories</code><small>终审通过创建；回读需求状态、描述、开发人、计划/完成时间。</small></div><div><b>关联任务</b><code>GET /tasks?story_id=...</code><small>同步任务标题、状态、负责人、计划日期、预估/完成/剩余/超出工时。</small></div><div><b>花费工时</b><code>GET /timesheets?entity_type=task</code><small>同步花费日期、工时、创建人和描述，用于工时偏差预警。</small></div></div></div>`;
+  const integrationSections = `<div class="${canConfigure?'grid-2':''}" style="margin-top:12px">${configSection}${apiMappingSection}</div>`;
+  const demandSyncSection = canViewDemands ? `<div class="section" style="margin-top:12px"><div class="toolbar"><div><div class="section-title">TAPD需求创建与信息回读</div><div class="section-subtitle">支持终审自动创建、手动回读、30分钟定时回读、Webhook及3次异常重试。</div></div><input id="tapdSearch" class="field" style="max-width:280px" placeholder="搜索REQ / 标题 / TAPD ID"></div><div class="table-wrap"><table class="table"><thead><tr><th>需求编号</th><th>需求标题 / 拆分系统</th><th>系统状态</th><th>TAPD需求</th><th>同步 / 重试状态</th><th>最近同步 / 下次重试</th><th>操作</th></tr></thead><tbody id="tapdRows">${rows||'<tr><td colspan="7"><div class="empty">暂无可同步需求</div></td></tr>'}</tbody></table></div></div>` : '';
   appView.innerHTML = `${workflow(4)}
   <div class="grid-4">
     <div class="metric"><div class="k">运行模式</div><div class="v" style="font-size:18px">${cfg.mode==='live'?'Live真实对接':'Mock演示'}</div><div class="sub">${cfg.mode==='live'?`Workspace ${esc(cfg.workspace_id||'未配置')}`:'无需外部账号即可演示全流程'}</div></div>
@@ -1438,14 +1590,8 @@ async function renderTapd() {
     <div class="metric"><div class="k">同步执行</div><div class="v">${overview.success_runs}</div><div class="sub">失败 ${overview.failed_runs} · 待重试 ${overview.waiting_retry}</div></div>
     <div class="metric"><div class="k">定时回读</div><div class="v" style="font-size:18px">每${intervalMin}分钟</div><div class="sub">任务接口单页最多200条，自动分页</div></div>
   </div>
-  <div class="grid-2" style="margin-top:12px">
-    <div class="section"><div class="toolbar"><div><div class="section-title">TAPD连接与同步配置</div><div class="section-subtitle">Live模式对接TAPD开放平台；API凭据仅从服务器环境变量读取，不在页面保存明文。</div></div>${hasPermission('system.integrations')?btn('测试连接','btn','tapdTest'):''}</div>
-      <div class="info-grid" style="grid-template-columns:130px 1fr"><div>API地址</div><div>${esc(cfg.base_url)}</div><div>Workspace ID</div><div>${esc(cfg.workspace_id||'未配置')}</div><div>API账号</div><div>${settings.tapd_credentials_ready?`已配置（${esc(settings.tapd_api_user_masked||'')}）`:'未配置'}</div><div>Webhook</div><div>POST /api/tapd/webhook</div></div>
-      ${hasPermission('system.integrations')?`<div class="config-grid"><div><label>运行模式</label><select id="tapdMode" class="select"><option value="mock" ${cfg.mode==='mock'?'selected':''}>Mock演示</option><option value="live" ${cfg.mode==='live'?'selected':''}>Live真实TAPD</option></select></div><div><label>Workspace ID</label><input id="tapdWorkspace" class="field" value="${esc(cfg.workspace_id||'')}"></div><div><label>API Base URL</label><input id="tapdBaseUrl" class="field" value="${esc(cfg.base_url)}"></div><div><label>拆分策略</label><select id="tapdStrategy" class="select"><option value="system" ${settings.tapd_split_strategy==='system'?'selected':''}>按系统生成</option><option value="system_allocation" ${settings.tapd_split_strategy==='system_allocation'?'selected':''}>按系统 + 分摊行</option></select></div><div><label>定时回读（秒）</label><input id="tapdInterval" type="number" min="60" class="field" value="${Number(settings.tapd_sync_interval_seconds||1800)}"></div><div><label>失败重试（秒）</label><input id="tapdRetry" type="number" min="1" class="field" value="${Number(settings.tapd_retry_seconds||30)}"></div></div><div style="margin-top:10px">${btn('保存TAPD配置','btn primary','saveTapdConfig')}</div>`:''}
-    </div>
-    <div class="section"><div class="section-title">开放平台接口映射</div><div class="api-list"><div><b>创建/查询需求</b><code>POST /stories · GET /stories</code><small>终审通过创建；回读需求状态、描述、开发人、计划/完成时间。</small></div><div><b>关联任务</b><code>GET /tasks?story_id=...</code><small>同步任务标题、状态、负责人、计划日期、预估/完成/剩余/超出工时。</small></div><div><b>花费工时</b><code>GET /timesheets?entity_type=task</code><small>同步花费日期、工时、创建人和描述，用于工时偏差预警。</small></div></div></div>
-  </div>
-  <div class="section" style="margin-top:12px"><div class="toolbar"><div><div class="section-title">TAPD需求创建与信息回读</div><div class="section-subtitle">支持终审自动创建、手动回读、30分钟定时回读、Webhook及3次异常重试。</div></div><input id="tapdSearch" class="field" style="max-width:280px" placeholder="搜索REQ / 标题 / TAPD ID"></div><div class="table-wrap"><table class="table"><thead><tr><th>需求编号</th><th>需求标题 / 拆分系统</th><th>系统状态</th><th>TAPD需求</th><th>同步 / 重试状态</th><th>最近同步 / 下次重试</th><th>操作</th></tr></thead><tbody id="tapdRows">${rows||'<tr><td colspan="7"><div class="empty">暂无可同步需求</div></td></tr>'}</tbody></table></div></div>
+  ${integrationSections}
+  ${demandSyncSection}
   <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">最近回读任务</div>${simpleTable(['需求','任务ID','任务标题','创建/负责人','预估','完成','剩余','预计结束'],taskRows)}</div><div class="section"><div class="section-title">最近同步记录</div>${simpleTable(['需求','来源','结果','变更量','说明','时间'],runRows)}</div></div>`;
   const bindRows=()=>{
     $$('.tapd-detail').forEach((b)=>b.addEventListener('click',()=>navigate(`demand-detail/${b.dataset.id}`,{tab:'tapd'})));
@@ -1454,7 +1600,7 @@ async function renderTapd() {
     $$('.tapd-fail').forEach((b)=>b.addEventListener('click',async()=>{try{const r=await api(`/api/demands/${b.dataset.id}/tapd/push?simulate_failure=true`,{method:'POST'});toast(r.message||'已进入重试队列','warning');await loadNotifications(false);renderTapd();}catch(error){toast(error.message,'error');await loadNotifications(false);renderTapd();}}));
   };
   bindRows();
-  $('#tapdSearch').addEventListener('input',()=>{const q=$('#tapdSearch').value.trim().toLowerCase();$$('#tapdRows tr').forEach(tr=>{tr.style.display=!q||tr.textContent.toLowerCase().includes(q)?'':'none';});});
+  if ($('#tapdSearch')) $('#tapdSearch').addEventListener('input',()=>{const q=$('#tapdSearch').value.trim().toLowerCase();$$('#tapdRows tr').forEach(tr=>{tr.style.display=!q||tr.textContent.toLowerCase().includes(q)?'':'none';});});
   $('#tapdRefresh').addEventListener('click', renderTapd);
   if ($('#tapdRunJobs')) $('#tapdRunJobs').addEventListener('click', async()=>{try{const r=await api('/api/poc/jobs/scan?force=true',{method:'POST'});toast(`后台任务完成：OA提醒${r.data.oaReminders}，TAPD重试${r.data.tapdRetries}，定时回读${r.data.tapdScheduledSync}`,'success');await loadNotifications(false);renderTapd();}catch(e){toast(e.message,'error')}});
   if ($('#tapdTest')) $('#tapdTest').addEventListener('click',async()=>{try{const r=await api('/api/tapd/test-connection',{method:'POST'});const d=r.data;toast(`${d.message}${d.story_count!=null?` · 需求${d.story_count} · 任务${d.task_count}`:''}`,'success');}catch(e){toast(e.message,'error')}});
@@ -1482,7 +1628,7 @@ async function renderAI() {
     const input = $('#aiInput'); const question = input.value.trim(); if(!question||state.aiBusy)return;
     state.chat.push({type:'user',text:question}); input.value=''; state.aiBusy=true; renderAI(); renderAiAssistantWidget();
     try{const result=await askAiAgent(question,{source:'ai-page'});state.aiProvider=result.provider;state.chat.push({type:'ai',text:result.answer,provider:result.provider,fallback:result.fallback});if(result.fallback)toast(`外部智能体暂不可用，已切换本地知识引擎：${result.warning}`,'warn');}
-    catch(error){state.chat.push({type:'ai',text:`查询失败：${error.message}`,provider:'系统提示'});}
+    catch(error){if(error.status!==403)state.chat.push({type:'ai',text:`查询失败：${error.message}`,provider:'系统提示'});}
     finally{state.aiBusy=false;renderAI();renderAiAssistantWidget();}
   };
   $('#aiSend').addEventListener('click',send);
@@ -1494,14 +1640,16 @@ async function renderAI() {
 async function renderInitiativeForm(){
   const id=Number(parseRoute().query.get('id')||0);
   let item=id?(await api(`/api/initiatives/${id}`)).data:null;
-  const budgets=(await api('/api/budget-ledger')).data;
+  const canLinkBudget=hasPermission('budget');
+  const budgets=canLinkBudget?(await api('/api/budget-ledger')).data:[];
+  const budgetField=canLinkBudget?`<div><label>预算来源</label><select id="iniBudget" class="select"><option value="">请选择</option>${budgets.map(b=>`<option value="${b.id}" ${b.id===item?.budget_id?'selected':''}>${esc(b.budget_no)} · ${esc(b.budget_name)}</option>`).join('')}</select></div>`:'';
   const projectTypes=state.v4meta?.project_types||['系统建设','智能化改造','基础设施','咨询服务','研发创新'];
   setPage({title:'新建立项',iconName:'send',crumbs:['立项管理','立项列表'],actions:`${btn('保存草稿','btn','iniSave')}${item?btn('删除草稿','btn danger','iniDelete'):''}${btn('提交审批','btn primary','iniSubmit',item&& !['草稿','已驳回'].includes(item.status)?'disabled':'')}`});
   appView.innerHTML=`<div class="section"><div class="section-title">立项基本信息</div>
     <div class="grid-3"><div><label>立项编号</label><input class="field" value="${esc(item?.initiative_no||'提交后自动生成')}" disabled></div><div><label>项目类型</label><select id="iniType" class="select">${projectTypes.map(x=>`<option ${x===item?.project_type?'selected':''}>${x}</option>`).join('')}</select></div><div><label>紧急程度</label><select id="iniUrgency" class="select">${['高','中','低'].map(x=>`<option ${x===(item?.urgency||'中')?'selected':''}>${x}</option>`).join('')}</select></div></div>
     <div class="form-row"><div class="label required">立项名称</div><input id="iniTitle" class="field" maxlength="100" value="${esc(item?.title||'')}"></div>
     <div class="grid-3"><div><label>申请人</label><input id="iniApplicant" class="field" value="${esc(item?.applicant||state.userDisplay)}"></div><div><label>所属部门</label><input id="iniDept" class="field" value="${esc(item?.department||'数字化管理部')}"></div><div><label>项目负责人</label><input id="iniOwner" class="field" value="${esc(item?.owner||'王卫嘉')}"></div></div>
-    <div class="grid-3" style="margin-top:10px"><div><label>项目发起人/Sponsor</label><input id="iniSponsor" class="field" value="${esc(item?.sponsor||'')}"></div><div><label>预估预算</label><input id="iniAmount" type="number" min="0" class="field" value="${item?.estimated_budget||0}"></div><div><label>预算来源</label><select id="iniBudget" class="select"><option value="">请选择</option>${budgets.map(b=>`<option value="${b.id}" ${b.id===item?.budget_id?'selected':''}>${esc(b.budget_no)} · ${esc(b.budget_name)}</option>`).join('')}</select></div></div>
+    <div class="grid-3" style="margin-top:10px"><div><label>项目发起人/Sponsor</label><input id="iniSponsor" class="field" value="${esc(item?.sponsor||'')}"></div><div><label>预估预算</label><input id="iniAmount" type="number" min="0" class="field" value="${item?.estimated_budget||0}"></div>${budgetField}</div>
     <div class="grid-2" style="margin-top:10px"><div><label>计划开始</label><input id="iniStart" type="date" class="field" value="${item?.planned_start||''}"></div><div><label>计划结束</label><input id="iniEnd" type="date" class="field" value="${item?.planned_end||''}"></div></div>
   </div>
   <div class="section" style="margin-top:12px"><div class="section-title">立项论证</div>
@@ -1512,7 +1660,7 @@ async function renderInitiativeForm(){
     <div style="margin-top:10px"><label>补充说明</label><textarea id="iniDesc" class="textarea">${esc(item?.description||'')}</textarea></div>
     ${item?`<div class="callout" style="margin-top:14px">当前状态：${statusPill(item.status)} · 当前节点：${esc(item.current_node)}</div>`:''}
   </div>`;
-  const corePayload=()=>({title:$('#iniTitle').value.trim(),description:$('#iniDesc').value,applicant:$('#iniApplicant').value,department:$('#iniDept').value,owner:$('#iniOwner').value,estimated_budget:Number($('#iniAmount').value),budget_id:Number($('#iniBudget').value)||null,planned_start:$('#iniStart').value||null,planned_end:$('#iniEnd').value||null});
+  const corePayload=()=>({title:$('#iniTitle').value.trim(),description:$('#iniDesc').value,applicant:$('#iniApplicant').value,department:$('#iniDept').value,owner:$('#iniOwner').value,estimated_budget:Number($('#iniAmount').value),budget_id:Number($('#iniBudget')?.value)||null,planned_start:$('#iniStart').value||null,planned_end:$('#iniEnd').value||null});
   const profilePayload=()=>({project_type:$('#iniType').value,background:$('#iniBackground').value,objectives:$('#iniObjectives').value,scope:$('#iniScope').value,expected_benefit:$('#iniBenefit').value,sponsor:$('#iniSponsor').value,urgency:$('#iniUrgency').value});
   const save=async()=>{if(!$('#iniTitle').value.trim()){toast('请填写立项名称','error');return null;}const r=await api(item?`/api/initiatives/${item.id}`:'/api/initiatives',{method:item?'PUT':'POST',body:JSON.stringify(corePayload())});const iid=item?.id||r.data.id;await api(`/api/initiatives/${iid}/profile`,{method:'PUT',body:JSON.stringify(profilePayload())});item=(await api(`/api/initiatives/${iid}`)).data;return {id:iid,message:r.message};};
   $('#iniSave').addEventListener('click',async()=>{try{const r=await save();if(r){toast('立项草稿已保存','success');navigate('initiative-form',{id:r.id});}}catch(e){toast(e.message,'error')}});
@@ -1521,10 +1669,10 @@ async function renderInitiativeForm(){
 }
 
 async function renderInitiativeList(){
-  setPage({title:'立项列表',iconName:'send',crumbs:['立项管理'],actions:hasPermission('initiative.create')?btn(`${icon('plus')} 新建立项`,'btn primary','iniNew'):''});
+  setPage({title:'立项列表',iconName:'send',crumbs:['立项管理'],actions:canAccessRoute('initiative-form')?btn(`${icon('plus')} 新建立项`,'btn primary','iniNew'):''});
   const items=(await api('/api/initiatives')).data;
   appView.innerHTML=`<div class="section"><div class="toolbar"><input id="iniSearch" class="field" style="max-width:320px" placeholder="搜索立项编号/名称/申请人"><select id="iniStatus" class="select" style="max-width:180px"><option value="">全部状态</option>${['草稿','审批中','已通过','已驳回'].map(x=>`<option>${x}</option>`).join('')}</select></div><div class="table-wrap"><table class="table"><thead><tr><th>立项编号</th><th>立项名称</th><th>项目类型</th><th>申请人</th><th>预估预算</th><th>状态</th><th>当前节点</th><th>操作</th></tr></thead><tbody id="iniRows"></tbody></table></div></div>`;
-  const draw=()=>{const q=$('#iniSearch').value.trim().toLowerCase(),st=$('#iniStatus').value;const rows=items.filter(x=>(!q||`${x.initiative_no} ${x.title} ${x.applicant}`.toLowerCase().includes(q))&&(!st||x.status===st));$('#iniRows').innerHTML=rows.map(x=>`<tr><td>${x.initiative_no}</td><td>${esc(x.title)}</td><td>${esc(x.project_type||'系统建设')}</td><td>${esc(x.applicant)}</td><td>¥${money(x.estimated_budget)}</td><td>${statusPill(x.status)}</td><td>${esc(x.current_node)}</td><td><button class="link iniView" data-id="${x.id}">详情</button>${['草稿','已驳回'].includes(x.status)?` <button class="link iniEdit" data-id="${x.id}">编辑</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="subtle">暂无匹配数据</td></tr>';$$('.iniView').forEach(b=>b.addEventListener('click',()=>navigate(`initiative-detail/${b.dataset.id}`)));$$('.iniEdit').forEach(b=>b.addEventListener('click',()=>navigate('initiative-form',{id:b.dataset.id})));};
+  const draw=()=>{const q=$('#iniSearch').value.trim().toLowerCase(),st=$('#iniStatus').value;const rows=items.filter(x=>(!q||`${x.initiative_no} ${x.title} ${x.applicant}`.toLowerCase().includes(q))&&(!st||x.status===st));$('#iniRows').innerHTML=rows.map(x=>`<tr><td>${x.initiative_no}</td><td>${esc(x.title)}</td><td>${esc(x.project_type||'系统建设')}</td><td>${esc(x.applicant)}</td><td>¥${money(x.estimated_budget)}</td><td>${statusPill(x.status)}</td><td>${esc(x.current_node)}</td><td><button class="link iniView" data-id="${x.id}">详情</button>${canAccessRoute('initiative-form')&&['草稿','已驳回'].includes(x.status)?` <button class="link iniEdit" data-id="${x.id}">编辑</button>`:''}</td></tr>`).join('')||'<tr><td colspan="8" class="subtle">暂无匹配数据</td></tr>';$$('.iniView').forEach(b=>b.addEventListener('click',()=>navigate(`initiative-detail/${b.dataset.id}`)));$$('.iniEdit').forEach(b=>b.addEventListener('click',()=>navigate('initiative-form',{id:b.dataset.id})));};
   $('#iniSearch').addEventListener('input',draw);$('#iniStatus').addEventListener('change',draw);if($('#iniNew'))$('#iniNew').addEventListener('click',()=>navigate('initiative-form'));draw();
 }
 async function renderInitiativeDetail(id){
@@ -1539,15 +1687,17 @@ async function renderInitiativeDetail(id){
 async function renderInitiativeApprovals(){setPage({title:'立项审批',iconName:'approve',crumbs:['立项管理']});const items=(await api('/api/initiative-approvals/pending')).data;appView.innerHTML=`<div class="section"><div class="section-title">我的立项审批待办</div>${simpleTable(['立项编号','名称','预算','当前节点','操作'],items.map(x=>[x.initiative_no,esc(x.title),`¥${money(x.estimated_budget)}`,x.current_node,`<button class="link iniApprove" data-id="${x.id}">处理</button>`]))}</div>`;$$('.iniApprove').forEach(b=>b.addEventListener('click',async()=>{const x=(await api(`/api/initiatives/${b.dataset.id}`)).data;showModal(`<h3 id="modalTitle">${esc(x.current_node)}</h3><div class="callout">${esc(x.initiative_no)} · ${esc(x.title)} · ¥${money(x.estimated_budget)}</div><textarea id="iniComment" class="textarea" placeholder="审批意见"></textarea><div class="modal-actions">${btn('驳回','btn danger','iniReject')}${btn('通过','btn primary','iniPass')}</div>`);for(const [id,action] of [['iniReject','驳回'],['iniPass','通过']])$('#'+id).addEventListener('click',async()=>{await api(`/api/initiatives/${x.id}/approve`,{method:'POST',body:JSON.stringify({action,comment:$('#iniComment').value})});closeModal();toast(`已${action}`,'success');renderInitiativeApprovals();});}));}
 
 async function renderProjectList(){setPage({title:'项目台账',iconName:'project',crumbs:['项目管理'],actions:hasPermission('project')?btn(`${icon('plus')} 新建项目`,'btn primary','projectNew'):''});const items=(await api('/api/projects')).data;appView.innerHTML=`<div class="section"><div class="table-wrap"><table class="table"><thead><tr><th>项目编号</th><th>项目名称</th><th>项目经理</th><th>部门</th><th>预算</th><th>状态</th><th>进度</th><th>周期</th><th>操作</th></tr></thead><tbody>${items.map(x=>`<tr><td>${x.project_no}</td><td>${esc(x.name)}</td><td>${esc(x.manager)}</td><td>${esc(x.department)}</td><td>¥${money(x.total_budget)}</td><td>${statusPill(x.status)}</td><td>${progressCell(x.progress)}</td><td>${x.start_date||'—'} ~ ${x.end_date||'—'}</td><td><button class="link pView" data-id="${x.id}">项目详情</button></td></tr>`).join('')}</tbody></table></div></div>`;$$('.pView').forEach(b=>b.addEventListener('click',()=>navigate(`project-detail/${b.dataset.id}`)));if($('#projectNew'))$('#projectNew').addEventListener('click',()=>openProjectForm());}
-async function openProjectForm(item={}){const budgets=(await api('/api/budget-ledger')).data;showModal(`<h3 id="modalTitle">${item.id?'编辑':'新建'}项目</h3><div class="form-row"><div class="label required">项目名称</div><input id="pName" class="field" value="${esc(item.name||'')}"></div><div class="grid-2"><div><label>项目经理</label><input id="pManager" class="field" value="${esc(item.manager||'王卫嘉')}"></div><div><label>部门</label><input id="pDept" class="field" value="${esc(item.department||'数字化管理部')}"></div></div><div class="grid-2" style="margin-top:10px"><div><label>关联预算</label><select id="pBudget" class="select"><option value="">请选择</option>${budgets.map(b=>`<option value="${b.id}" ${b.id===item.budget_id?'selected':''}>${esc(b.budget_no)} · ${esc(b.budget_name)}</option>`).join('')}</select></div><div><label>项目预算</label><input id="pTotal" type="number" class="field" value="${item.total_budget||0}"></div></div><div class="grid-3" style="margin-top:10px"><div><label>状态</label><select id="pStatus" class="select">${['规划中','实施中','暂停','已完成'].map(s=>`<option ${s===item.status?'selected':''}>${s}</option>`).join('')}</select></div><div><label>进度</label><input id="pProgress" type="number" min="0" max="100" class="field" value="${item.progress||0}"></div><div><label>开始日期</label><input id="pStart" type="date" class="field" value="${item.start_date||''}"></div></div><div style="margin-top:10px"><label>结束日期</label><input id="pEnd" type="date" class="field" value="${item.end_date||''}"></div><div style="margin-top:10px"><label>项目说明</label><textarea id="pDesc" class="textarea">${esc(item.description||'')}</textarea></div><div class="modal-actions">${btn('取消','btn','pCancel')}${btn('保存','btn primary','pSave')}</div>`);$('#pCancel').addEventListener('click',closeModal);$('#pSave').addEventListener('click',async()=>{const p={name:$('#pName').value,manager:$('#pManager').value,department:$('#pDept').value,budget_id:Number($('#pBudget').value)||null,total_budget:Number($('#pTotal').value),status:$('#pStatus').value,progress:Number($('#pProgress').value),start_date:$('#pStart').value||null,end_date:$('#pEnd').value||null,description:$('#pDesc').value};const r=await api(item.id?`/api/projects/${item.id}`:'/api/projects',{method:item.id?'PUT':'POST',body:JSON.stringify(p)});closeModal();toast(r.message,'success');renderProjectList();});}
+async function openProjectForm(item={}){const canLinkBudget=hasPermission('budget');const budgets=canLinkBudget?(await api('/api/budget-ledger')).data:[];const budgetField=canLinkBudget?`<div><label>关联预算</label><select id="pBudget" class="select"><option value="">不关联</option>${budgets.map(b=>`<option value="${b.id}" ${b.id===item.budget_id?'selected':''}>${esc(b.budget_no)} · ${esc(b.budget_name)}</option>`).join('')}</select></div>`:'';showModal(`<h3 id="modalTitle">${item.id?'编辑':'新建'}项目</h3><div class="form-row"><div class="label required">项目名称</div><input id="pName" class="field" value="${esc(item.name||'')}"></div><div class="grid-2"><div><label>项目经理</label><input id="pManager" class="field" value="${esc(item.manager||'王卫嘉')}"></div><div><label>部门</label><input id="pDept" class="field" value="${esc(item.department||'数字化管理部')}"></div></div><div class="grid-2" style="margin-top:10px">${budgetField}<div><label>项目预算</label><input id="pTotal" type="number" class="field" value="${item.total_budget||0}"></div></div><div class="grid-3" style="margin-top:10px"><div><label>状态</label><select id="pStatus" class="select">${['规划中','实施中','暂停','已完成'].map(s=>`<option ${s===item.status?'selected':''}>${s}</option>`).join('')}</select></div><div><label>进度</label><input id="pProgress" type="number" min="0" max="100" class="field" value="${item.progress||0}"></div><div><label>开始日期</label><input id="pStart" type="date" class="field" value="${item.start_date||''}"></div></div><div style="margin-top:10px"><label>结束日期</label><input id="pEnd" type="date" class="field" value="${item.end_date||''}"></div><div style="margin-top:10px"><label>项目说明</label><textarea id="pDesc" class="textarea">${esc(item.description||'')}</textarea></div><div class="modal-actions">${btn('取消','btn','pCancel')}${btn('保存','btn primary','pSave')}</div>`);$('#pCancel').addEventListener('click',closeModal);$('#pSave').addEventListener('click',async()=>{const p={name:$('#pName').value,manager:$('#pManager').value,department:$('#pDept').value,budget_id:Number($('#pBudget')?.value)||null,total_budget:Number($('#pTotal').value),status:$('#pStatus').value,progress:Number($('#pProgress').value),start_date:$('#pStart').value||null,end_date:$('#pEnd').value||null,description:$('#pDesc').value};const r=await api(item.id?`/api/projects/${item.id}`:'/api/projects',{method:item.id?'PUT':'POST',body:JSON.stringify(p)});closeModal();toast(r.message,'success');renderProjectList();});}
 async function renderProjectDetail(id,query){
   const [d,risks,deliverables]=await Promise.all([api(`/api/projects/${id}`),api(`/api/projects/${id}/risks`),api(`/api/projects/${id}/deliverables`)]);const p=d.data;
   setPage({title:'项目详情',iconName:'project',crumbs:['项目管理','项目台账'],actions:`${hasPermission('project')?btn('编辑项目','btn','editProject'):''}${btn('360视图','btn primary','open360')}`});
   const high=risks.data.filter(x=>x.level==='高'&&x.status!=='已关闭').length;
-  appView.innerHTML=`<div class="grid-4"><div class="metric"><div class="k">项目状态</div><div class="v">${esc(p.status)}</div><div class="sub">健康度 ${esc(p.health||'正常')}</div></div><div class="metric"><div class="k">总体进度</div><div class="v">${p.progress}%</div>${progressCell(p.progress,false)}</div><div class="metric"><div class="k">项目预算</div><div class="v" style="font-size:17px">¥${money(p.total_budget)}</div><div class="sub">${esc(p.budget?.budget_name||'未关联预算')}</div></div><div class="metric"><div class="k">风险</div><div class="v">${risks.data.length}</div><div class="sub">高风险 ${high} 项</div></div></div>
+  const budgetMetric=hasPermission('budget')?`<div class="metric"><div class="k">项目预算</div><div class="v" style="font-size:17px">¥${money(p.total_budget)}</div><div class="sub">${esc(p.budget?.budget_name||'未关联预算')}</div></div>`:'';
+  const relationSections=`${hasPermission('contract')?`<div class="section"><div class="section-title">合同</div>${simpleTable(['合同编号','名称','金额','状态'],p.contracts.map(x=>[x.contract_no,x.name,`¥${money(x.total_amount)}`,statusPill(x.status)]))}</div>`:''}${hasPermission('settlement')?`<div class="section"><div class="section-title">结算</div>${simpleTable(['结算编号','类型','金额','状态'],p.settlements.map(x=>[x.settlement_no,x.settlement_type,`¥${money(x.amount)}`,statusPill(x.status)]))}</div>`:''}`;
+  appView.innerHTML=`<div class="grid-4"><div class="metric"><div class="k">项目状态</div><div class="v">${esc(p.status)}</div><div class="sub">健康度 ${esc(p.health||'正常')}</div></div><div class="metric"><div class="k">总体进度</div><div class="v">${p.progress}%</div>${progressCell(p.progress,false)}</div>${budgetMetric}<div class="metric"><div class="k">风险</div><div class="v">${risks.data.length}</div><div class="sub">高风险 ${high} 项</div></div></div>
   <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">项目基本信息</div><div class="detail-grid"><div><span>项目编号</span><b>${p.project_no}</b></div><div><span>项目名称</span><b>${esc(p.name)}</b></div><div><span>项目经理</span><b>${esc(p.manager)}</b></div><div><span>所属部门</span><b>${esc(p.department)}</b></div><div><span>计划周期</span><b>${p.start_date||'—'} ~ ${p.end_date||'—'}</b></div><div><span>项目类型</span><b>${esc(p.project_type||'系统建设')}</b></div></div><div class="description">${esc(p.description||'')}</div></div><div class="section"><div class="section-title">里程碑</div>${simpleTable(['名称','计划日期','状态','负责人'],p.milestones.map(x=>[x.name,x.planned_date||'—',statusPill(x.status),x.owner]))}</div></div>
   <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">任务</div>${simpleTable(['任务','负责人','状态','进度'],p.tasks.slice(0,8).map(x=>[x.title,x.owner,statusPill(x.status),progressCell(x.progress)]))}</div><div class="section"><div class="section-title">风险与交付</div>${simpleTable(['类型','编号/名称','状态','负责人'],[...risks.data.slice(0,4).map(x=>['风险',x.risk_no+' '+esc(x.title),statusPill(x.level+' / '+x.status),esc(x.owner)]),...deliverables.data.slice(0,4).map(x=>['交付物',x.deliverable_no+' '+esc(x.name),statusPill(x.status),esc(x.owner)])])}</div></div>
-  <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">合同</div>${simpleTable(['合同编号','名称','金额','状态'],p.contracts.map(x=>[x.contract_no,x.name,`¥${money(x.total_amount)}`,statusPill(x.status)]))}</div><div class="section"><div class="section-title">结算</div>${simpleTable(['结算编号','类型','金额','状态'],p.settlements.map(x=>[x.settlement_no,x.settlement_type,`¥${money(x.amount)}`,statusPill(x.status)]))}</div></div>`;
+  ${relationSections?`<div class="grid-2" style="margin-top:12px">${relationSections}</div>`:''}`;
   if($('#editProject'))$('#editProject').addEventListener('click',()=>openProjectForm(p));$('#open360').addEventListener('click',()=>navigate('project360',{projectId:id}));
 }
 
@@ -1564,10 +1714,23 @@ async function renderProjectTasks(){setPage({title:'任务管理',iconName:'proj
 async function renderMilestones(){setPage({title:'里程碑管理',iconName:'project',crumbs:['项目管理']});const projects=(await api('/api/projects')).data;const selected=Number(parseRoute().query.get('projectId')||projects[0]?.id||0);if(!selected){appView.innerHTML='<div class="empty">暂无项目</div>';return;}const d=(await api(`/api/projects/${selected}`)).data;appView.innerHTML=`<div class="section"><div class="toolbar"><select id="mProject" class="select" style="max-width:360px">${projects.map(p=>`<option value="${p.id}" ${p.id===selected?'selected':''}>${p.project_no} · ${esc(p.name)}</option>`).join('')}</select>${btn(`${icon('plus')} 新建里程碑`,'btn primary','mNew')}</div>${simpleTable(['里程碑','计划日期','实际日期','状态','负责人','说明','操作'],d.milestones.map(x=>[esc(x.name),x.planned_date||'—',x.actual_date||'—',statusPill(x.status),esc(x.owner),esc(x.description),`<button class="link mEdit" data-id="${x.id}">编辑</button> <button class="link mDel" data-id="${x.id}">删除</button>`]))}</div>`;$('#mProject').addEventListener('change',e=>navigate('milestones',{projectId:e.target.value}));const form=(x={})=>{showModal(`<h3 id="modalTitle">${x.id?'编辑':'新建'}里程碑</h3><input id="mName" class="field" placeholder="里程碑名称" value="${esc(x.name||'')}"><div class="grid-2" style="margin-top:10px"><input id="mPlan" type="date" class="field" value="${x.planned_date||''}"><input id="mActual" type="date" class="field" value="${x.actual_date||''}"></div><div class="grid-2" style="margin-top:10px"><select id="mStatus" class="select">${['未完成','进行中','已完成','延期'].map(s=>`<option ${s===x.status?'selected':''}>${s}</option>`).join('')}</select><input id="mOwner" class="field" placeholder="负责人" value="${esc(x.owner||'')}"></div><textarea id="mDesc" class="textarea" style="margin-top:10px">${esc(x.description||'')}</textarea><div class="modal-actions">${btn('取消','btn','mCancel')}${btn('保存','btn primary','mSave')}</div>`);$('#mCancel').addEventListener('click',closeModal);$('#mSave').addEventListener('click',async()=>{const p={name:$('#mName').value,planned_date:$('#mPlan').value||null,actual_date:$('#mActual').value||null,status:$('#mStatus').value,owner:$('#mOwner').value,description:$('#mDesc').value};await api(x.id?`/api/milestones/${x.id}`:`/api/projects/${selected}/milestones`,{method:x.id?'PUT':'POST',body:JSON.stringify(p)});closeModal();renderMilestones();});};$('#mNew').addEventListener('click',()=>form());$$('.mEdit').forEach(b=>b.addEventListener('click',()=>form(d.milestones.find(x=>x.id===Number(b.dataset.id)))));$$('.mDel').forEach(b=>b.addEventListener('click',async()=>{await api(`/api/milestones/${b.dataset.id}`,{method:'DELETE'});renderMilestones();}));}
 
 async function renderSettlementForm(){
-  const id=Number(parseRoute().query.get('id')||0);const projects=(await api('/api/projects')).data,contracts=(await api('/api/contracts')).data,budgets=(await api('/api/budget-ledger')).data,all=(await api('/api/settlements')).data,item=id?all.find(x=>x.id===id):null;
+  const id=Number(parseRoute().query.get('id')||0);
+  const canLinkProject=hasPermission('project360')||hasPermission('project');
+  const canLinkContract=hasPermission('contract');
+  const canLinkBudget=hasPermission('budget');
+  const [projects,contracts,budgets,all]=await Promise.all([
+    canLinkProject?api('/api/projects').then(r=>r.data):Promise.resolve([]),
+    canLinkContract?api('/api/contracts').then(r=>r.data):Promise.resolve([]),
+    canLinkBudget?api('/api/budget-ledger').then(r=>r.data):Promise.resolve([]),
+    api('/api/settlements').then(r=>r.data)
+  ]);
+  const item=id?all.find(x=>x.id===id):null;
+  const projectField=canLinkProject?`<div><label>项目</label><select id="setProject" class="select"><option value="">请选择</option>${projects.map(x=>`<option value="${x.id}" ${x.id===item?.project_id?'selected':''}>${x.project_no} · ${esc(x.name)}</option>`).join('')}</select></div>`:'';
+  const contractField=canLinkContract?`<div><label>合同</label><select id="setContract" class="select"><option value="">请选择</option>${contracts.map(x=>`<option value="${x.id}" ${x.id===item?.contract_id?'selected':''}>${x.contract_no} · ${esc(x.name)}</option>`).join('')}</select></div>`:'';
+  const budgetField=canLinkBudget?`<div><label>预算</label><select id="setBudget" class="select"><option value="">请选择</option>${budgets.map(x=>`<option value="${x.id}" ${x.id===item?.budget_id?'selected':''}>${x.budget_no} · ${esc(x.budget_name)}</option>`).join('')}</select></div>`:'';
   setPage({title:'结算申请',iconName:'settle',crumbs:['结算管理'],actions:`${btn('保存草稿','btn','setSave')}${btn('提交审批','btn primary','setSubmit')}`});
-  appView.innerHTML=`<div class="section"><div class="section-title">结算基本信息</div><div class="grid-3"><div><label>结算类型</label><select id="setType" class="select">${['项目结算','合同付款结算','费用报销结算'].map(v=>`<option ${v===item?.settlement_type?'selected':''}>${v}</option>`).join('')}</select></div><div><label>项目</label><select id="setProject" class="select"><option value="">请选择</option>${projects.map(x=>`<option value="${x.id}" ${x.id===item?.project_id?'selected':''}>${x.project_no} · ${esc(x.name)}</option>`).join('')}</select></div><div><label>合同</label><select id="setContract" class="select"><option value="">请选择</option>${contracts.map(x=>`<option value="${x.id}" ${x.id===item?.contract_id?'selected':''}>${x.contract_no} · ${esc(x.name)}</option>`).join('')}</select></div></div><div class="grid-3" style="margin-top:10px"><div><label>预算</label><select id="setBudget" class="select"><option value="">请选择</option>${budgets.map(x=>`<option value="${x.id}" ${x.id===item?.budget_id?'selected':''}>${x.budget_no} · ${esc(x.budget_name)}</option>`).join('')}</select></div><div><label>结算金额</label><input id="setAmount" type="number" class="field" value="${item?.amount||0}"></div><div><label>申请人</label><input id="setApplicant" class="field" value="${esc(item?.applicant||state.userDisplay)}"></div></div><div style="margin-top:10px"><label>结算说明</label><textarea id="setDesc" class="textarea">${esc(item?.description||'')}</textarea></div>${item?`<div class="callout" style="margin-top:12px">${item.settlement_no} · ${statusPill(item.status)} · ${esc(item.current_node)}<div class="help">保存后可在结算详情中维护明细项，明细合计会自动回写结算金额。</div></div>`:''}</div>`;
-  const payload=()=>({project_id:Number($('#setProject').value)||null,contract_id:Number($('#setContract').value)||null,budget_id:Number($('#setBudget').value)||null,amount:Number($('#setAmount').value),settlement_type:$('#setType').value,applicant:$('#setApplicant').value,description:$('#setDesc').value});
+  appView.innerHTML=`<div class="section"><div class="section-title">结算基本信息</div><div class="grid-3"><div><label>结算类型</label><select id="setType" class="select">${['项目结算','合同付款结算','费用报销结算'].map(v=>`<option ${v===item?.settlement_type?'selected':''}>${v}</option>`).join('')}</select></div>${projectField}${contractField}</div><div class="grid-3" style="margin-top:10px">${budgetField}<div><label>结算金额</label><input id="setAmount" type="number" class="field" value="${item?.amount||0}"></div><div><label>申请人</label><input id="setApplicant" class="field" value="${esc(item?.applicant||state.userDisplay)}"></div></div><div style="margin-top:10px"><label>结算说明</label><textarea id="setDesc" class="textarea">${esc(item?.description||'')}</textarea></div>${item?`<div class="callout" style="margin-top:12px">${item.settlement_no} · ${statusPill(item.status)} · ${esc(item.current_node)}<div class="help">保存后可在结算详情中维护明细项，明细合计会自动回写结算金额。</div></div>`:''}</div>`;
+  const payload=()=>({project_id:Number($('#setProject')?.value)||null,contract_id:Number($('#setContract')?.value)||null,budget_id:Number($('#setBudget')?.value)||null,amount:Number($('#setAmount').value),settlement_type:$('#setType').value,applicant:$('#setApplicant').value,description:$('#setDesc').value});
   $('#setSave').addEventListener('click',async()=>{try{const r=await api(item?`/api/settlements/${item.id}`:'/api/settlements',{method:item?'PUT':'POST',body:JSON.stringify(payload())});toast(r.message,'success');navigate(item?`settlement-detail/${item.id}`:`settlement-detail/${r.data.id}`);}catch(e){toast(e.message,'error')}});$('#setSubmit').addEventListener('click',async()=>{try{let sid=item?.id;if(!sid){const r=await api('/api/settlements',{method:'POST',body:JSON.stringify(payload())});sid=r.data.id;}const r=await api(`/api/settlements/${sid}/submit`,{method:'POST'});toast(r.message,'success');navigate(`settlement-detail/${sid}`);}catch(e){toast(e.message,'error')}});
 }
 async function renderSettlementList(){
@@ -1586,7 +1749,7 @@ async function renderIndicatorData(){setPage({title:'指标数据',iconName:'ind
 async function renderIndicatorBoard(){setPage({title:'指标看板',iconName:'indicator',crumbs:['指标库']});const items=(await api('/api/indicators')).data;appView.innerHTML=`<div class="grid-3">${items.map(x=>{const rate=Number(x.target_value)?Number(x.current_value)/Number(x.target_value)*100:0;return `<div class="metric"><div class="k">${esc(x.category)} · ${esc(x.indicator_no)}</div><div class="v" style="font-size:17px">${esc(x.name)}</div><div class="kpi-number" style="font-size:22px">${x.current_value}${esc(x.unit)}</div><div class="sub">目标 ${x.target_value}${esc(x.unit)}</div><div class="progress" style="margin-top:10px"><span style="width:${Math.min(100,Math.max(0,rate))}%"></span></div><div class="sub">目标达成 ${rate.toFixed(1)}%</div></div>`;}).join('')}</div>`;}
 
 async function renderContractList(){setPage({title:'合同台账',iconName:'contract',crumbs:['合同管理'],actions:btn(`${icon('plus')} 新建合同`,'btn primary','cNew')});const items=(await api('/api/contracts')).data;appView.innerHTML=`<div class="section">${simpleTable(['合同编号','合同名称','项目','供应商','合同金额','周期','状态','当前节点','操作'],items.map(x=>[x.contract_no,esc(x.name),esc(x.project_name||'—'),esc(x.supplier),`¥${money(x.total_amount)}`,`${x.start_date||'—'} ~ ${x.end_date||'—'}`,statusPill(x.status),x.current_node,`<button class="link cView" data-id="${x.id}">详情</button>`]))}</div>`;$('#cNew').addEventListener('click',()=>openContractForm());$$('.cView').forEach(b=>b.addEventListener('click',()=>navigate(`contract-detail/${b.dataset.id}`)));}
-async function openContractForm(item={}){const projects=(await api('/api/projects')).data,budgets=(await api('/api/budget-ledger')).data;showModal(`<h3 id="modalTitle">${item.id?'编辑':'新建'}合同</h3><input id="cName" class="field" placeholder="合同名称" value="${esc(item.name||'')}"><div class="grid-2" style="margin-top:10px"><select id="cProject" class="select"><option value="">关联项目</option>${projects.map(x=>`<option value="${x.id}" ${x.id===item.project_id?'selected':''}>${x.project_no} · ${esc(x.name)}</option>`).join('')}</select><select id="cBudget" class="select"><option value="">关联预算</option>${budgets.map(x=>`<option value="${x.id}" ${x.id===item.budget_id?'selected':''}>${x.budget_no} · ${esc(x.budget_name)}</option>`).join('')}</select></div><div class="grid-2" style="margin-top:10px"><input id="cSupplier" class="field" placeholder="供应商" value="${esc(item.supplier||'')}"><input id="cAmount" type="number" class="field" value="${item.total_amount||0}"></div><div class="grid-2" style="margin-top:10px"><input id="cStart" type="date" class="field" value="${item.start_date||''}"><input id="cEnd" type="date" class="field" value="${item.end_date||''}"></div><input id="cOwner" class="field" style="margin-top:10px" placeholder="合同负责人" value="${esc(item.owner||'')}"><textarea id="cDesc" class="textarea" style="margin-top:10px">${esc(item.description||'')}</textarea><div class="modal-actions">${btn('取消','btn','cCancel')}${btn('保存','btn primary','cSave')}</div>`);$('#cCancel').addEventListener('click',closeModal);$('#cSave').addEventListener('click',async()=>{const p={name:$('#cName').value,project_id:Number($('#cProject').value)||null,budget_id:Number($('#cBudget').value)||null,supplier:$('#cSupplier').value,total_amount:Number($('#cAmount').value),start_date:$('#cStart').value||null,end_date:$('#cEnd').value||null,owner:$('#cOwner').value,description:$('#cDesc').value};await api(item.id?`/api/contracts/${item.id}`:'/api/contracts',{method:item.id?'PUT':'POST',body:JSON.stringify(p)});closeModal();renderContractList();});}
+async function openContractForm(item={}){const canLinkProject=hasPermission('project360')||hasPermission('project'),canLinkBudget=hasPermission('budget');const [projects,budgets]=await Promise.all([canLinkProject?api('/api/projects').then(r=>r.data):Promise.resolve([]),canLinkBudget?api('/api/budget-ledger').then(r=>r.data):Promise.resolve([])]);const relationFields=`${canLinkProject?`<select id="cProject" class="select"><option value="">不关联项目</option>${projects.map(x=>`<option value="${x.id}" ${x.id===item.project_id?'selected':''}>${x.project_no} · ${esc(x.name)}</option>`).join('')}</select>`:''}${canLinkBudget?`<select id="cBudget" class="select"><option value="">不关联预算</option>${budgets.map(x=>`<option value="${x.id}" ${x.id===item.budget_id?'selected':''}>${x.budget_no} · ${esc(x.budget_name)}</option>`).join('')}</select>`:''}`;showModal(`<h3 id="modalTitle">${item.id?'编辑':'新建'}合同</h3><input id="cName" class="field" placeholder="合同名称" value="${esc(item.name||'')}">${relationFields?`<div class="grid-2" style="margin-top:10px">${relationFields}</div>`:''}<div class="grid-2" style="margin-top:10px"><input id="cSupplier" class="field" placeholder="供应商" value="${esc(item.supplier||'')}"><input id="cAmount" type="number" class="field" value="${item.total_amount||0}"></div><div class="grid-2" style="margin-top:10px"><input id="cStart" type="date" class="field" value="${item.start_date||''}"><input id="cEnd" type="date" class="field" value="${item.end_date||''}"></div><input id="cOwner" class="field" style="margin-top:10px" placeholder="合同负责人" value="${esc(item.owner||'')}"><textarea id="cDesc" class="textarea" style="margin-top:10px">${esc(item.description||'')}</textarea><div class="modal-actions">${btn('取消','btn','cCancel')}${btn('保存','btn primary','cSave')}</div>`);$('#cCancel').addEventListener('click',closeModal);$('#cSave').addEventListener('click',async()=>{const p={name:$('#cName').value,project_id:Number($('#cProject')?.value)||null,budget_id:Number($('#cBudget')?.value)||null,supplier:$('#cSupplier').value,total_amount:Number($('#cAmount').value),start_date:$('#cStart').value||null,end_date:$('#cEnd').value||null,owner:$('#cOwner').value,description:$('#cDesc').value};await api(item.id?`/api/contracts/${item.id}`:'/api/contracts',{method:item.id?'PUT':'POST',body:JSON.stringify(p)});closeModal();renderContractList();});}
 async function renderContractDetail(id){
   const [cr,changes]=await Promise.all([api(`/api/contracts/${id}`),api(`/api/contracts/${id}/changes`)]);const c=cr.data;
   setPage({title:'合同详情',iconName:'contract',crumbs:['合同管理','合同台账'],actions:`${['草稿','已驳回'].includes(c.status)?btn('编辑','btn','cEdit')+btn('提交审批','btn primary','cSubmit'):''}${btn('新增变更','btn','cChange')}`});
@@ -1626,13 +1789,15 @@ function openChangePassword() {
 }
 
 async function renderUsers(){
-  setPage({title:'用户管理',iconName:'user',crumbs:['系统管理'],actions:btn(`${icon('plus')} 新增用户`,'btn primary','userNew')});
-  const [usersResp,rolesResp]=await Promise.all([api('/api/system/users'),api('/api/system/roles')]);
+  const canManageRoles=hasPermission('system.roles');
+  setPage({title:'用户管理',iconName:'user',crumbs:['系统管理'],actions:canManageRoles?btn(`${icon('plus')} 新增用户`,'btn primary','userNew'):''});
+  const [usersResp,rolesResp]=await Promise.all([api('/api/system/users'),canManageRoles?api('/api/system/roles'):Promise.resolve({data:[]})]);
   const users=usersResp.data,roles=rolesResp.data.filter(r=>r.status==='启用');
-  appView.innerHTML=`<div class="section"><div class="toolbar"><div class="filters"><input id="userSearch" class="field" style="max-width:300px" placeholder="账号 / 姓名 / 部门"><select id="userRoleFilter" class="select" style="max-width:190px"><option value="">全部角色</option>${roles.map(r=>`<option value="${esc(r.code)}">${esc(r.label)}</option>`).join('')}</select><select id="userStatusFilter" class="select" style="max-width:140px"><option value="">全部状态</option><option>启用</option><option>停用</option></select></div><div class="subtle">共 ${users.length} 个账号</div></div>
+  const roleFilter=canManageRoles?`<select id="userRoleFilter" class="select" style="max-width:190px"><option value="">全部角色</option>${roles.map(r=>`<option value="${esc(r.code)}">${esc(r.label)}</option>`).join('')}</select>`:'';
+  appView.innerHTML=`<div class="section"><div class="toolbar"><div class="filters"><input id="userSearch" class="field" style="max-width:300px" placeholder="账号 / 姓名 / 部门">${roleFilter}<select id="userStatusFilter" class="select" style="max-width:140px"><option value="">全部状态</option><option>启用</option><option>停用</option></select></div><div class="subtle">共 ${users.length} 个账号</div></div>
   <div class="table-wrap"><table class="table"><thead><tr><th>账号</th><th>姓名</th><th>部门</th><th>角色</th><th>联系方式</th><th>状态</th><th>最近登录</th><th>操作</th></tr></thead><tbody id="userRows"></tbody></table></div></div>`;
-  const draw=()=>{const q=$('#userSearch').value.trim().toLowerCase(),role=$('#userRoleFilter').value,st=$('#userStatusFilter').value;const rows=users.filter(u=>(!q||`${u.username} ${u.display_name} ${u.department}`.toLowerCase().includes(q))&&(!role||(u.role_codes||[u.role_code]).includes(role))&&(!st||u.status===st));$('#userRows').innerHTML=rows.map(u=>`<tr><td><span class="detail-no">${esc(u.username)}</span></td><td>${esc(u.display_name)}</td><td>${esc(u.department||'—')}</td><td><div class="role-chip-list">${(u.role_labels||[u.role_label]).map(label=>`<span>${esc(label)}</span>`).join('')}</div></td><td><div>${esc(u.email||'—')}</div><div class="subtle">${esc(u.phone||'')}</div></td><td>${statusPill(u.status)}</td><td>${esc(u.last_login||'从未登录')}</td><td><div class="action-group"><button class="link userEdit" data-id="${u.id}">编辑</button><button class="link userReset" data-id="${u.id}">重置密码</button></div></td></tr>`).join('')||'<tr><td colspan="8" class="empty">暂无匹配账号</td></tr>';$$('.userEdit').forEach(b=>b.addEventListener('click',()=>openUserForm(users.find(u=>u.id===Number(b.dataset.id)),roles)));$$('.userReset').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('确认将该账号密码重置为系统演示初始密码？'))return;try{const r=await api(`/api/system/users/${b.dataset.id}/reset-password`,{method:'POST'});toast(r.message,'success');}catch(e){toast(e.message,'error')}}));};
-  ['userSearch','userRoleFilter','userStatusFilter'].forEach(id=>$('#'+id).addEventListener(id==='userSearch'?'input':'change',draw));$('#userNew').addEventListener('click',()=>openUserForm(null,roles));draw();
+  const draw=()=>{const q=$('#userSearch').value.trim().toLowerCase(),role=$('#userRoleFilter')?.value||'',st=$('#userStatusFilter').value;const rows=users.filter(u=>(!q||`${u.username} ${u.display_name} ${u.department}`.toLowerCase().includes(q))&&(!role||(u.role_codes||[u.role_code]).includes(role))&&(!st||u.status===st));$('#userRows').innerHTML=rows.map(u=>`<tr><td><span class="detail-no">${esc(u.username)}</span></td><td>${esc(u.display_name)}</td><td>${esc(u.department||'—')}</td><td><div class="role-chip-list">${(u.role_labels||[u.role_label]).map(label=>`<span>${esc(label)}</span>`).join('')}</div></td><td><div>${esc(u.email||'—')}</div><div class="subtle">${esc(u.phone||'')}</div></td><td>${statusPill(u.status)}</td><td>${esc(u.last_login||'从未登录')}</td><td><div class="action-group">${canManageRoles?`<button class="link userEdit" data-id="${u.id}">编辑</button>`:''}<button class="link userReset" data-id="${u.id}">重置密码</button></div></td></tr>`).join('')||'<tr><td colspan="8" class="empty">暂无匹配账号</td></tr>';$$('.userEdit').forEach(b=>b.addEventListener('click',()=>openUserForm(users.find(u=>u.id===Number(b.dataset.id)),roles)));$$('.userReset').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('确认将该账号密码重置为系统演示初始密码？'))return;try{const r=await api(`/api/system/users/${b.dataset.id}/reset-password`,{method:'POST'});toast(r.message,'success');}catch(e){toast(e.message,'error')}}));};
+  ['userSearch','userStatusFilter',...(canManageRoles?['userRoleFilter']:[])].forEach(id=>$('#'+id).addEventListener(id==='userSearch'?'input':'change',draw));if($('#userNew'))$('#userNew').addEventListener('click',()=>openUserForm(null,roles));draw();
 }
 
 function openUserForm(item,roles){

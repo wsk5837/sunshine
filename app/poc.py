@@ -939,13 +939,27 @@ def tapd_test_connection(x_role: Optional[str] = Header(None)):
 def tapd_overview():
     with connect() as conn:
         cfg = tapd_runtime_config(conn)
+        split_strategy = get_setting(conn, "tapd_split_strategy", "system")
+        sync_interval_seconds = int(float(get_setting(conn, "tapd_sync_interval_seconds", "1800")))
+        retry_seconds = int(float(get_setting(conn, "tapd_retry_seconds", "30")))
         req_count = conn.execute("SELECT COUNT(*) c FROM tapd_requirements").fetchone()["c"]
         success_runs = conn.execute("SELECT COUNT(*) c FROM tapd_sync_runs WHERE success=1").fetchone()["c"]
         failed_runs = conn.execute("SELECT COUNT(*) c FROM tapd_sync_runs WHERE success=0").fetchone()["c"]
         waiting_retry = conn.execute("SELECT COUNT(*) c FROM tapd_retry_jobs WHERE status='等待重试'").fetchone()["c"]
         tasks = [dict(r) for r in conn.execute("""SELECT t.*,d.demand_no,d.title demand_title FROM tapd_tasks t JOIN demands d ON d.id=t.demand_id ORDER BY t.id DESC LIMIT 12""")]
         runs = [dict(r) for r in conn.execute("""SELECT r.*,d.demand_no,d.title demand_title FROM tapd_sync_runs r JOIN demands d ON d.id=r.demand_id ORDER BY r.id DESC LIMIT 12""")]
-        return {"code": 0, "data": {"config": cfg, "requirement_count": req_count, "success_runs": success_runs, "failed_runs": failed_runs, "waiting_retry": waiting_retry, "recent_tasks": tasks, "recent_runs": runs}}
+        return {"code": 0, "data": {
+            "config": cfg,
+            "split_strategy": split_strategy,
+            "sync_interval_seconds": sync_interval_seconds,
+            "retry_seconds": retry_seconds,
+            "requirement_count": req_count,
+            "success_runs": success_runs,
+            "failed_runs": failed_runs,
+            "waiting_retry": waiting_retry,
+            "recent_tasks": tasks,
+            "recent_runs": runs,
+        }}
 
 
 @router.get("/demands/{demand_id}/oa-tasks")
