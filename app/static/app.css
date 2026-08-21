@@ -352,6 +352,7 @@ footer { text-align: center; color: #8092b4; padding: 15px; }
 .grid-2 > *, .grid-3 > *, .grid-4 > *, .approval-panel > *, .fp-layout > *, .ai-layout > * { min-width: 0; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .grid-4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.dashboard-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
 .metric {
   border: 1px solid var(--line);
   border-radius: 8px;

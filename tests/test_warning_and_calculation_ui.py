@@ -56,3 +56,27 @@ def test_function_point_amount_uses_hover_breakdown_and_clickable_detail():
     assert "预警已真实写入消息中心" in javascript
     assert ".calc-tooltip:hover .calc-tooltip-panel" in stylesheet
     assert ".calc-tooltip:focus .calc-tooltip-panel" in stylesheet
+
+
+def test_dashboard_skips_and_hides_modules_without_permission(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "dashboard-permission.db")
+    with TestClient(app) as client:
+        javascript = client.get("/app.js").text
+        login = client.post(
+            "/api/auth/login",
+            json={"username": "lili11-ghq", "password": "Demo@123"},
+        )
+        assert login.status_code == 200
+        headers = {"X-Session": login.json()["data"]["token"]}
+        me = client.get("/api/auth/me", headers=headers).json()["data"]
+        assert "dashboard" in me["permissions"]
+        assert "demand.approve" not in me["permissions"]
+        for path in ("/api/platform-dashboard", "/api/dashboard", "/api/notifications", "/api/tapd/overview"):
+            assert client.get(path, headers=headers).status_code == 200
+        assert client.get("/api/approvals/pending", headers=headers).status_code == 403
+
+    assert "canApprove ? api('/api/approvals/pending')" in javascript
+    assert "canViewTapd ? api('/api/tapd/overview')" in javascript
+    assert "canApprove ? `<div class=\"section\"><div class=\"toolbar\"><div><div class=\"section-title\">我的需求审批待办" in javascript
+    assert "hasPermission('contract') ? btn('合同台账'" in javascript
+    assert "if ($(`#${id}`))" in javascript

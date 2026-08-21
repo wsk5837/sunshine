@@ -728,32 +728,56 @@ async function renderRoute() {
 }
 
 async function renderDashboard() {
+  const canApprove = hasPermission('demand.approve');
+  const canViewDemands = hasPermission('demand.list');
+  const canViewProjects = hasPermission('project360') || hasPermission('project');
+  const canViewBudget = hasPermission('budget');
+  const canViewTapd = hasPermission('tapd');
+  const canViewInitiatives = hasPermission('initiative.list');
   setPage({ title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: `${hasPermission('demand.create')?btn(`${icon('plus')} 新建需求`, 'btn primary', 'dashNew'):''}${btn('导出汇总','btn','dashExport')}` });
   const [platformResp, demandResp, pendingResp, noteResp, tapdResp] = await Promise.all([
-    api('/api/platform-dashboard'), api('/api/dashboard'), api('/api/approvals/pending'), api('/api/notifications'), api('/api/tapd/overview')
+    api('/api/platform-dashboard'),
+    api('/api/dashboard'),
+    canApprove ? api('/api/approvals/pending') : Promise.resolve({ data: [] }),
+    api('/api/notifications'),
+    canViewTapd ? api('/api/tapd/overview') : Promise.resolve({ data: null })
   ]);
   const p = platformResp.data, d = demandResp.data, pending = pendingResp.data || [], notes = (noteResp.data || []).slice(0,6), tapd = tapdResp.data;
   const rate = p.budget_total ? p.budget_used / p.budget_total * 100 : 0;
-  appView.innerHTML = `<div class="grid-4">
-    <div class="metric"><div class="k">在管项目</div><div class="kpi-number">${p.projects}</div><div class="sub">平均进度 ${p.project_progress}%</div></div>
-    <div class="metric"><div class="k">需求总数</div><div class="kpi-number">${p.demands}</div><div class="sub">待处理审批 ${pending.length} 条</div></div>
-    <div class="metric"><div class="k">预算执行</div><div class="kpi-number" style="font-size:20px">${rate.toFixed(1)}%</div><div class="sub">¥${money(p.budget_used)} / ¥${money(p.budget_total)}</div></div>
-    <div class="metric"><div class="k">TAPD同步</div><div class="kpi-number">${tapd.requirement_count}</div><div class="sub">${tapd.config.mode==='live'?'Live':'Mock'} · 待重试 ${tapd.waiting_retry}</div></div>
-  </div>
-  <div class="grid-2" style="margin-top:12px">
-    <div class="section"><div class="section-title">近期需求</div>${demandTable(d.recent,{compact:true})}</div>
-    <div class="section"><div class="toolbar"><div><div class="section-title">我的需求审批待办</div><div class="section-subtitle">按当前身份实时读取可处理节点</div></div>${pending.length?`<span class="status warn">${pending.length} 待处理</span>`:''}</div>${simpleTable(['需求编号','需求标题','当前节点','金额','操作'],pending.slice(0,6).map(x=>[x.demand_no,esc(x.title),esc(x.current_node),`¥${money(x.estimated_amount||x.budget_amount||0)}`,`<button class="link dash-approve" data-id="${x.id}">处理</button>`]))}</div>
-  </div>
-  <div class="grid-2" style="margin-top:12px">
-    <div class="section"><div class="section-title">在管项目</div>${simpleTable(['项目编号','项目名称','经理','状态','进度'],p.recent_projects.map(x=>[x.project_no,x.name,x.manager,statusPill(x.status),progressCell(x.progress)]))}</div>
-    <div class="section"><div class="toolbar"><div><div class="section-title">风险与提醒</div><div class="section-subtitle">预算、工时、审批与集成异常统一汇总</div></div></div><div class="notice-list">${notes.length?notes.map(n=>`<div class="notice-item"><span class="status ${n.level==='warning'?'warn':n.level==='error'?'danger':''}">${esc(n.level||'info')}</span><div><strong>${esc(n.title)}</strong><small>${esc(n.content||'')}</small></div></div>`).join(''):'<div class="empty">当前暂无提醒</div>'}</div></div>
-  </div>
-  <div class="grid-2" style="margin-top:12px"><div class="section"><div class="section-title">快捷入口</div><div class="quick-grid">${btn('新建立项','btn','quickIni')}${btn('新建需求','btn primary','quickDemand')}${btn('项目台账','btn','quickProject')}${btn('合同台账','btn','quickContract')}${btn('预算管理','btn','quickBudget')}${btn('TAPD同步中心','btn','quickTapd')}</div></div><div class="section"><div class="section-title">最近立项</div>${simpleTable(['立项编号','名称','状态','当前节点'],p.recent_initiatives.map(x=>[x.initiative_no,x.title,statusPill(x.status),x.current_node]))}</div></div>`;
+  const metricCards = [
+    canViewProjects ? `<div class="metric"><div class="k">在管项目</div><div class="kpi-number">${p.projects}</div><div class="sub">平均进度 ${p.project_progress}%</div></div>` : '',
+    canViewDemands ? `<div class="metric"><div class="k">需求总数</div><div class="kpi-number">${p.demands}</div><div class="sub">${canApprove?`待处理审批 ${pending.length} 条`:'需求全生命周期汇总'}</div></div>` : '',
+    canViewBudget ? `<div class="metric"><div class="k">预算执行</div><div class="kpi-number" style="font-size:20px">${rate.toFixed(1)}%</div><div class="sub">¥${money(p.budget_used)} / ¥${money(p.budget_total)}</div></div>` : '',
+    canViewTapd && tapd ? `<div class="metric"><div class="k">TAPD同步</div><div class="kpi-number">${tapd.requirement_count}</div><div class="sub">${tapd.config.mode==='live'?'Live':'Mock'} · 待重试 ${tapd.waiting_retry}</div></div>` : ''
+  ].filter(Boolean);
+  const primarySections = [
+    canViewDemands ? `<div class="section"><div class="section-title">近期需求</div>${demandTable(d.recent,{compact:true})}</div>` : '',
+    canApprove ? `<div class="section"><div class="toolbar"><div><div class="section-title">我的需求审批待办</div><div class="section-subtitle">按当前身份实时读取可处理节点</div></div>${pending.length?`<span class="status warn">${pending.length} 待处理</span>`:''}</div>${simpleTable(['需求编号','需求标题','当前节点','金额','操作'],pending.slice(0,6).map(x=>[x.demand_no,esc(x.title),esc(x.current_node),`¥${money(x.estimated_amount||x.budget_amount||0)}`,`<button class="link dash-approve" data-id="${x.id}">处理</button>`]))}</div>` : ''
+  ].filter(Boolean);
+  const overviewSections = [
+    canViewProjects ? `<div class="section"><div class="section-title">在管项目</div>${simpleTable(['项目编号','项目名称','经理','状态','进度'],p.recent_projects.map(x=>[x.project_no,x.name,x.manager,statusPill(x.status),progressCell(x.progress)]))}</div>` : '',
+    `<div class="section"><div class="toolbar"><div><div class="section-title">风险与提醒</div><div class="section-subtitle">只展示当前账号可见的定向消息</div></div></div><div class="notice-list">${notes.length?notes.map(n=>`<div class="notice-item"><span class="status ${n.level==='warning'?'warn':n.level==='error'?'danger':''}">${esc(n.level||'info')}</span><div><strong>${esc(n.title)}</strong><small>${esc(n.content||'')}</small></div></div>`).join(''):'<div class="empty">当前暂无提醒</div>'}</div></div>`
+  ].filter(Boolean);
+  const quickButtons = [
+    hasPermission('initiative.create') ? btn('新建立项','btn','quickIni') : '',
+    hasPermission('demand.create') ? btn('新建需求','btn primary','quickDemand') : '',
+    canViewProjects ? btn('项目台账','btn','quickProject') : '',
+    hasPermission('contract') ? btn('合同台账','btn','quickContract') : '',
+    canViewBudget ? btn('预算管理','btn','quickBudget') : '',
+    canViewTapd ? btn('TAPD同步中心','btn','quickTapd') : ''
+  ].filter(Boolean).join('');
+  const bottomSections = [
+    quickButtons ? `<div class="section"><div class="section-title">快捷入口</div><div class="quick-grid">${quickButtons}</div></div>` : '',
+    canViewInitiatives ? `<div class="section"><div class="section-title">最近立项</div>${simpleTable(['立项编号','名称','状态','当前节点'],p.recent_initiatives.map(x=>[x.initiative_no,x.title,statusPill(x.status),x.current_node]))}</div>` : ''
+  ].filter(Boolean);
+  const sectionGroup = (sections) => sections.length ? `<div class="${sections.length > 1 ? 'grid-2' : ''}" style="margin-top:12px">${sections.join('')}</div>` : '';
+  appView.innerHTML = `${metricCards.length ? `<div class="dashboard-metrics">${metricCards.join('')}</div>` : ''}${sectionGroup(primarySections)}${sectionGroup(overviewSections)}${sectionGroup(bottomSections)}`;
   bindCommonDemandActions(appView);
   $$('.dash-approve').forEach(b=>b.addEventListener('click',()=>navigate(`approval/${b.dataset.id}`)));
   if($('#dashNew'))$('#dashNew').addEventListener('click',()=>navigate('demand-form'));
   if ($('#dashExport')) $('#dashExport').addEventListener('click',()=>window.open('/api/exports/platform-summary.csv','_blank'));
-  $('#quickDemand').addEventListener('click',()=>navigate('demand-form')); $('#quickIni').addEventListener('click',()=>navigate('initiative-form')); $('#quickProject').addEventListener('click',()=>navigate('project-list')); $('#quickContract').addEventListener('click',()=>navigate('contract-list')); $('#quickBudget').addEventListener('click',()=>navigate('budget')); $('#quickTapd').addEventListener('click',()=>navigate('tapd'));
+  const quickRoutes = { quickDemand:'demand-form', quickIni:'initiative-form', quickProject:'project-list', quickContract:'contract-list', quickBudget:'budget', quickTapd:'tapd' };
+  Object.entries(quickRoutes).forEach(([id, route]) => { if ($(`#${id}`)) $(`#${id}`).addEventListener('click',()=>navigate(route)); });
 }
 
 function statusPill(s){return `<span class="status ${statusClass(s)}">${esc(s)}</span>`;}
@@ -1091,7 +1115,7 @@ async function renderDemandDetail(id, query) {
 
 function renderDemandDetailTab(demand, tab) {
   if (tab === 'approval') return `<div class="grid-2"><div><div class="section flat"><div class="section-title">审批记录</div>${approvalRecords(demand.approvals)}</div></div><aside><div class="section flat"><div class="section-title">审批节点</div>${approvalFlow(demand)}</div></aside></div>`;
-  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
+  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
   if (tab === 'budget') return `<div class="section flat"><div class="section-title">预算校验</div>${budgetSnapshot(demand.budget_snapshot)}<div class="section-title" style="margin-top:18px">费用分摊</div>${allocationTable(demand.allocations)}</div>`;
   if (tab === 'tapd') {
     const reqs = demand.tapd_requirements || [];
@@ -1201,7 +1225,7 @@ async function renderProductEval(query) {
   appView.innerHTML = `${workflow(2)}<div class="fp-layout">
     <aside class="section"><div class="section-title">待评估需求</div><div class="demand-selector-list">${demands.map((d) => `<button class="demand-selector-card ${d.id===demand.id?'active':''}" type="button" data-id="${d.id}"><strong>${esc(d.demand_no || '草稿')} · ${esc(d.title)}</strong><span class="status ${statusClass(d.status)}">${esc(d.status)}</span><div class="help">预估 ¥${money(d.estimated_amount || d.budget_amount)}</div></button>`).join('')}</div></aside>
     <div>
-      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
+      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
       ${!editable ? `<div class="callout warn" style="margin-bottom:12px">当前账号未授予功能点或费用评估权限，可查看评估结果但不能修改。</div>` : ''}
       <div class="section"><div class="toolbar"><div class="section-title" style="margin:0">功能点评估明细</div>${editable ? btn('添加功能点','btn small primary','addFunctionPointInline') : ''}</div>${functionPointTable(demand.function_points, editable)}</div>
       <div class="section"><div class="section-title">费用分摊</div>${editable ? allocationEditor(demand) : allocationTable(demand.allocations)}</div>
