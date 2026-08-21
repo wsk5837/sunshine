@@ -414,6 +414,11 @@ function updateUserUI() {
   $('#menuUsername').textContent = state.currentUserData?.username || '—';
   $('#menuRole').textContent = state.currentUserData?.role_label || state.role;
   applyMenuPermissions();
+  const aiWidget = $('#aiAssistantWidget');
+  if (aiWidget) {
+    aiWidget.classList.toggle('hidden', !hasPermission('ai'));
+    if (!hasPermission('ai')) $('#aiAssistantPanel').classList.add('hidden');
+  }
 }
 
 function renderAiAssistantWidget() {
@@ -586,7 +591,7 @@ function showLogin(message = '') {
 function showApp() {
   $('#loginScreen').classList.add('hidden');
   $('#appShell').classList.remove('hidden');
-  $('#aiAssistantWidget').classList.remove('hidden');
+  $('#aiAssistantWidget').classList.toggle('hidden', !hasPermission('ai'));
 }
 
 async function rawLogin(username, password) {
@@ -639,6 +644,11 @@ async function init() {
 
 async function renderRoute() {
   const route = parseRoute();
+  if (route.path.split('/')[0] === 'ai' && !hasPermission('ai')) {
+    toast('当前角色未授权使用AI助手', 'error');
+    navigate('dashboard');
+    return;
+  }
   const routeActiveGroup = routeGroup(route.path.split('/')[0]);
   state.openGroups = routeActiveGroup ? new Set([routeActiveGroup]) : new Set();
   updateNav(route.path);
@@ -1412,7 +1422,7 @@ async function renderAI() {
     'REQ-20260817-0001 当前卡在哪个环节，预计何时完成？',
     '历史同类需求怎么处理，平均交付周期是多少？'
   ];
-  appView.innerHTML = `${workflow(5)}<div class="ai-layout"><div class="chat"><div class="ai-page-agent-bar"><div><strong>TRM企业智能体</strong><small>通过本系统后端安全代理连接 Gazellio G.AIOS</small></div><span class="status ${state.aiProvider.includes('本地')?'warn':'success'}">${esc(state.aiProvider)}</span></div><div class="chat-history" id="chatHistory">${state.chat.map((msg)=>`<div class="bubble ${msg.type}">${esc(msg.text)}${msg.type==='ai'&&msg.provider?`<span class="ai-message-meta">${esc(msg.provider)}${msg.fallback?' · 本地降级':''}</span>`:''}</div>`).join('')}${state.aiBusy?'<div class="bubble ai"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>':''}</div><div class="chat-input"><textarea id="aiInput" maxlength="1000" placeholder="可查询申请、审批、预算、TAPD进度、项目统计和历史处理数据"></textarea><button class="btn primary" id="aiSend" type="button" ${state.aiBusy?'disabled':''}>发送</button></div></div><aside class="section"><div class="section-title">五类推荐问题</div>${recommendations.map((q)=>`<button class="suggestion" type="button">${esc(q)}</button>`).join('')}<div class="callout">当前身份：${esc(state.meta.roles[state.role])}<div class="help">回答基于当前账号可访问的系统事实数据：①单条需求完整信息 ②项目批量统计 ③月/季度预算趋势 ④当前环节与预计完成 ⑤历史追溯与平均周期。</div></div></aside></div>`;
+  appView.innerHTML = `${workflow(5)}<div class="ai-layout"><div class="chat"><div class="ai-page-agent-bar"><div><strong>TRM企业智能体</strong><small>通过本系统后端安全代理连接 Gazellio G.AIOS</small></div><span class="status ${state.aiProvider.includes('本地')?'warn':'success'}">${esc(state.aiProvider)}</span></div><div class="chat-history" id="chatHistory">${state.chat.map((msg)=>`<div class="bubble ${msg.type}">${esc(msg.text)}${msg.type==='ai'&&msg.provider?`<span class="ai-message-meta">${esc(msg.provider)}${msg.fallback?' · 本地降级':''}</span>`:''}</div>`).join('')}${state.aiBusy?'<div class="bubble ai"><span class="ai-float-typing"><i></i><i></i><i></i></span></div>':''}</div><div class="chat-input"><textarea id="aiInput" maxlength="1000" placeholder="可查询申请、审批、预算、TAPD进度、项目统计和历史处理数据"></textarea><button class="btn primary" id="aiSend" type="button" ${state.aiBusy?'disabled':''}>发送</button></div></div><aside class="section"><div class="section-title">POC五类推荐问题</div>${recommendations.map((q)=>`<button class="suggestion" type="button">${esc(q)}</button>`).join('')}<div class="callout">当前身份：${esc(state.meta.roles[state.role])}<div class="help">回答基于当前账号可访问的系统事实数据：①单条需求完整信息 ②项目批量统计 ③月/季度预算趋势 ④当前环节与预计完成 ⑤历史追溯与平均周期。</div></div></aside></div>`;
   const send = async () => {
     const input = $('#aiInput'); const question = input.value.trim(); if(!question||state.aiBusy)return;
     state.chat.push({type:'user',text:question}); input.value=''; state.aiBusy=true; renderAI(); renderAiAssistantWidget();
@@ -1579,7 +1589,7 @@ function openUserForm(item,roles){
 async function renderRoles(){
   setPage({title:'角色管理',iconName:'settings',crumbs:['系统管理'],actions:btn(`${icon('plus')} 新增角色`,'btn primary','roleNew')});
   const [rolesResp,permResp]=await Promise.all([api('/api/system/roles'),api('/api/system/permissions')]);const roles=rolesResp.data,permissions=permResp.data;
-  appView.innerHTML=`<div class="section"><div class="section-title">角色与权限</div><div class="section-subtitle">角色权限决定登录后可见的功能菜单；内置审批角色同时用于需求和立项审批节点匹配。</div><div class="role-card-grid">${roles.map(r=>`<div class="role-card"><div class="toolbar"><div><strong>${esc(r.label)}</strong><div class="subtle">${esc(r.code)}</div></div>${statusPill(r.status)}</div><p>${esc(r.description||'—')}</p><div class="role-card-meta"><span>用户数 <b>${r.user_count}</b></span><span>权限 <b>${r.permissions.includes('*')?'全部':r.permissions.length}</b></span><span>${r.built_in?'系统内置':'自定义'}</span></div><button class="btn roleEdit" data-code="${esc(r.code)}">配置权限</button></div>`).join('')}</div></div>`;
+  appView.innerHTML=`<div class="section"><div class="section-title">角色与权限</div><div class="section-subtitle">角色权限同时决定可见菜单、审批节点和AI可调用的查询/写入工具；后台修改AI权限后立即对当前会话生效。</div><div class="role-card-grid">${roles.map(r=>`<div class="role-card"><div class="toolbar"><div><strong>${esc(r.label)}</strong><div class="subtle">${esc(r.code)}</div></div>${statusPill(r.status)}</div><p>${esc(r.description||'—')}</p><div class="role-card-meta"><span>用户数 <b>${r.user_count}</b></span><span>权限 <b>${r.permissions.includes('*')?'全部':r.permissions.length}</b></span><span>${r.built_in?'系统内置':'自定义'}</span></div><button class="btn roleEdit" data-code="${esc(r.code)}">配置权限</button></div>`).join('')}</div></div>`;
   $$('.roleEdit').forEach(b=>b.addEventListener('click',()=>openRoleForm(roles.find(r=>r.code===b.dataset.code),permissions)));$('#roleNew').addEventListener('click',()=>openRoleForm(null,permissions));
 }
 

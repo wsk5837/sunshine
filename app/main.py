@@ -20,7 +20,17 @@ from openpyxl import Workbook, load_workbook
 from .db import BASE_DIR, connect, init_db, now_iso, row_to_dict, get_budget_by_name
 from .extended import router as extended_router, init_extended_db, project_detail
 from .v4 import router as v4_router, init_v4_db
-from .auth import router as auth_router, init_auth_db, resolve_session, get_role_labels, get_demo_users
+from .auth import (
+    DEFAULT_ROLE_PERMISSIONS,
+    get_ai_permissions,
+    has_permission,
+    issue_ai_delegation,
+    router as auth_router,
+    init_auth_db,
+    resolve_session,
+    get_role_labels,
+    get_demo_users,
+)
 from .ai_gateway import AIServiceError, public_ai_config, run_agent_message
 from .trm_mcp import init_trm_mcp_db, mcp_asgi_app, public_mcp_status
 from .poc import (
@@ -97,6 +107,7 @@ async def auth_session_middleware(request: Request, call_next):
                 "requestId": request.headers.get("X-Request-Id") or str(uuid.uuid4()), "timestamp": now_iso()
             })
         if session_user:
+            request.state.auth_user = session_user
             headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() not in {b"x-user", b"x-role"}]
             headers.extend([(b"x-user", session_user["username"].encode("ascii", "ignore")), (b"x-role", session_user["role_code"].encode("ascii", "ignore"))])
             request.scope["headers"] = headers
@@ -323,20 +334,43 @@ class AIQueryPayload(BaseModel):
     source: str = Field(default="assistant", max_length=40)
 
 
-def build_ai_fact_context(question: str, role: str, project_id: Optional[int] = None) -> str:
+def build_ai_fact_context(
+    question: str,
+    role: str,
+    project_id: Optional[int] = None,
+    permissions: Optional[list[str]] = None,
+    delegation_token: str = "",
+) -> str:
     """构建受控、紧凑的系统事实快照，供外部智能体回答业务问题。"""
+    permissions = list(permissions or [])
+    can_budget = has_permission(permissions, "ai.query.budget")
+    can_demand = has_permission(permissions, "ai.query.demand")
+    can_project = has_permission(permissions, "ai.query.project")
+    can_create_demand = has_permission(permissions, "ai.create.demand")
+    can_create_project = has_permission(permissions, "ai.create.project")
     mcp_state = public_mcp_status()
+    supported_writes = []
+    if mcp_state["write_enabled"] and can_create_demand:
+        supported_writes.append("创建需求草稿")
+    if mcp_state["write_enabled"] and can_create_project:
+        supported_writes.append("创建项目")
     facts: dict[str, Any] = {
-        "data_scope": "TRM事实查询使用只读快照；业务写操作必须通过已授权的TRM MCP工具执行",
+        "data_scope": "仅可使用下方已授权的TRM事实；业务写操作必须通过已授权的TRM MCP工具执行",
         "current_role": ROLE_LABELS.get(role, role),
+        "ai_permissions": get_ai_permissions(permissions),
         "mcp_action_capabilities": {
             "server_ready": mcp_state["enabled"],
             "write_enabled": mcp_state["write_enabled"],
-            "supported_writes": ["创建项目", "创建需求草稿"],
+            "supported_writes": supported_writes,
             "required_flow": "查询有效数据 -> prepare预览 -> 用户明确确认 -> create幂等写入",
         },
     }
-    if project_id:
+    if delegation_token and mcp_state["enabled"]:
+        facts["mcp_authorization"] = {
+            "delegation_token": delegation_token,
+            "usage": "调用每一个 trm_* 工具时必须原样传入 delegation_token；不得在回答、预览或日志中显示该令牌",
+        }
+    if project_id and can_project:
         detail = project_detail(project_id)["data"]
         facts["selected_project"] = {
             key: detail.get(key)
@@ -345,48 +379,52 @@ def build_ai_fact_context(question: str, role: str, project_id: Optional[int] = 
                 "progress", "start_date", "end_date", "description", "total_budget",
             )
         }
-        facts["budget"] = detail.get("budget")
+        if can_budget:
+            facts["budget"] = detail.get("budget")
         facts["tasks"] = detail.get("tasks", [])[:100]
         facts["milestones"] = detail.get("milestones", [])[:60]
-        facts["demands"] = [
-            {key: item.get(key) for key in (
-                "id", "demand_no", "title", "demand_type", "priority", "status",
-                "current_node", "estimated_amount", "estimated_hours", "actual_hours",
-                "tapd_id", "tapd_status", "planned_online_date",
-            )}
-            for item in detail.get("demands", [])[:100]
-        ]
+        if can_demand:
+            facts["demands"] = [
+                {key: item.get(key) for key in (
+                    "id", "demand_no", "title", "demand_type", "priority", "status",
+                    "current_node", "estimated_amount", "estimated_hours", "actual_hours",
+                    "tapd_id", "tapd_status", "planned_online_date",
+                )}
+                for item in detail.get("demands", [])[:100]
+            ]
         facts["contracts"] = detail.get("contracts", [])[:50]
         facts["settlements"] = detail.get("settlements", [])[:50]
         facts["business_values"] = detail.get("values", [])[:50]
-    else:
+    elif not project_id:
         with connect() as conn:
-            demand_rows = conn.execute("SELECT * FROM demands ORDER BY id DESC LIMIT 80").fetchall()
-            demands = [dict(row) for row in demand_rows]
-            req_match = re.search(r"REQ-\d{8}-\d{4}", question.upper())
-            if req_match:
-                target_row = conn.execute(
-                    "SELECT * FROM demands WHERE UPPER(demand_no)=?",
-                    (req_match.group(0),),
-                ).fetchone()
-                if target_row:
-                    target = demand_dict(conn, target_row)
-                    facts["matched_demand"] = target
-            facts["recent_demands"] = [
-                {key: item.get(key) for key in (
-                    "id", "demand_no", "title", "demand_type", "priority", "applicant",
-                    "applicant_dept", "status", "current_node", "budget_sources",
-                    "estimated_amount", "estimated_hours", "actual_hours", "tapd_id",
-                    "tapd_status", "planned_online_date", "created_at", "submitted_at",
-                )}
-                for item in demands[:30]
-            ]
-            facts["budgets"] = [dict(row) for row in conn.execute(
-                "SELECT budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year FROM budgets ORDER BY year DESC,id LIMIT 30"
-            )]
-            facts["projects"] = [dict(row) for row in conn.execute(
-                "SELECT id,project_no,name,manager,department,total_budget,status,progress,start_date,end_date FROM projects ORDER BY updated_at DESC LIMIT 30"
-            )]
+            if can_demand:
+                demand_rows = conn.execute("SELECT * FROM demands ORDER BY id DESC LIMIT 80").fetchall()
+                demands = [dict(row) for row in demand_rows]
+                req_match = re.search(r"REQ-\d{8}-\d{4}", question.upper())
+                if req_match:
+                    target_row = conn.execute(
+                        "SELECT * FROM demands WHERE UPPER(demand_no)=?",
+                        (req_match.group(0),),
+                    ).fetchone()
+                    if target_row:
+                        facts["matched_demand"] = demand_dict(conn, target_row)
+                facts["recent_demands"] = [
+                    {key: item.get(key) for key in (
+                        "id", "demand_no", "title", "demand_type", "priority", "applicant",
+                        "applicant_dept", "status", "current_node", "budget_sources",
+                        "estimated_amount", "estimated_hours", "actual_hours", "tapd_id",
+                        "tapd_status", "planned_online_date", "created_at", "submitted_at",
+                    )}
+                    for item in demands[:30]
+                ]
+            if can_budget:
+                facts["budgets"] = [dict(row) for row in conn.execute(
+                    "SELECT budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year FROM budgets ORDER BY year DESC,id LIMIT 30"
+                )]
+            if can_project:
+                facts["projects"] = [dict(row) for row in conn.execute(
+                    "SELECT id,project_no,name,manager,department,total_budget,status,progress,start_date,end_date FROM projects ORDER BY updated_at DESC LIMIT 30"
+                )]
 
     serialized = json.dumps(facts, ensure_ascii=False, default=str)
     # 防止异常数据量放大模型输入；优先保留前部的项目/命中需求与核心概况。
@@ -1047,10 +1085,32 @@ async def ai_chat(
         raise BusinessError(400, "REQ-4002", "AI问答内容不能为空")
     if len(question) > MAX_AI_LEN:
         raise BusinessError(400, "REQ-4003", "AI问答单次问题不能超过1000个字符")
-    actor, role = actor_context(x_user, x_role)
-    context = build_ai_fact_context(question, role, payload.project_id)
+    user = getattr(request.state, "auth_user", None)
+    if not user:
+        raise BusinessError(401, "AUTH-4010", "登录已失效，请重新登录后使用AI助手")
+    permissions = list(user.get("permissions") or [])
+    if not has_permission(permissions, "ai"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权使用AI助手")
+    if payload.project_id and not has_permission(permissions, "ai.query.project"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询项目")
+    actor = f"{user['display_name']} {user['username']}".strip()
+    role = user["role_code"]
     business_type = "project360" if payload.project_id else "assistant"
     business_id = str(payload.project_id or "")
+    delegation_token = ""
+    if public_mcp_status()["enabled"]:
+        delegation_token = issue_ai_delegation(
+            request.headers.get("X-Session", ""),
+            payload.source or business_type,
+            payload.project_id,
+        )
+    context = build_ai_fact_context(
+        question,
+        role,
+        payload.project_id,
+        permissions=permissions,
+        delegation_token=delegation_token,
+    )
     try:
         result = await run_agent_message(
             question=question,
@@ -1072,6 +1132,9 @@ async def ai_chat(
             )
         raise BusinessError(502, "AI-5020", str(exc)) from exc
 
+    if delegation_token and isinstance(result.get("answer"), str):
+        result["answer"] = result["answer"].replace(delegation_token, "[已隐藏AI委托令牌]")
+
     with connect() as conn:
         conn.execute(
             """INSERT INTO integration_logs(integration_code,direction,business_type,business_id,success,message,request_id,created_at)
@@ -1080,7 +1143,12 @@ async def ai_chat(
         )
         audit(
             conn, request, actor, role, "调用AI智能体", "ai_session", result.get("session_id") or "new",
-            details={"source": payload.source, "project_id": payload.project_id, "agent_id": result["agent_id"]},
+            details={
+                "source": payload.source,
+                "project_id": payload.project_id,
+                "agent_id": result["agent_id"],
+                "ai_permissions": get_ai_permissions(permissions),
+            },
         )
     return {
         "code": 0,
@@ -1090,15 +1158,34 @@ async def ai_chat(
 
 
 @app.post("/api/ai/query")
-def ai_query(payload: AIQueryPayload, x_role: Optional[str] = Header(None)):
+def ai_query(payload: AIQueryPayload, request: Request, x_role: Optional[str] = Header(None)):
     q = (payload.question or "").strip()
     if not q:
         raise BusinessError(400, "REQ-4002", "AI问答内容不能为空")
     if len(q) > MAX_AI_LEN:
         raise BusinessError(400, "REQ-4003", "AI问答单次问题不能超过1000个字符")
-    role = x_role or "applicant"
+    user = getattr(request.state, "auth_user", None)
+    # 仅保留本地TestClient的旧测试兼容；真实HTTP请求必须由中间件注入登录用户。
+    role = user["role_code"] if user else (x_role or "applicant")
+    permissions = list(user.get("permissions") or []) if user else list(DEFAULT_ROLE_PERMISSIONS.get(role, []))
+    if not has_permission(permissions, "ai"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权使用AI助手")
+    asks_budget = "预算" in q
+    asks_project = "项目" in q
+    asks_demand = bool(re.search(r"REQ-\d{8}-\d{4}", q.upper())) or any(
+        word in q for word in ("需求", "审批", "功能点", "TAPD", "进度", "工时", "历史", "过往")
+    )
+    if asks_budget and not has_permission(permissions, "ai.query.budget"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询预算")
+    if asks_project and not has_permission(permissions, "ai.query.project"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询项目")
+    if asks_demand and not has_permission(permissions, "ai.query.demand"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询需求")
     with connect() as conn:
-        rows = [demand_dict(conn, r) for r in conn.execute("SELECT * FROM demands ORDER BY id DESC LIMIT 1000")]
+        rows = (
+            [demand_dict(conn, r) for r in conn.execute("SELECT * FROM demands ORDER BY id DESC LIMIT 1000")]
+            if has_permission(permissions, "ai.query.demand") else []
+        )
         target = None
         m = re.search(r"REQ-\d{8}-\d{4}", q.upper())
         if m:
@@ -1205,6 +1292,8 @@ def ai_query(payload: AIQueryPayload, x_role: Optional[str] = Header(None)):
                 answer = "当前数据中尚无同时具备提交时间和关闭时间的已完成需求；历史追溯能力已启用，产生已完成需求后会自动计算平均交付周期并展示过往审批、评估与TAPD处理记录。"
 
         elif "多少" in q and ("需求" in q or "条" in q):
+            if not has_permission(permissions, "ai.query.demand"):
+                raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询需求")
             answer = f"当前系统共有{len(rows)}条需求，其中审批中{sum(1 for d in rows if '审批' in (d.get('current_node') or '') or d.get('current_node')=='终审')}条，已完成{sum(1 for d in rows if d.get('status')=='已完成')}条。"
         elif "预算" in q and target:
             snap = budget_snapshot(conn, target)

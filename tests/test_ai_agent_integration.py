@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from app.ai_gateway import _event_text
@@ -30,8 +32,10 @@ def test_public_ai_config_contains_no_admin_credentials():
         assert "admin_token" not in serialized
 
 
-def test_ai_chat_proxies_session_and_project_context(monkeypatch):
+def test_ai_chat_proxies_session_project_context_and_live_permissions(monkeypatch):
     captured = {}
+    monkeypatch.setenv("TRM_MCP_API_TOKEN", "test-token-for-ai-delegation-123456789")
+    monkeypatch.setenv("TRM_MCP_WRITE_ENABLED", "true")
 
     async def fake_run_agent_message(**kwargs):
         captured.update(kwargs)
@@ -44,11 +48,15 @@ def test_ai_chat_proxies_session_and_project_context(monkeypatch):
 
     monkeypatch.setattr("app.main.run_agent_message", fake_run_agent_message)
     with TestClient(app) as client:
-        projects = client.get("/api/projects").json()["data"]
+        login = client.post("/api/auth/login", json={"username": "wangwj", "password": "Demo@123"})
+        assert login.status_code == 200, login.text
+        session_token = login.json()["data"]["token"]
+        headers = {"X-Session": session_token}
+        projects = client.get("/api/projects", headers=headers).json()["data"]
         assert projects
         response = client.post(
             "/api/ai/chat",
-            headers={"X-User": "tester", "X-Role": "project_manager"},
+            headers=headers,
             json={
                 "question": "这个项目当前有哪些风险？",
                 "session_id": "existing-session",
@@ -63,6 +71,11 @@ def test_ai_chat_proxies_session_and_project_context(monkeypatch):
         assert captured["session_id"] == "existing-session"
         assert captured["source"] == "project360"
         assert projects[0]["project_no"] in captured["context"]
+        context = json.loads(captured["context"])
+        assert "ai.create.project" in context["ai_permissions"]
+        assert context["mcp_action_capabilities"]["supported_writes"] == ["创建项目"]
+        assert len(context["mcp_authorization"]["delegation_token"]) >= 40
+        assert context["mcp_authorization"]["delegation_token"] not in response.text
 
 
 def test_ai_chat_rejects_empty_question():

@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from .db import connect, now_iso, row_to_dict
 from .rules import BusinessError, ROLE_LABELS
-from .auth import get_role_labels
+from .auth import get_role_labels, has_permission
 
 router = APIRouter(prefix="/api", tags=["完整平台功能"])
 
@@ -578,11 +578,19 @@ def delete_milestone(milestone_id:int,request:Request,x_user:Optional[str]=Heade
 def project360(project_id:int): return project_detail(project_id)
 
 @router.post('/project360/{project_id}/query')
-def project_robot_query(project_id:int,payload:dict):
+def project_robot_query(project_id:int,payload:dict,request:Request):
+    user=getattr(request.state,'auth_user',None)
+    if not user: raise BusinessError(401,'AUTH-4010','登录已失效，请重新登录后使用项目360机器人')
+    permissions=user.get('permissions') or []
+    if not has_permission(permissions,'ai') or not has_permission(permissions,'ai.query.project'):
+        raise BusinessError(403,'AUTH-4030','当前角色未授权AI查询项目')
     q=str(payload.get('question','')).strip()
     detail=project_detail(project_id)['data']; task_count=len(detail['tasks']); done=sum(1 for x in detail['tasks'] if x['status']=='已完成'); overdue=sum(1 for x in detail['tasks'] if x.get('end_date') and x['status']!='已完成' and x['end_date'] < datetime.now().strftime('%Y-%m-%d'))
-    budget=detail.get('budget'); budget_text='未关联预算' if not budget else f"预算{budget['total_budget']:,.0f}元，已使用{budget['used_budget']:,.0f}元，执行率{budget['used_budget']/budget['total_budget']*100:.1f}%"
-    answer=f"{detail['project_no']} {detail['name']} 当前状态为{detail['status']}，总体进度{detail['progress']}%。共有{task_count}项任务，已完成{done}项，逾期未完成{overdue}项；{budget_text}；关联需求{len(detail['demands'])}条、合同{len(detail['contracts'])}份、结算{len(detail['settlements'])}笔。"
+    if has_permission(permissions,'ai.query.budget'):
+        budget=detail.get('budget'); budget_text='未关联预算' if not budget else f"预算{budget['total_budget']:,.0f}元，已使用{budget['used_budget']:,.0f}元，执行率{budget['used_budget']/budget['total_budget']*100:.1f}%"
+    else: budget_text='当前角色无AI预算查询权限'
+    demand_text=f"关联需求{len(detail['demands'])}条" if has_permission(permissions,'ai.query.demand') else '关联需求数已按权限隐藏'
+    answer=f"{detail['project_no']} {detail['name']} 当前状态为{detail['status']}，总体进度{detail['progress']}%。共有{task_count}项任务，已完成{done}项，逾期未完成{overdue}项；{budget_text}；{demand_text}、合同{len(detail['contracts'])}份、结算{len(detail['settlements'])}笔。"
     if '风险' in q or '预警' in q:
         answer += ' 当前重点关注：逾期任务、预算执行率、未完成里程碑以及需求/TAPD同步异常。'
     return {'code':0,'data':{'answer':answer}}

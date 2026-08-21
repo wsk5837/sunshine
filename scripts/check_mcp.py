@@ -23,14 +23,10 @@ async def main() -> int:
         )
         tools = await session.list_tools()
         names = [tool.name for tool in tools.tools]
-        budgets = await session.call_tool("trm_list_budgets", {})
-        if budgets.is_error:
-            print("预算只读工具调用失败", file=sys.stderr)
-            return 1
         print(f"MCP连接成功：{url}")
         print(f"工具数：{len(names)}")
         print("工具：" + ", ".join(names))
-        print(f"可用预算数：{budgets.structured_content['count']}")
+        print("工具发现验证通过。业务工具调用需要由TRM当前登录会话签发的 delegation_token。")
     return 0
 
 

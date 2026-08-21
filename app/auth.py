@@ -1,8 +1,12 @@
+import base64
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import time
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -33,6 +37,11 @@ PERMISSION_CATALOG = {
     "function_points": "功能点管理",
     "tapd": "TAPD同步",
     "ai": "AI智能问答",
+    "ai.query.budget": "AI查询预算",
+    "ai.query.demand": "AI查询需求",
+    "ai.query.project": "AI查询项目",
+    "ai.create.demand": "AI创建需求草稿",
+    "ai.create.project": "AI创建项目",
     "project": "项目管理",
     "settlement": "结算管理",
     "indicator": "指标库",
@@ -44,15 +53,66 @@ PERMISSION_CATALOG = {
 }
 
 DEFAULT_ROLE_PERMISSIONS = {
-    "applicant": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.create", "demand.list", "demand.create", "tapd", "ai"],
-    "department_head": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai"],
-    "product_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "demand.approve", "demand.evaluate", "function_points", "tapd", "ai", "project"],
-    "finance": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "settlement", "contract"],
-    "vp": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project"],
-    "business_owner": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project", "settlement", "contract", "indicator"],
-    "project_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "tapd", "ai", "project", "settlement", "indicator", "contract"],
+    "applicant": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.create", "demand.list", "demand.create", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "ai.create.demand"],
+    "department_head": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project"],
+    "product_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "demand.approve", "demand.evaluate", "function_points", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "project"],
+    "finance": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "settlement", "contract"],
+    "vp": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "project"],
+    "business_owner": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "project", "settlement", "contract", "indicator"],
+    "project_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "ai.create.project", "project", "settlement", "indicator", "contract"],
     "admin": ["*"],
 }
+
+AI_PERMISSION_CODES = tuple(code for code in PERMISSION_CATALOG if code.startswith("ai."))
+
+
+def has_permission(permissions: list[str] | tuple[str, ...] | set[str], code: str) -> bool:
+    return "*" in permissions or code in permissions
+
+
+def get_ai_permissions(permissions: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    if "*" in permissions:
+        return list(AI_PERMISSION_CODES)
+    return [code for code in AI_PERMISSION_CODES if code in permissions]
+
+
+@dataclass(frozen=True)
+class AIPrincipal:
+    user_id: int
+    username: str
+    display_name: str
+    department: str
+    role_code: str
+    role_label: str
+    permissions: tuple[str, ...]
+    delegation_id: str
+
+
+def _delegation_secret() -> bytes:
+    raw = (
+        os.getenv("TRM_AI_DELEGATION_SECRET")
+        or os.getenv("TRM_MCP_CONFIRMATION_SECRET")
+        or os.getenv("TRM_MCP_API_TOKEN")
+        or ""
+    )
+    if len(raw) < 24:
+        raise ValueError("AI委托令牌密钥未配置（TRM_AI_DELEGATION_SECRET / TRM_MCP_API_TOKEN 至少24字符）")
+    return raw.encode("utf-8")
+
+
+def _delegation_ttl() -> int:
+    try:
+        value = int(os.getenv("TRM_AI_DELEGATION_TTL_SECONDS", "900"))
+    except ValueError:
+        value = 900
+    return max(60, min(value, 1800))
+
+
+def _sign_delegation(body: dict) -> str:
+    raw = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    signature = hmac.new(_delegation_secret(), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
 
 
 def _password_hash(password: str, salt_hex: Optional[str] = None) -> str:
@@ -109,6 +169,21 @@ def init_auth_db():
                 last_seen TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES system_users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS ai_delegations (
+                id TEXT PRIMARY KEY,
+                auth_session_token TEXT NOT NULL,
+                source TEXT DEFAULT '',
+                project_id INTEGER,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY(auth_session_token) REFERENCES auth_sessions(token) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS auth_permission_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_delegations_session ON ai_delegations(auth_session_token);
+            CREATE INDEX IF NOT EXISTS idx_ai_delegations_expires ON ai_delegations(expires_at);
             """
         )
         ts = now_iso()
@@ -136,8 +211,38 @@ def init_auth_db():
                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(username) DO NOTHING""",
                 (username, display, dept, email, phone, role, _password_hash(password), "启用", ts, ts),
             )
+        migration_name = "ai_fine_grained_v1"
+        if not conn.execute("SELECT 1 FROM auth_permission_migrations WHERE name=?", (migration_name,)).fetchone():
+            for row in conn.execute("SELECT code,permissions FROM system_roles").fetchall():
+                try:
+                    current = json.loads(row["permissions"] or "[]")
+                except Exception:
+                    current = []
+                if "*" in current or "ai" not in current:
+                    continue
+                additions: list[str] = []
+                if "budget" in current:
+                    additions.append("ai.query.budget")
+                if "demand.list" in current:
+                    additions.append("ai.query.demand")
+                if "project" in current or "project360" in current:
+                    additions.append("ai.query.project")
+                if "demand.create" in current:
+                    additions.append("ai.create.demand")
+                if row["code"] == "project_manager":
+                    additions.append("ai.create.project")
+                merged = list(dict.fromkeys([*current, *additions]))
+                conn.execute(
+                    "UPDATE system_roles SET permissions=?,updated_at=? WHERE code=?",
+                    (json.dumps(merged, ensure_ascii=False), ts, row["code"]),
+                )
+            conn.execute(
+                "INSERT INTO auth_permission_migrations(name,applied_at) VALUES(?,?)",
+                (migration_name, ts),
+            )
         # remove expired sessions
         conn.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now_iso(),))
+        conn.execute("DELETE FROM ai_delegations WHERE expires_at < ?", (now_iso(),))
 
 
 def _role_dict(row):
@@ -187,6 +292,97 @@ def resolve_session(token: str):
         except Exception:
             d["permissions"] = []
         return d
+
+
+def issue_ai_delegation(session_token: str, source: str = "", project_id: Optional[int] = None) -> str:
+    """Issue an opaque, short-lived capability bound to the real login session.
+
+    The token contains no role or permission claims. MCP always reloads the
+    current user and role from the database, so role edits and account/session
+    revocation take effect immediately.
+    """
+    user = resolve_session(session_token)
+    if not user:
+        raise BusinessError(401, "AUTH-4010", "登录已失效，无法授权AI调用业务工具")
+    permissions = user.get("permissions") or []
+    if not has_permission(permissions, "ai"):
+        raise BusinessError(403, "AUTH-4030", "当前角色未授权使用AI助手")
+    now = datetime.now(timezone.utc).astimezone()
+    expires = now + timedelta(seconds=_delegation_ttl())
+    delegation_id = str(uuid.uuid4())
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO ai_delegations(id,auth_session_token,source,project_id,created_at,expires_at)
+               VALUES(?,?,?,?,?,?)""",
+            (
+                delegation_id,
+                session_token,
+                (source or "")[:100],
+                project_id,
+                now.isoformat(timespec="seconds"),
+                expires.isoformat(timespec="seconds"),
+            ),
+        )
+    return _sign_delegation({"jti": delegation_id, "exp": int(expires.timestamp()), "v": 1})
+
+
+def validate_ai_delegation(token: str, required_permission: str) -> AIPrincipal:
+    """Validate one MCP call against live backend role permissions."""
+    try:
+        encoded, signature = (token or "").split(".", 1)
+        expected = hmac.new(_delegation_secret(), encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError
+        padding = "=" * (-len(encoded) % 4)
+        body = json.loads(base64.urlsafe_b64decode(encoded + padding).decode("utf-8"))
+        if body.get("v") != 1 or int(body.get("exp") or 0) < int(time.time()):
+            raise ValueError
+        delegation_id = str(body["jti"])
+    except Exception as exc:
+        raise ValueError("当前登录用户的AI委托令牌无效或已过期，请在TRM内重新发起对话") from exc
+
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT d.id delegation_id,d.expires_at delegation_expires,
+                      s.expires_at session_expires,u.id user_id,u.username,u.display_name,u.department,
+                      u.status user_status,u.role_code,r.label role_label,r.permissions,r.status role_status
+               FROM ai_delegations d
+               JOIN auth_sessions s ON s.token=d.auth_session_token
+               JOIN system_users u ON u.id=s.user_id
+               JOIN system_roles r ON r.code=u.role_code
+               WHERE d.id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("AI委托令牌已撤销，请重新登录或重新发起对话")
+        if (
+            row["user_status"] != "启用"
+            or row["role_status"] != "启用"
+            or row["delegation_expires"] < now_iso()
+            or row["session_expires"] < now_iso()
+        ):
+            conn.execute("DELETE FROM ai_delegations WHERE id=?", (delegation_id,))
+            raise ValueError("用户会话、角色或AI委托已失效")
+        try:
+            permissions = tuple(json.loads(row["permissions"] or "[]"))
+        except Exception:
+            permissions = ()
+
+    if not has_permission(permissions, "ai"):
+        raise ValueError("当前角色未授权使用AI助手")
+    if not has_permission(permissions, required_permission):
+        label = PERMISSION_CATALOG.get(required_permission, required_permission)
+        raise ValueError(f"当前角色缺少权限：{label}（{required_permission}）")
+    return AIPrincipal(
+        user_id=int(row["user_id"]),
+        username=row["username"],
+        display_name=row["display_name"],
+        department=row["department"] or "",
+        role_code=row["role_code"],
+        role_label=row["role_label"],
+        permissions=permissions,
+        delegation_id=delegation_id,
+    )
 
 
 def require_admin(x_role: Optional[str]):

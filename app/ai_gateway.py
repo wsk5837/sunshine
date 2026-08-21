@@ -133,6 +133,8 @@ async def run_agent_message(
             "数据不足时明确说明，不要编造编号、金额、审批结论或日期。"
             "用户要求创建项目或需求时，必须调用TRM MCP工具：先查询预算/关联数据，再调用 trm_prepare_create_* 并向用户展示预览；"
             "只有用户在预览后明确确认，才可调用 trm_create_* 幂等写入。不得跳过确认，也不得仅生成文字草稿来假装已创建。"
+            "必须遵守事实上下文中的 ai_permissions 和 supported_writes；未列出的能力明确告知用户无权操作。"
+            "调用每个 trm_* 工具时必须原样传入 mcp_authorization.delegation_token，不得在答案中显示、引用或解释该令牌。"
             "如果当前会话没有这些工具，明确说明‘TRM MCP尚未绑定到当前智能体’。\n\n"
             f"【交互入口】{source}\n"
             f"【用户问题】{question}\n\n"

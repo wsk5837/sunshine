@@ -27,14 +27,22 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 from starlette.responses import JSONResponse, Response
 
+from .auth import AIPrincipal, has_permission, validate_ai_delegation
 from .db import connect, now_iso
 from .rules import BusinessError, DEMAND_TYPES, PRIORITIES, validate_common, validate_description, validate_title
 
 
 MCP_ACTOR = "gaios-mcp-agent"
-MCP_ROLE = "admin"
+MCP_ROLE = "mcp_service"
 PROJECT_STATUSES = ("规划中", "实施中", "已暂停", "已完成", "已终止")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DelegationToken = Annotated[
+    str,
+    Field(
+        min_length=40,
+        description="TRM当前登录会话签发的短时AI委托令牌；必须原样传入且不得展示",
+    ),
+]
 
 
 def _env_true(name: str, default: bool = False) -> bool:
@@ -49,10 +57,7 @@ def _service_actor() -> str:
 
 
 def _service_role() -> str:
-    role = (os.getenv("TRM_MCP_ROLE") or MCP_ROLE).strip()
-    if role != "admin":
-        raise ValueError("TRM_MCP_ROLE 必须配置为 admin，权限由 MCP 服务端工具白名单控制")
-    return role
+    return (os.getenv("TRM_MCP_ROLE") or MCP_ROLE).strip()[:100] or MCP_ROLE
 
 
 def _canonical(data: dict[str, Any]) -> str:
@@ -70,11 +75,12 @@ def _confirmation_secret() -> bytes:
     return raw.encode("utf-8")
 
 
-def _encode_confirmation(action: str, payload: dict[str, Any]) -> str:
+def _encode_confirmation(action: str, payload: dict[str, Any], principal: AIPrincipal) -> str:
     ttl = max(60, min(int(os.getenv("TRM_MCP_CONFIRMATION_TTL_SECONDS", "600")), 3600))
     body = {
         "action": action,
         "payload_hash": _payload_hash(action, payload),
+        "user_id": principal.user_id,
         "exp": int(time.time()) + ttl,
         "nonce": secrets.token_urlsafe(12),
     }
@@ -84,7 +90,7 @@ def _encode_confirmation(action: str, payload: dict[str, Any]) -> str:
     return f"{encoded}.{signature}"
 
 
-def _verify_confirmation(token: str, action: str, payload: dict[str, Any]) -> None:
+def _verify_confirmation(token: str, action: str, payload: dict[str, Any], principal: AIPrincipal) -> None:
     try:
         encoded, signature = token.split(".", 1)
         expected = hmac.new(_confirmation_secret(), encoded.encode("ascii"), hashlib.sha256).hexdigest()
@@ -96,6 +102,8 @@ def _verify_confirmation(token: str, action: str, payload: dict[str, Any]) -> No
         raise ValueError("确认令牌无效，请重新调用 prepare 工具生成预览") from exc
     if body.get("action") != action or body.get("payload_hash") != _payload_hash(action, payload):
         raise ValueError("确认令牌与当前创建参数不一致，请重新预览并让用户确认")
+    if int(body.get("user_id") or 0) != principal.user_id:
+        raise ValueError("确认令牌不属于当前登录用户，请重新预览")
     if int(body.get("exp") or 0) < int(time.time()):
         raise ValueError("确认令牌已过期，请重新调用 prepare 工具")
 
@@ -103,7 +111,10 @@ def _verify_confirmation(token: str, action: str, payload: dict[str, Any]) -> No
 def _ensure_write_enabled() -> None:
     if not _env_true("TRM_MCP_WRITE_ENABLED", False):
         raise ValueError("MCP 写操作未启用；由管理员在服务端设置 TRM_MCP_WRITE_ENABLED=true 后再试")
-    _service_role()
+
+
+def _authorize(delegation_token: str, required_permission: str) -> AIPrincipal:
+    return validate_ai_delegation(delegation_token, required_permission)
 
 
 def _validate_date(value: Optional[str], label: str) -> Optional[str]:
@@ -132,6 +143,8 @@ def _audit_tool(
     operation: str,
     success: bool,
     request_id: str,
+    principal: AIPrincipal,
+    required_permission: str,
     idempotency_key: str = "",
     object_type: str = "",
     object_id: str = "",
@@ -141,14 +154,18 @@ def _audit_tool(
 ) -> None:
     conn.execute(
         """INSERT INTO mcp_tool_calls
-        (tool_name,operation,actor,role,success,request_id,idempotency_key,object_type,object_id,
-         arguments_json,result_json,error,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (tool_name,operation,actor,role,user_id,service_actor,required_permission,delegation_id,
+         success,request_id,idempotency_key,object_type,object_id,arguments_json,result_json,error,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             tool_name,
             operation,
+            principal.username,
+            principal.role_code,
+            principal.user_id,
             _service_actor(),
-            _service_role(),
+            required_permission,
+            principal.delegation_id,
             1 if success else 0,
             request_id,
             idempotency_key,
@@ -169,6 +186,8 @@ def _audit_business(
     object_type: str,
     object_id: Any,
     request_id: str,
+    principal: AIPrincipal,
+    required_permission: str,
     demand_id: Optional[int] = None,
     details: Optional[dict[str, Any]] = None,
 ) -> None:
@@ -178,14 +197,21 @@ def _audit_business(
         VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (
             demand_id,
-            _service_actor(),
-            _service_role(),
+            f"{principal.display_name} {principal.username}".strip(),
+            principal.role_code,
             action,
             object_type,
             str(object_id),
             "成功",
             request_id,
-            _canonical({"channel": "mcp", **(details or {})}),
+            _canonical({
+                "channel": "mcp",
+                "user_id": principal.user_id,
+                "delegation_id": principal.delegation_id,
+                "required_permission": required_permission,
+                "service_actor": _service_actor(),
+                **(details or {}),
+            }),
             now_iso(),
         ),
     )
@@ -202,6 +228,10 @@ def init_trm_mcp_db() -> None:
                 operation TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 role TEXT NOT NULL,
+                user_id INTEGER,
+                service_actor TEXT DEFAULT '',
+                required_permission TEXT DEFAULT '',
+                delegation_id TEXT DEFAULT '',
                 success INTEGER NOT NULL,
                 request_id TEXT NOT NULL,
                 idempotency_key TEXT DEFAULT '',
@@ -224,6 +254,15 @@ def init_trm_mcp_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_mcp_tool_calls_created ON mcp_tool_calls(created_at DESC);
             """
         )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(mcp_tool_calls)")}
+        for name, definition in (
+            ("user_id", "INTEGER"),
+            ("service_actor", "TEXT DEFAULT ''"),
+            ("required_permission", "TEXT DEFAULT ''"),
+            ("delegation_id", "TEXT DEFAULT ''"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE mcp_tool_calls ADD COLUMN {name} {definition}")
 
 
 def _demand_payload(
@@ -232,9 +271,7 @@ def _demand_payload(
     demand_type: str,
     budget_sources: list[str],
     priority: str,
-    applicant: str,
-    applicant_code: str,
-    applicant_dept: str,
+    principal: AIPrincipal,
     budget_amount: float,
 ) -> dict[str, Any]:
     try:
@@ -245,9 +282,9 @@ def _demand_payload(
         raise ValueError(exc.message) from exc
     if budget_amount < 0 or budget_amount > 999_999_999.99:
         raise ValueError("预算金额必须在0~999999999.99之间")
-    applicant = applicant.strip() or _service_actor()
-    applicant_code = applicant_code.strip() or applicant
-    applicant_dept = applicant_dept.strip()
+    applicant = f"{principal.display_name} {principal.username}".strip()
+    applicant_code = principal.username
+    applicant_dept = principal.department
     sources = list(dict.fromkeys(x.strip() for x in budget_sources if x.strip()))
     with connect() as conn:
         known = {row["budget_name"] for row in conn.execute("SELECT budget_name FROM budgets")}
@@ -321,6 +358,9 @@ trm_mcp = MCPServer(
     version="1.0.0",
     description="供企业智能体查询 TRM 数据，并在用户确认后创建项目或需求草稿。",
     instructions=(
+        "每个 trm_* 工具都必须传入TRM事实上下文提供的 delegation_token；"
+        "该令牌代表当前登录用户，不得向用户显示、转述或写入日志。"
+        "工具会实时读取后台角色权限，拒绝未授权操作。"
         "先查询后操作。创建需求前先调用 trm_list_budgets 核对预算名称，创建项目前先核对预算ID。"
         "任何创建都必须先调用 trm_prepare_create_* 获取预览，将预览展示给用户；"
         "仅在用户明确确认后，用完全相同的字段、确认令牌和唯一幂等键调用 trm_create_*。"
@@ -335,23 +375,29 @@ trm_mcp = MCPServer(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_list_budgets(
+    delegation_token: DelegationToken,
     year: Annotated[Optional[int], Field(description="可选预算年份，如2026；不传表示全部")] = None,
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.query.budget")
+    request_id = str(uuid.uuid4())
     with connect() as conn:
         rows = conn.execute(
             "SELECT * FROM budgets WHERE (? IS NULL OR year=?) ORDER BY year DESC,id",
             (year, year),
         ).fetchall()
-    items = []
-    for row in rows:
-        item = dict(row)
-        total = float(item["total_budget"] or 0)
-        used = float(item["used_budget"] or 0)
-        item["remaining_budget"] = round(total - used, 2)
-        item["execution_rate"] = round(used / total * 100, 2) if total else 0
-        item["warning"] = "预算不足" if item["remaining_budget"] < 0 else ("执行率已达95%" if item["execution_rate"] >= 95 else "")
-        items.append(item)
-    return {"count": len(items), "items": items}
+        items = []
+        for row in rows:
+            item = dict(row)
+            total = float(item["total_budget"] or 0)
+            used = float(item["used_budget"] or 0)
+            item["remaining_budget"] = round(total - used, 2)
+            item["execution_rate"] = round(used / total * 100, 2) if total else 0
+            item["warning"] = "预算不足" if item["remaining_budget"] < 0 else ("执行率已达95%" if item["execution_rate"] >= 95 else "")
+            items.append(item)
+        result = {"count": len(items), "items": items}
+        _audit_tool(conn, tool_name="trm_list_budgets", operation="read", success=True, request_id=request_id,
+                    principal=principal, required_permission="ai.query.budget", arguments={"year": year}, result={"count": len(items)})
+    return result
 
 
 @trm_mcp.tool(
@@ -360,10 +406,13 @@ def trm_list_budgets(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_search_demands(
+    delegation_token: DelegationToken,
     query: Annotated[str, Field(max_length=100, description="需求编号、标题或申请人关键词；空字符串表示最近需求")] = "",
     status: Annotated[str, Field(max_length=40, description="可选精确状态，如草稿、产品经理审批、已完成")] = "",
     limit: Annotated[int, Field(ge=1, le=100, description="返回条数，1~100")] = 20,
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.query.demand")
+    request_id = str(uuid.uuid4())
     wheres: list[str] = []
     params: list[Any] = []
     if query.strip():
@@ -382,7 +431,11 @@ def trm_search_demands(
                 FROM demands{where} ORDER BY id DESC LIMIT ?""",
             (*params, limit),
         ).fetchall()
-    return {"count": len(rows), "items": [dict(row) for row in rows]}
+        result = {"count": len(rows), "items": [dict(row) for row in rows]}
+        _audit_tool(conn, tool_name="trm_search_demands", operation="read", success=True, request_id=request_id,
+                    principal=principal, required_permission="ai.query.demand",
+                    arguments={"query": query, "status": status, "limit": limit}, result={"count": len(rows)})
+    return result
 
 
 @trm_mcp.tool(
@@ -391,8 +444,11 @@ def trm_search_demands(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_get_demand(
+    delegation_token: DelegationToken,
     identifier: Annotated[str, Field(min_length=1, max_length=40, description="REQ-YYYYMMDD-XXXX 或草稿数字ID")],
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.query.demand")
+    request_id = str(uuid.uuid4())
     with connect() as conn:
         if identifier.strip().isdigit():
             row = conn.execute("SELECT * FROM demands WHERE id=?", (int(identifier),)).fetchone()
@@ -409,11 +465,14 @@ def trm_get_demand(
         item["approvals"] = [dict(x) for x in conn.execute("SELECT * FROM approval_records WHERE demand_id=? ORDER BY id", (item["id"],))]
         item["function_points"] = [dict(x) for x in conn.execute("SELECT * FROM function_points WHERE demand_id=? ORDER BY id", (item["id"],))]
         item["allocations"] = [dict(x) for x in conn.execute("SELECT * FROM allocations WHERE demand_id=? ORDER BY id", (item["id"],))]
-    estimated = float(item.get("estimated_hours") or 0)
-    actual = float(item.get("actual_hours") or 0)
-    deviation = abs(actual - estimated) / estimated * 100 if estimated else 0
-    item["work_hour_deviation_rate"] = round(deviation, 2)
-    item["work_hour_warning"] = deviation > 30
+        estimated = float(item.get("estimated_hours") or 0)
+        actual = float(item.get("actual_hours") or 0)
+        deviation = abs(actual - estimated) / estimated * 100 if estimated else 0
+        item["work_hour_deviation_rate"] = round(deviation, 2)
+        item["work_hour_warning"] = deviation > 30
+        _audit_tool(conn, tool_name="trm_get_demand", operation="read", success=True, request_id=request_id,
+                    principal=principal, required_permission="ai.query.demand",
+                    arguments={"identifier": identifier}, result={"id": item["id"], "demand_no": item.get("demand_no")})
     return item
 
 
@@ -423,10 +482,13 @@ def trm_get_demand(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_list_projects(
+    delegation_token: DelegationToken,
     query: Annotated[str, Field(max_length=100, description="项目编号/名称/项目经理/部门关键词")] = "",
     status: Annotated[str, Field(max_length=40, description="可选精确项目状态")] = "",
     limit: Annotated[int, Field(ge=1, le=100, description="返回条数，1~100")] = 20,
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.query.project")
+    request_id = str(uuid.uuid4())
     wheres: list[str] = []
     params: list[Any] = []
     if query.strip():
@@ -444,7 +506,11 @@ def trm_list_projects(
                 FROM projects{where} ORDER BY updated_at DESC LIMIT ?""",
             (*params, limit),
         ).fetchall()
-    return {"count": len(rows), "items": [dict(row) for row in rows]}
+        result = {"count": len(rows), "items": [dict(row) for row in rows]}
+        _audit_tool(conn, tool_name="trm_list_projects", operation="read", success=True, request_id=request_id,
+                    principal=principal, required_permission="ai.query.project",
+                    arguments={"query": query, "status": status, "limit": limit}, result={"count": len(rows)})
+    return result
 
 
 @trm_mcp.tool(
@@ -453,8 +519,11 @@ def trm_list_projects(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_get_project(
+    delegation_token: DelegationToken,
     identifier: Annotated[str, Field(min_length=1, max_length=40, description="PRJ-YYYY-XXXX 或数字ID")],
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.query.project")
+    request_id = str(uuid.uuid4())
     with connect() as conn:
         if identifier.strip().isdigit():
             row = conn.execute("SELECT * FROM projects WHERE id=?", (int(identifier),)).fetchone()
@@ -464,13 +533,16 @@ def trm_get_project(
             raise ValueError("项目不存在")
         item = dict(row)
         pid = item["id"]
-        item["budget"] = dict(conn.execute("SELECT * FROM budgets WHERE id=?", (item["budget_id"],)).fetchone()) if item.get("budget_id") and conn.execute("SELECT 1 FROM budgets WHERE id=?", (item["budget_id"],)).fetchone() else None
+        item["budget"] = dict(conn.execute("SELECT * FROM budgets WHERE id=?", (item["budget_id"],)).fetchone()) if has_permission(principal.permissions, "ai.query.budget") and item.get("budget_id") and conn.execute("SELECT 1 FROM budgets WHERE id=?", (item["budget_id"],)).fetchone() else None
         item["tasks"] = [dict(x) for x in conn.execute("SELECT * FROM project_tasks WHERE project_id=? ORDER BY id", (pid,))]
         item["milestones"] = [dict(x) for x in conn.execute("SELECT * FROM milestones WHERE project_id=? ORDER BY planned_date,id", (pid,))]
         item["risks"] = [dict(x) for x in conn.execute("SELECT * FROM project_risks WHERE project_id=? ORDER BY id DESC", (pid,))]
-        demand_rows = [dict(x) for x in conn.execute("SELECT * FROM demands ORDER BY id DESC")]
+        demand_rows = [dict(x) for x in conn.execute("SELECT * FROM demands ORDER BY id DESC")] if has_permission(principal.permissions, "ai.query.demand") else []
         budget_name = item["budget"]["budget_name"] if item["budget"] else ""
         item["demands"] = [x for x in demand_rows if budget_name and budget_name in _safe_json(x.get("budget_sources"), [])]
+        _audit_tool(conn, tool_name="trm_get_project", operation="read", success=True, request_id=request_id,
+                    principal=principal, required_permission="ai.query.project",
+                    arguments={"identifier": identifier}, result={"id": item["id"], "project_no": item.get("project_no")})
     return item
 
 
@@ -483,28 +555,33 @@ def trm_get_project(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_prepare_create_demand(
+    delegation_token: DelegationToken,
     title: Annotated[str, Field(min_length=1, max_length=100, description="需求标题，1~100字")],
     description: Annotated[str, Field(max_length=5000, description="需求描述，最多5000字")],
     demand_type: Annotated[Literal["业务流程优化", "智能化改造项目", "系统功能新增"], Field(description="需求类型")],
     budget_sources: Annotated[list[str], Field(max_length=20, description="预算名称列表，名称必须来自 trm_list_budgets；可为空")],
     priority: Annotated[Literal["高", "中", "低"], Field(description="优先级")],
-    applicant: Annotated[str, Field(max_length=100, description="业务申请人显示名；留空时使用MCP服务身份")] = "",
-    applicant_code: Annotated[str, Field(max_length=100, description="申请人工号/账号；留空时沿用申请人")] = "",
-    applicant_dept: Annotated[str, Field(max_length=100, description="申请人部门")] = "数字化管理部",
     budget_amount: Annotated[float, Field(ge=0, le=999999999.99, description="申请预算金额，元")] = 0,
 ) -> dict[str, Any]:
-    payload = _demand_payload(title, description, demand_type, budget_sources, priority, applicant, applicant_code, applicant_dept, budget_amount)
+    principal = _authorize(delegation_token, "ai.create.demand")
+    request_id = str(uuid.uuid4())
+    payload = _demand_payload(title, description, demand_type, budget_sources, priority, principal, budget_amount)
     warnings = []
     if payload["budget_amount"] > 50_000:
         warnings.append("预算超过5万元：草稿可创建，但提交审批前必须上传‘预算依据’附件")
-    return {
+    result = {
         "operation": "create_demand_draft",
         "will_write": False,
         "preview": payload,
         "warnings": warnings,
-        "confirmation_token": _encode_confirmation("create_demand", payload),
+        "confirmation_token": _encode_confirmation("create_demand", payload, principal),
         "next_step": "先向用户展示 preview 和 warnings；用户明确确认后再调用 trm_create_demand",
     }
+    with connect() as conn:
+        _audit_tool(conn, tool_name="trm_prepare_create_demand", operation="preview", success=True,
+                    request_id=request_id, principal=principal, required_permission="ai.create.demand",
+                    arguments=payload, result={"will_write": False, "warnings": warnings})
+    return result
 
 
 @trm_mcp.tool(
@@ -517,6 +594,7 @@ def trm_prepare_create_demand(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 def trm_create_demand(
+    delegation_token: DelegationToken,
     title: Annotated[str, Field(min_length=1, max_length=100, description="与预览相同的需求标题")],
     description: Annotated[str, Field(max_length=5000, description="与预览相同的需求描述")],
     demand_type: Annotated[Literal["业务流程优化", "智能化改造项目", "系统功能新增"], Field(description="与预览相同的需求类型")],
@@ -524,27 +602,30 @@ def trm_create_demand(
     priority: Annotated[Literal["高", "中", "低"], Field(description="与预览相同的优先级")],
     confirmation_token: Annotated[str, Field(min_length=40, description="prepare 工具返回的未过期确认令牌")],
     idempotency_key: Annotated[str, Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$", description="此次用户创建操作的唯一幂等键；网络重试必须复用同一值")],
-    applicant: Annotated[str, Field(max_length=100, description="与预览相同的业务申请人")] = "",
-    applicant_code: Annotated[str, Field(max_length=100, description="与预览相同的申请人工号/账号")] = "",
-    applicant_dept: Annotated[str, Field(max_length=100, description="与预览相同的申请人部门")] = "数字化管理部",
     budget_amount: Annotated[float, Field(ge=0, le=999999999.99, description="与预览相同的预算金额，元")] = 0,
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.create.demand")
     _ensure_write_enabled()
-    payload = _demand_payload(title, description, demand_type, budget_sources, priority, applicant, applicant_code, applicant_dept, budget_amount)
-    _verify_confirmation(confirmation_token, "create_demand", payload)
+    payload = _demand_payload(title, description, demand_type, budget_sources, priority, principal, budget_amount)
+    _verify_confirmation(confirmation_token, "create_demand", payload, principal)
     request_hash = _payload_hash("create_demand", payload)
     request_id = str(uuid.uuid4())
+    storage_key = f"u{principal.user_id}:{idempotency_key}"
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         prior = conn.execute(
             "SELECT request_hash,result_json FROM mcp_idempotency WHERE tool_name=? AND idempotency_key=?",
-            ("trm_create_demand", idempotency_key),
+            ("trm_create_demand", storage_key),
         ).fetchone()
         if prior:
             if prior["request_hash"] != request_hash:
                 raise ValueError("该幂等键已用于不同参数，请勿复用")
             replay = json.loads(prior["result_json"])
             replay["idempotent_replay"] = True
+            _audit_tool(conn, tool_name="trm_create_demand", operation="replay", success=True,
+                        request_id=request_id, principal=principal, required_permission="ai.create.demand",
+                        idempotency_key=idempotency_key, object_type="demand", object_id=str(replay.get("id") or ""),
+                        arguments=payload, result=replay)
             return replay
         now = now_iso()
         cur = conn.execute(
@@ -573,10 +654,14 @@ def trm_create_demand(
         }
         conn.execute(
             "INSERT INTO mcp_idempotency(tool_name,idempotency_key,request_hash,result_json,created_at) VALUES (?,?,?,?,?)",
-            ("trm_create_demand", idempotency_key, request_hash, _canonical(result), now),
+            ("trm_create_demand", storage_key, request_hash, _canonical(result), now),
         )
-        _audit_business(conn, action="MCP创建需求草稿", object_type="demand", object_id=did, demand_id=did, request_id=request_id, details={"idempotency_key": idempotency_key})
-        _audit_tool(conn, tool_name="trm_create_demand", operation="create", success=True, request_id=request_id, idempotency_key=idempotency_key, object_type="demand", object_id=str(did), arguments=payload, result=result)
+        _audit_business(conn, action="MCP创建需求草稿", object_type="demand", object_id=did,
+                        demand_id=did, request_id=request_id, principal=principal,
+                        required_permission="ai.create.demand", details={"idempotency_key": idempotency_key})
+        _audit_tool(conn, tool_name="trm_create_demand", operation="create", success=True,
+                    request_id=request_id, principal=principal, required_permission="ai.create.demand",
+                    idempotency_key=idempotency_key, object_type="demand", object_id=str(did), arguments=payload, result=result)
     return result
 
 
@@ -586,6 +671,7 @@ def trm_create_demand(
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_prepare_create_project(
+    delegation_token: DelegationToken,
     name: Annotated[str, Field(min_length=1, max_length=100, description="项目名称")],
     manager: Annotated[str, Field(min_length=1, max_length=100, description="项目经理")],
     department: Annotated[str, Field(max_length=100, description="所属部门")] = "",
@@ -597,15 +683,22 @@ def trm_prepare_create_project(
     end_date: Annotated[Optional[str], Field(description="计划结束日期 YYYY-MM-DD")] = None,
     description: Annotated[str, Field(max_length=5000, description="项目描述")] = "",
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.create.project")
+    request_id = str(uuid.uuid4())
     payload = _project_payload(name, manager, department, budget_id, total_budget, status, progress, start_date, end_date, description)
-    return {
+    result = {
         "operation": "create_project",
         "will_write": False,
         "preview": payload,
         "warnings": [],
-        "confirmation_token": _encode_confirmation("create_project", payload),
+        "confirmation_token": _encode_confirmation("create_project", payload, principal),
         "next_step": "先向用户展示 preview；用户明确确认后再调用 trm_create_project",
     }
+    with connect() as conn:
+        _audit_tool(conn, tool_name="trm_prepare_create_project", operation="preview", success=True,
+                    request_id=request_id, principal=principal, required_permission="ai.create.project",
+                    arguments=payload, result={"will_write": False})
+    return result
 
 
 @trm_mcp.tool(
@@ -618,6 +711,7 @@ def trm_prepare_create_project(
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
 )
 def trm_create_project(
+    delegation_token: DelegationToken,
     name: Annotated[str, Field(min_length=1, max_length=100, description="与预览相同的项目名称")],
     manager: Annotated[str, Field(min_length=1, max_length=100, description="与预览相同的项目经理")],
     confirmation_token: Annotated[str, Field(min_length=40, description="prepare 工具返回的未过期确认令牌")],
@@ -631,22 +725,28 @@ def trm_create_project(
     end_date: Annotated[Optional[str], Field(description="与预览相同的计划结束日期")]=None,
     description: Annotated[str, Field(max_length=5000, description="与预览相同的项目描述")] = "",
 ) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "ai.create.project")
     _ensure_write_enabled()
     payload = _project_payload(name, manager, department, budget_id, total_budget, status, progress, start_date, end_date, description)
-    _verify_confirmation(confirmation_token, "create_project", payload)
+    _verify_confirmation(confirmation_token, "create_project", payload, principal)
     request_hash = _payload_hash("create_project", payload)
     request_id = str(uuid.uuid4())
+    storage_key = f"u{principal.user_id}:{idempotency_key}"
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         prior = conn.execute(
             "SELECT request_hash,result_json FROM mcp_idempotency WHERE tool_name=? AND idempotency_key=?",
-            ("trm_create_project", idempotency_key),
+            ("trm_create_project", storage_key),
         ).fetchone()
         if prior:
             if prior["request_hash"] != request_hash:
                 raise ValueError("该幂等键已用于不同参数，请勿复用")
             replay = json.loads(prior["result_json"])
             replay["idempotent_replay"] = True
+            _audit_tool(conn, tool_name="trm_create_project", operation="replay", success=True,
+                        request_id=request_id, principal=principal, required_permission="ai.create.project",
+                        idempotency_key=idempotency_key, object_type="project", object_id=str(replay.get("id") or ""),
+                        arguments=payload, result=replay)
             return replay
         year = datetime.now().year
         prefix = f"PRJ-{year}-"
@@ -677,10 +777,14 @@ def trm_create_project(
         }
         conn.execute(
             "INSERT INTO mcp_idempotency(tool_name,idempotency_key,request_hash,result_json,created_at) VALUES (?,?,?,?,?)",
-            ("trm_create_project", idempotency_key, request_hash, _canonical(result), now),
+            ("trm_create_project", storage_key, request_hash, _canonical(result), now),
         )
-        _audit_business(conn, action="MCP创建项目", object_type="project", object_id=pid, request_id=request_id, details={"idempotency_key": idempotency_key, "project_no": project_no})
-        _audit_tool(conn, tool_name="trm_create_project", operation="create", success=True, request_id=request_id, idempotency_key=idempotency_key, object_type="project", object_id=str(pid), arguments=payload, result=result)
+        _audit_business(conn, action="MCP创建项目", object_type="project", object_id=pid,
+                        request_id=request_id, principal=principal, required_permission="ai.create.project",
+                        details={"idempotency_key": idempotency_key, "project_no": project_no})
+        _audit_tool(conn, tool_name="trm_create_project", operation="create", success=True,
+                    request_id=request_id, principal=principal, required_permission="ai.create.project",
+                    idempotency_key=idempotency_key, object_type="project", object_id=str(pid), arguments=payload, result=result)
     return result
 
 
@@ -795,6 +899,7 @@ def public_mcp_status() -> dict[str, Any]:
         "transport": "http_streamable",
         "endpoint_path": "/mcp/",
         "authentication": "Bearer token" if token_ready else "未配置",
+        "user_authorization": "live_role_delegation",
         "tool_count": 9,
         "service_actor": _service_actor(),
     }

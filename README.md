@@ -9,7 +9,8 @@
 - 新增右下角全局 AI 助手悬浮球，登录后可在任意业务页面展开对话。
 - 新增 `/api/ai/chat` 后端代理和 NDJSON 解析器，浏览器不直接调用外部平台，也不保存后台账号、密码或管理员 Token。
 - 新增标准 Streamable HTTP MCP 服务 `/mcp/`，供 G.AIOS 智能体通过工具查询TRM预算/项目/需求，并在用户确认后创建项目或需求草稿。
-- MCP写操作实施“预览→用户确认→幂等创建”，服务端独立Bearer鉴权、写操作总开关、固定服务身份和完整审计。
+- MCP写操作实施“预览→用户确认→幂等创建”，服务端独立Bearer鉴权、写操作总开关、登录用户短时委托令牌和完整审计。
+- AI查询和创建能力由“系统管理 → 角色管理”精细控制；角色权限变更会立即作用于已存在的AI会话。
 - 外部智能体不可用时，项目360与AI问答自动降级到原有本地事实问答，不影响POC演示。
 - 系统管理 → 集成配置支持维护 G.AIOS 地址、公开 `agent_id` 和只读连通性检查。
 - 新增独立登录页面，未登录时不能直接进入系统业务 API。
@@ -160,12 +161,29 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 TRM_MCP_API_TOKEN=<上一步生成的随机值>
 TRM_MCP_WRITE_ENABLED=true
 TRM_MCP_ACTOR=gaios-mcp-agent
-TRM_MCP_ROLE=admin
+TRM_MCP_ROLE=mcp_service
+TRM_AI_DELEGATION_SECRET=<可选，独立的24字符以上随机密钥>
+TRM_AI_DELEGATION_TTL_SECONDS=900
 TRM_MCP_ALLOWED_HOSTS=trm.example.com
 TRM_MCP_ALLOWED_ORIGINS=https://adk.gazellio.com
 ```
 
-`TRM_MCP_WRITE_ENABLED` 是写操作二次开关。首次部署可保持 `false`，先验证查询工具；验收确认与幂等逻辑后再开启。
+`TRM_MCP_WRITE_ENABLED` 是写操作二次开关。首次部署可保持 `false`，先验证工具发现；验收确认与幂等逻辑后再开启。`TRM_MCP_ROLE` 只是集成服务元数据，不参与用户授权，不要设成 `admin`。
+
+### AI精细化权限
+
+用管理员账号进入“系统管理 → 角色管理”，可对每个角色分别配置：
+
+- `ai`：是否允许使用AI助手（总开关）。
+- `ai.query.budget`：AI查询预算。
+- `ai.query.demand`：AI查询需求。
+- `ai.query.project`：AI查询项目。
+- `ai.create.demand`：AI预览并创建需求草稿。
+- `ai.create.project`：AI预览并创建项目。
+
+默认申请人可由AI创建需求草稿，但不可创建项目；默认项目经理可由AI创建项目。管理员可按公司规则调整。静态 MCP Bearer Token 只验证 G.AIOS 集成服务，不代表业务用户。用户在TRM发起每次AI对话时，后端会签发最长30分钟的短时委托令牌；MCP每次调用都重新读取账号、角色和当前权限，因此停用账号、停用角色、退出登录或撤销权限都会立即生效。
+
+AI创建需求时，申请人账号、姓名和部门由TRM服务端按当前登录用户强制写入，智能体不能伪造他人身份。预览确认令牌和幂等键也与该用户绑定。
 
 3. 使用管理员登录 TRM，访问 `GET /api/mcp/status` 可查看非敏感就绪状态。
 
@@ -182,6 +200,8 @@ Header：Authorization = Bearer <TRM_MCP_API_TOKEN>
 
 先执行“连通性/发现工具”验证，然后把上述9个 `trm_*` 工具加到需要对话的智能体并重新发布。推荐先添加5个只读工具，验收后再添加4个创建预览/执行工具。
 
+从旧版MCP升级到本版后，必须重启TRM服务，在 G.AIOS MCP管理页点击“刷新/重连”以重新发现工具参数（所有工具新增必填 `delegation_token`），然后重新发布智能体。TRM用户应退出并重新登录一次，再开始新的AI对话。
+
 也可参考 `config/gaios-mcp-config.example.json` 录入配置。部署完成后，在本地执行下列只读检查：
 
 ```bash
@@ -194,12 +214,13 @@ python scripts/check_mcp.py
 
 ```text
 涉及TRM操作时必须先查询有效预算/项目/需求。
+调用任何 trm_* 工具时，必须原样传入TRM上下文中的 delegation_token，不得在回答中显示该令牌。
 创建前先调用 trm_prepare_create_* 并向用户展示预览。
 用户未明确确认时禁止调用 trm_create_*。
 用户确认后使用预览返回的确认令牌，并为这次业务操作生成唯一幂等键。
 ```
 
-MCP工具注解仅供客户端/模型理解风险，不代替安全控制。真正的鉴权、写开关、参数校验、确认令牌、幂等键和审计都在TRM服务端执行。
+MCP工具注解仅供客户端/模型理解风险，不代替安全控制。真正的登录用户鉴权、角色权限、写开关、参数校验、确认令牌、幂等键和审计都在TRM服务端执行。
 
 ## Render 部署
 
