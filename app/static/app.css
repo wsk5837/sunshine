@@ -521,6 +521,57 @@ footer { text-align: center; color: #8092b4; padding: 15px; }
 .info-grid > div { padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .info-grid > div:nth-child(4n+1), .info-grid > div:nth-child(4n+3) { background: #f8faff; color: var(--muted); }
 .info-grid > div:nth-last-child(-n+4) { border-bottom: 0; }
+.info-grid.interactive-info-grid { overflow: visible; }
+.fp-summary-link { font-weight: 600; }
+.hover-hint { margin-left: 4px; color: #8a95ad; font-size: 11px; font-weight: 400; }
+.calc-metric-value { overflow: visible !important; }
+.calc-tooltip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  outline: none;
+}
+.calc-tooltip-trigger {
+  color: #3f64dc;
+  border-bottom: 1px dashed #7d91df;
+  cursor: help;
+  white-space: nowrap;
+}
+.calc-tooltip-trigger::after { content: " ⓘ"; color: #8a98c9; font-size: .78em; }
+.calc-tooltip-panel {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 9px);
+  z-index: 70;
+  width: min(390px, 72vw);
+  display: block;
+  padding: 12px 13px;
+  border: 1px solid #dce3f2;
+  border-radius: 8px;
+  background: #fff;
+  color: #42516f;
+  box-shadow: 0 12px 32px rgba(43, 57, 96, .18);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  visibility: hidden;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity .14s ease, transform .14s ease, visibility .14s;
+  pointer-events: none;
+}
+.calc-tooltip:hover .calc-tooltip-panel,
+.calc-tooltip:focus .calc-tooltip-panel,
+.calc-tooltip:focus-within .calc-tooltip-panel { visibility: visible; opacity: 1; transform: translateY(0); }
+.calc-title { display: block; margin-bottom: 7px; color: #25375c; font-weight: 650; }
+.calc-breakdown-list { display: block; max-height: 210px; overflow: auto; }
+.calc-line { display: grid; grid-template-columns: minmax(100px, 1fr) auto; gap: 12px; padding: 6px 0; border-bottom: 1px solid #edf0f7; }
+.calc-line > span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calc-line > span:last-child { white-space: nowrap; }
+.calc-empty { display: block; padding: 5px 0; color: var(--muted); }
+.calc-total { display: block; padding-top: 8px; color: #263a68; font-weight: 650; text-align: right; }
 .timeline { position: relative; padding-left: 24px; }
 .timeline::before { content: ""; position: absolute; left: 7px; top: 6px; bottom: 6px; width: 1px; background: #dfe5f3; }
 .timeline-item { position: relative; padding: 0 0 18px; }
@@ -763,5 +814,12 @@ footer { text-align: center; color: #8092b4; padding: 15px; }
 .permission-grid label input { grid-row:1 / span 2; }
 .permission-grid label span { font-weight:500; }
 .permission-grid label small { color:var(--muted); margin-top:2px; }
+.user-role-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin-top:8px; max-height:260px; overflow:auto; }
+.user-role-grid label { border:1px solid var(--line); border-radius:9px; padding:9px 10px; display:grid; grid-template-columns:auto 1fr; column-gap:8px; align-items:center; background:#fff; cursor:pointer; }
+.user-role-grid label:has(input:checked) { border-color:#7d86f7; background:linear-gradient(90deg,#f1f4ff,#fbf1ff); }
+.user-role-grid label input { grid-row:1 / span 2; }
+.user-role-grid label small { color:var(--muted); margin-top:2px; }
+.role-chip-list { display:flex; flex-wrap:wrap; gap:5px; min-width:160px; }
+.role-chip-list span { display:inline-flex; padding:3px 8px; border-radius:999px; background:#eef1ff; color:#5662cf; font-size:12px; white-space:nowrap; }
 .permission-all { display:flex; align-items:center; gap:8px; padding:10px; background:#f7f9ff; border-radius:8px; }
-@media (max-width: 1180px) { .role-card-grid,.permission-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width: 1180px) { .role-card-grid,.permission-grid,.user-role-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }

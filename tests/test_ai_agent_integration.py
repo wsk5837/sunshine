@@ -72,7 +72,7 @@ def test_ai_chat_proxies_session_project_context_and_live_permissions(monkeypatc
         assert captured["source"] == "project360"
         assert projects[0]["project_no"] in captured["context"]
         context = json.loads(captured["context"])
-        assert "ai.create.project" in context["ai_permissions"]
+        assert "create.project" in context["effective_ai_capabilities"]
         assert context["mcp_action_capabilities"]["supported_writes"] == ["创建项目"]
         assert len(context["mcp_authorization"]["delegation_token"]) >= 40
         assert context["mcp_authorization"]["delegation_token"] not in response.text

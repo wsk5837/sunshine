@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -37,11 +38,6 @@ PERMISSION_CATALOG = {
     "function_points": "功能点管理",
     "tapd": "TAPD同步",
     "ai": "AI智能问答",
-    "ai.query.budget": "AI查询预算",
-    "ai.query.demand": "AI查询需求",
-    "ai.query.project": "AI查询项目",
-    "ai.create.demand": "AI创建需求草稿",
-    "ai.create.project": "AI创建项目",
     "project": "项目管理",
     "settlement": "结算管理",
     "indicator": "指标库",
@@ -53,27 +49,40 @@ PERMISSION_CATALOG = {
 }
 
 DEFAULT_ROLE_PERMISSIONS = {
-    "applicant": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.create", "demand.list", "demand.create", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "ai.create.demand"],
-    "department_head": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project"],
-    "product_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "demand.approve", "demand.evaluate", "function_points", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "project"],
-    "finance": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "settlement", "contract"],
-    "vp": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "project"],
-    "business_owner": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "project", "settlement", "contract", "indicator"],
-    "project_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "tapd", "ai", "ai.query.budget", "ai.query.demand", "ai.query.project", "ai.create.project", "project", "settlement", "indicator", "contract"],
+    "applicant": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.create", "demand.list", "demand.create", "tapd", "ai"],
+    "department_head": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai"],
+    "product_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "demand.approve", "demand.evaluate", "function_points", "tapd", "ai", "project"],
+    "finance": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "settlement", "contract"],
+    "vp": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project"],
+    "business_owner": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project", "settlement", "contract", "indicator"],
+    "project_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "tapd", "ai", "project", "settlement", "indicator", "contract"],
     "admin": ["*"],
 }
 
-AI_PERMISSION_CODES = tuple(code for code in PERMISSION_CATALOG if code.startswith("ai."))
+AI_CAPABILITY_RULES: dict[str, tuple[str, ...]] = {
+    "query.budget": ("budget",),
+    "query.demand": ("demand.list",),
+    "query.project": ("project360", "project"),
+    "create.demand": ("demand.create",),
+    "create.project": ("initiative.create", "project"),
+}
 
 
 def has_permission(permissions: list[str] | tuple[str, ...] | set[str], code: str) -> bool:
     return "*" in permissions or code in permissions
 
 
-def get_ai_permissions(permissions: list[str] | tuple[str, ...] | set[str]) -> list[str]:
-    if "*" in permissions:
-        return list(AI_PERMISSION_CODES)
-    return [code for code in AI_PERMISSION_CODES if code in permissions]
+def has_any_permission(permissions: list[str] | tuple[str, ...] | set[str], codes: tuple[str, ...]) -> bool:
+    return "*" in permissions or any(code in permissions for code in codes)
+
+
+def has_ai_capability(permissions: list[str] | tuple[str, ...] | set[str], capability: str) -> bool:
+    required = AI_CAPABILITY_RULES.get(capability, ())
+    return bool(required) and has_any_permission(permissions, required)
+
+
+def get_ai_capabilities(permissions: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    return [capability for capability in AI_CAPABILITY_RULES if has_ai_capability(permissions, capability)]
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,8 @@ class AIPrincipal:
     department: str
     role_code: str
     role_label: str
+    role_codes: tuple[str, ...]
+    role_labels: tuple[str, ...]
     permissions: tuple[str, ...]
     delegation_id: str
 
@@ -169,6 +180,16 @@ def init_auth_db():
                 last_seen TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES system_users(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS system_user_roles (
+                user_id INTEGER NOT NULL,
+                role_code TEXT NOT NULL,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(user_id, role_code),
+                FOREIGN KEY(user_id) REFERENCES system_users(id) ON DELETE CASCADE,
+                FOREIGN KEY(role_code) REFERENCES system_roles(code) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_system_user_roles_role ON system_user_roles(role_code, user_id);
             CREATE TABLE IF NOT EXISTS ai_delegations (
                 id TEXT PRIMARY KEY,
                 auth_session_token TEXT NOT NULL,
@@ -211,31 +232,27 @@ def init_auth_db():
                    VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(username) DO NOTHING""",
                 (username, display, dept, email, phone, role, _password_hash(password), "启用", ts, ts),
             )
-        migration_name = "ai_fine_grained_v1"
+        conn.execute(
+            """INSERT OR IGNORE INTO system_user_roles(user_id,role_code,is_primary,created_at)
+               SELECT id,role_code,1,? FROM system_users""",
+            (ts,),
+        )
+        # V4.9.1: AI no longer has a second permission system. Remove the
+        # previously introduced ai.* grants; MCP derives capabilities directly
+        # from the same business permissions used by pages and API actions.
+        migration_name = "ai_permissions_unified_v2"
         if not conn.execute("SELECT 1 FROM auth_permission_migrations WHERE name=?", (migration_name,)).fetchone():
             for row in conn.execute("SELECT code,permissions FROM system_roles").fetchall():
                 try:
                     current = json.loads(row["permissions"] or "[]")
                 except Exception:
                     current = []
-                if "*" in current or "ai" not in current:
-                    continue
-                additions: list[str] = []
-                if "budget" in current:
-                    additions.append("ai.query.budget")
-                if "demand.list" in current:
-                    additions.append("ai.query.demand")
-                if "project" in current or "project360" in current:
-                    additions.append("ai.query.project")
-                if "demand.create" in current:
-                    additions.append("ai.create.demand")
-                if row["code"] == "project_manager":
-                    additions.append("ai.create.project")
-                merged = list(dict.fromkeys([*current, *additions]))
-                conn.execute(
-                    "UPDATE system_roles SET permissions=?,updated_at=? WHERE code=?",
-                    (json.dumps(merged, ensure_ascii=False), ts, row["code"]),
-                )
+                cleaned = [code for code in current if not str(code).startswith("ai.")]
+                if cleaned != current:
+                    conn.execute(
+                        "UPDATE system_roles SET permissions=?,updated_at=? WHERE code=?",
+                        (json.dumps(cleaned, ensure_ascii=False), ts, row["code"]),
+                    )
             conn.execute(
                 "INSERT INTO auth_permission_migrations(name,applied_at) VALUES(?,?)",
                 (migration_name, ts),
@@ -243,6 +260,7 @@ def init_auth_db():
         # remove expired sessions
         conn.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now_iso(),))
         conn.execute("DELETE FROM ai_delegations WHERE expires_at < ?", (now_iso(),))
+        conn.execute("PRAGMA optimize")
 
 
 def _role_dict(row):
@@ -252,6 +270,141 @@ def _role_dict(row):
     except Exception:
         d["permissions"] = []
     return d
+
+
+def _parse_permissions(raw: str | None) -> list[str]:
+    try:
+        value = json.loads(raw or "[]")
+        return [str(item) for item in value] if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
+def _load_user_roles(conn, user_id: int, fallback_role: str = "") -> dict:
+    rows = conn.execute(
+        """SELECT ur.role_code,ur.is_primary,r.label,r.permissions
+           FROM system_user_roles ur
+           JOIN system_roles r ON r.code=ur.role_code
+           WHERE ur.user_id=? AND r.status='启用'
+           ORDER BY ur.is_primary DESC, ur.rowid""",
+        (user_id,),
+    ).fetchall()
+    if not rows and fallback_role:
+        fallback = conn.execute(
+            "SELECT code role_code,1 is_primary,label,permissions FROM system_roles WHERE code=? AND status='启用'",
+            (fallback_role,),
+        ).fetchone()
+        rows = [fallback] if fallback else []
+    role_codes = [row["role_code"] for row in rows]
+    role_labels = [row["label"] for row in rows]
+    merged: list[str] = []
+    for row in rows:
+        for permission in _parse_permissions(row["permissions"]):
+            if permission == "*":
+                merged = ["*"]
+                break
+            if permission not in merged:
+                merged.append(permission)
+        if merged == ["*"]:
+            break
+    return {
+        "role_codes": role_codes,
+        "role_labels": role_labels,
+        "role_code": role_codes[0] if role_codes else "",
+        "role_label": role_labels[0] if role_labels else "",
+        "permissions": merged,
+    }
+
+
+def request_role_codes(request: Request) -> set[str]:
+    user = getattr(request.state, "auth_user", None) or {}
+    if user:
+        return set(user.get("role_codes") or ([user.get("role_code")] if user.get("role_code") else []))
+    # 仅供本地 TestClient 的旧测试用例兼容；真实 HTTP 请求会在中间件中
+    # 被强制登录，且 X-Role/X-Roles 会被服务端会话数据覆盖。
+    raw = request.headers.get("X-Roles") or request.headers.get("X-Role") or ""
+    return {code.strip() for code in raw.split(",") if code.strip()}
+
+
+def request_has_role(request: Request, *role_codes: str) -> bool:
+    roles = request_role_codes(request)
+    return "admin" in roles or bool(roles.intersection(role_codes))
+
+
+def permissions_for_api(method: str, path: str) -> tuple[str, ...]:
+    """Return any-of permissions required by a protected API route.
+
+    Authentication is handled separately. An empty tuple means that every
+    authenticated user may call the route.
+    """
+    method = method.upper()
+    if path.startswith("/api/auth/") or path in {"/api/meta", "/api/v4/meta", "/api/notifications"}:
+        return ()
+    if re.fullmatch(r"/api/notifications/\d+/read", path):
+        return ()
+    if path == "/api/mcp/status":
+        return ("system.integrations",)
+    if path.startswith("/api/system/users"):
+        return ("system.users",)
+    if path.startswith("/api/system/roles") or path == "/api/system/permissions":
+        return ("system.roles",)
+    if path.startswith("/api/integrations") or path.startswith("/api/poc/settings") or path.startswith("/api/poc/jobs"):
+        return ("system.integrations",)
+    if path == "/api/tapd/test-connection":
+        return ("system.integrations",)
+    if path == "/api/audit":
+        return ("system.audit",)
+    if path.startswith("/api/ai/"):
+        return ("ai",)
+    if path in {"/api/dashboard", "/api/platform-dashboard"} or path.startswith("/api/exports/"):
+        return ("dashboard",)
+    if path.startswith("/api/initiative-approvals"):
+        return ("initiative.approve",)
+    if path.startswith("/api/initiatives"):
+        if path.endswith("/approve"):
+            return ("initiative.approve",)
+        if path.endswith("/convert-project"):
+            return ("project",)
+        return ("initiative.list",) if method == "GET" else ("initiative.create",)
+    if path.startswith("/api/approvals/"):
+        return ("demand.approve",)
+    if path.startswith("/api/attachments/"):
+        return ("demand.list",) if method == "GET" else ("demand.create",)
+    if path.startswith("/api/function-point"):
+        return ("function_points", "demand.evaluate")
+    if path.startswith("/api/demands"):
+        if path.endswith("/approve") or path.endswith("/oa-tasks"):
+            return ("demand.approve",)
+        if "/function-points" in path:
+            return ("function_points", "demand.evaluate")
+        if path.endswith("/allocations"):
+            return ("demand.evaluate",)
+        if path.endswith("/budget-check"):
+            return ("budget", "demand.evaluate")
+        if "/tapd/" in path:
+            return ("tapd",)
+        if method == "GET":
+            return ("demand.list",)
+        return ("demand.create",)
+    if path.startswith("/api/oa/tasks"):
+        return ("demand.approve", "demand.list")
+    if path.startswith("/api/tapd"):
+        return ("tapd",)
+    if path.startswith("/api/project360"):
+        return ("project360", "project")
+    if path.startswith("/api/projects") or path.startswith("/api/project-") or path.startswith("/api/milestones") or path.startswith("/api/deliverables"):
+        return ("project360", "project") if method == "GET" else ("project",)
+    if path.startswith("/api/budget") or path.startswith("/api/budgets"):
+        return ("budget",)
+    if path.startswith("/api/business-values"):
+        return ("value",)
+    if path.startswith("/api/settlement"):
+        return ("settlement",)
+    if path.startswith("/api/indicators"):
+        return ("indicator",)
+    if path.startswith("/api/contracts") or path.startswith("/api/contract-") or path.startswith("/api/payment-plans"):
+        return ("contract",)
+    return ()
 
 
 def get_role_labels():
@@ -274,23 +427,20 @@ def resolve_session(token: str):
         return None
     with connect() as conn:
         row = conn.execute(
-            """SELECT s.token,s.expires_at,u.id,u.username,u.display_name,u.department,u.email,u.phone,u.role_code,u.status,
-                      r.label role_label,r.permissions,r.status role_status
-               FROM auth_sessions s JOIN system_users u ON u.id=s.user_id JOIN system_roles r ON r.code=u.role_code
+            """SELECT s.token,s.expires_at,u.id,u.username,u.display_name,u.department,u.email,u.phone,u.role_code,u.status
+               FROM auth_sessions s JOIN system_users u ON u.id=s.user_id
                WHERE s.token=?""",
             (token,),
         ).fetchone()
         if not row:
             return None
-        if row["status"] != "启用" or row["role_status"] != "启用" or row["expires_at"] < now_iso():
+        role_context = _load_user_roles(conn, int(row["id"]), row["role_code"])
+        if row["status"] != "启用" or not role_context["role_codes"] or row["expires_at"] < now_iso():
             conn.execute("DELETE FROM auth_sessions WHERE token=?", (token,))
             return None
         conn.execute("UPDATE auth_sessions SET last_seen=? WHERE token=?", (now_iso(), token))
         d = dict(row)
-        try:
-            d["permissions"] = json.loads(d.get("permissions") or "[]")
-        except Exception:
-            d["permissions"] = []
+        d.update(role_context)
         return d
 
 
@@ -326,7 +476,7 @@ def issue_ai_delegation(session_token: str, source: str = "", project_id: Option
     return _sign_delegation({"jti": delegation_id, "exp": int(expires.timestamp()), "v": 1})
 
 
-def validate_ai_delegation(token: str, required_permission: str) -> AIPrincipal:
+def validate_ai_delegation(token: str, required_capability: str) -> AIPrincipal:
     """Validate one MCP call against live backend role permissions."""
     try:
         encoded, signature = (token or "").split(".", 1)
@@ -345,41 +495,40 @@ def validate_ai_delegation(token: str, required_permission: str) -> AIPrincipal:
         row = conn.execute(
             """SELECT d.id delegation_id,d.expires_at delegation_expires,
                       s.expires_at session_expires,u.id user_id,u.username,u.display_name,u.department,
-                      u.status user_status,u.role_code,r.label role_label,r.permissions,r.status role_status
+                      u.status user_status,u.role_code
                FROM ai_delegations d
                JOIN auth_sessions s ON s.token=d.auth_session_token
                JOIN system_users u ON u.id=s.user_id
-               JOIN system_roles r ON r.code=u.role_code
                WHERE d.id=?""",
             (delegation_id,),
         ).fetchone()
         if not row:
             raise ValueError("AI委托令牌已撤销，请重新登录或重新发起对话")
-        if (
-            row["user_status"] != "启用"
-            or row["role_status"] != "启用"
-            or row["delegation_expires"] < now_iso()
-            or row["session_expires"] < now_iso()
-        ):
+        role_context = _load_user_roles(conn, int(row["user_id"]), row["role_code"])
+        if (row["user_status"] != "启用" or not role_context["role_codes"]
+                or row["delegation_expires"] < now_iso() or row["session_expires"] < now_iso()):
             conn.execute("DELETE FROM ai_delegations WHERE id=?", (delegation_id,))
             raise ValueError("用户会话、角色或AI委托已失效")
-        try:
-            permissions = tuple(json.loads(row["permissions"] or "[]"))
-        except Exception:
-            permissions = ()
+        permissions = tuple(role_context["permissions"])
 
     if not has_permission(permissions, "ai"):
         raise ValueError("当前角色未授权使用AI助手")
-    if not has_permission(permissions, required_permission):
-        label = PERMISSION_CATALOG.get(required_permission, required_permission)
-        raise ValueError(f"当前角色缺少权限：{label}（{required_permission}）")
+    required_permissions = AI_CAPABILITY_RULES.get(required_capability)
+    if not required_permissions:
+        raise ValueError(f"AI能力映射未配置：{required_capability}")
+    if not has_any_permission(permissions, required_permissions):
+        labels = " / ".join(PERMISSION_CATALOG.get(code, code) for code in required_permissions)
+        codes = " | ".join(required_permissions)
+        raise ValueError(f"当前角色缺少对应业务权限：{labels}（{codes}）")
     return AIPrincipal(
         user_id=int(row["user_id"]),
         username=row["username"],
         display_name=row["display_name"],
         department=row["department"] or "",
-        role_code=row["role_code"],
-        role_label=row["role_label"],
+        role_code=role_context["role_code"],
+        role_label=role_context["role_label"],
+        role_codes=tuple(role_context["role_codes"]),
+        role_labels=tuple(role_context["role_labels"]),
         permissions=permissions,
         delegation_id=delegation_id,
     )
@@ -406,7 +555,8 @@ class UserPayload(BaseModel):
     department: str = ""
     email: str = ""
     phone: str = ""
-    role_code: str
+    role_code: Optional[str] = None
+    role_codes: list[str] = Field(default_factory=list, max_length=20)
     status: str = "启用"
     password: Optional[str] = None
 
@@ -419,21 +569,49 @@ class RolePayload(BaseModel):
     status: str = "启用"
 
 
+def _selected_role_codes(payload: UserPayload) -> list[str]:
+    raw = payload.role_codes or ([payload.role_code] if payload.role_code else [])
+    roles = list(dict.fromkeys(str(code).strip() for code in raw if str(code).strip()))
+    if not roles:
+        raise BusinessError(400, "AUTH-4001", "用户至少需要分配一个角色")
+    return roles
+
+
+def _assert_role_codes(conn, role_codes: list[str]) -> None:
+    placeholders = ",".join("?" for _ in role_codes)
+    active = {
+        row["code"] for row in conn.execute(
+            f"SELECT code FROM system_roles WHERE status='启用' AND code IN ({placeholders})",
+            role_codes,
+        )
+    }
+    invalid = [code for code in role_codes if code not in active]
+    if invalid:
+        raise BusinessError(400, "AUTH-4001", f"角色不存在或已停用：{', '.join(invalid)}")
+
+
+def _replace_user_roles(conn, user_id: int, role_codes: list[str], created_at: str) -> None:
+    _assert_role_codes(conn, role_codes)
+    conn.execute("DELETE FROM system_user_roles WHERE user_id=?", (user_id,))
+    for index, code in enumerate(role_codes):
+        conn.execute(
+            "INSERT INTO system_user_roles(user_id,role_code,is_primary,created_at) VALUES(?,?,?,?)",
+            (user_id, code, 1 if index == 0 else 0, created_at),
+        )
+
+
 @router.post("/api/auth/login")
 def login(payload: LoginPayload, request: Request):
     username = payload.username.strip()
     with connect() as conn:
-        row = conn.execute(
-            """SELECT u.*,r.label role_label,r.permissions,r.status role_status FROM system_users u
-               JOIN system_roles r ON r.code=u.role_code WHERE u.username=?""",
-            (username,),
-        ).fetchone()
+        row = conn.execute("SELECT * FROM system_users WHERE username=?", (username,)).fetchone()
         if not row or not _verify_password(payload.password, row["password_hash"]):
             raise BusinessError(401, "AUTH-4010", "账号或密码错误")
         if row["status"] != "启用":
             raise BusinessError(403, "AUTH-4030", "账号已停用，请联系系统管理员")
-        if row["role_status"] != "启用":
-            raise BusinessError(403, "AUTH-4030", "当前角色已停用，请联系系统管理员")
+        role_context = _load_user_roles(conn, int(row["id"]), row["role_code"])
+        if not role_context["role_codes"]:
+            raise BusinessError(403, "AUTH-4030", "当前账号没有可用角色，请联系系统管理员")
         token = secrets.token_urlsafe(36)
         now = datetime.now(timezone.utc).astimezone()
         expires = now + timedelta(hours=SESSION_HOURS)
@@ -442,16 +620,14 @@ def login(payload: LoginPayload, request: Request):
             (token, row["id"], now.isoformat(timespec="seconds"), expires.isoformat(timespec="seconds"), now.isoformat(timespec="seconds")),
         )
         conn.execute("UPDATE system_users SET last_login=?,updated_at=? WHERE id=?", (now_iso(), now_iso(), row["id"]))
-        try:
-            permissions = json.loads(row["permissions"] or "[]")
-        except Exception:
-            permissions = []
         return {"code": 0, "message": "登录成功", "data": {
             "token": token,
             "user": {
                 "id": row["id"], "username": row["username"], "display_name": row["display_name"],
                 "department": row["department"], "email": row["email"], "phone": row["phone"],
-                "role_code": row["role_code"], "role_label": row["role_label"], "permissions": permissions,
+                "role_code": role_context["role_code"], "role_label": role_context["role_label"],
+                "role_codes": role_context["role_codes"], "role_labels": role_context["role_labels"],
+                "permissions": role_context["permissions"],
             }
         }}
 
@@ -464,7 +640,9 @@ def me(x_session: Optional[str] = Header(None)):
     return {"code": 0, "data": {
         "id": user["id"], "username": user["username"], "display_name": user["display_name"],
         "department": user["department"], "email": user["email"], "phone": user["phone"],
-        "role_code": user["role_code"], "role_label": user["role_label"], "permissions": user["permissions"],
+        "role_code": user["role_code"], "role_label": user["role_label"],
+        "role_codes": user["role_codes"], "role_labels": user["role_labels"],
+        "permissions": user["permissions"],
     }}
 
 
@@ -492,37 +670,40 @@ def change_password(payload: ChangePasswordPayload, x_session: Optional[str] = H
 
 @router.get("/api/system/permissions")
 def permissions(x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
     return {"code": 0, "data": PERMISSION_CATALOG}
 
 
 @router.get("/api/system/users")
 def list_users(x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
     with connect() as conn:
         rows = conn.execute(
-            """SELECT u.id,u.username,u.display_name,u.department,u.email,u.phone,u.role_code,u.status,u.last_login,u.created_at,
-                      r.label role_label FROM system_users u JOIN system_roles r ON r.code=u.role_code ORDER BY u.id"""
+            """SELECT u.id,u.username,u.display_name,u.department,u.email,u.phone,u.role_code,u.status,u.last_login,u.created_at
+               FROM system_users u ORDER BY u.id"""
         ).fetchall()
-    return {"code": 0, "data": [dict(r) for r in rows]}
+        data = []
+        for row in rows:
+            item = dict(row)
+            item.update(_load_user_roles(conn, int(row["id"]), row["role_code"]))
+            data.append(item)
+    return {"code": 0, "data": data}
 
 
 @router.post("/api/system/users")
 def create_user(payload: UserPayload, x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
+    role_codes = _selected_role_codes(payload)
     password = payload.password or DEFAULT_DEMO_PASSWORD
     if len(password) < 8:
         raise BusinessError(400, "AUTH-4001", "初始密码至少8位")
     with connect() as conn:
-        if not conn.execute("SELECT 1 FROM system_roles WHERE code=? AND status='启用'", (payload.role_code,)).fetchone():
-            raise BusinessError(400, "AUTH-4001", "角色不存在或已停用")
+        _assert_role_codes(conn, role_codes)
         try:
             cur = conn.execute(
                 """INSERT INTO system_users(username,display_name,department,email,phone,role_code,password_hash,status,created_at,updated_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (payload.username.strip(), payload.display_name.strip(), payload.department, payload.email, payload.phone,
-                 payload.role_code, _password_hash(password), payload.status, now_iso(), now_iso()),
+                 role_codes[0], _password_hash(password), payload.status, now_iso(), now_iso()),
             )
+            _replace_user_roles(conn, int(cur.lastrowid), role_codes, now_iso())
         except Exception as exc:
             if "UNIQUE" in str(exc).upper():
                 raise BusinessError(409, "AUTH-4090", "账号已存在")
@@ -532,18 +713,18 @@ def create_user(payload: UserPayload, x_role: Optional[str] = Header(None)):
 
 @router.put("/api/system/users/{user_id}")
 def update_user(user_id: int, payload: UserPayload, x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
+    role_codes = _selected_role_codes(payload)
     with connect() as conn:
+        _assert_role_codes(conn, role_codes)
         old = conn.execute("SELECT * FROM system_users WHERE id=?", (user_id,)).fetchone()
         if not old:
             raise BusinessError(404, "REQ-4040", "用户不存在")
-        if not conn.execute("SELECT 1 FROM system_roles WHERE code=?", (payload.role_code,)).fetchone():
-            raise BusinessError(400, "AUTH-4001", "角色不存在")
         conn.execute(
             """UPDATE system_users SET username=?,display_name=?,department=?,email=?,phone=?,role_code=?,status=?,updated_at=? WHERE id=?""",
             (payload.username.strip(), payload.display_name.strip(), payload.department, payload.email, payload.phone,
-             payload.role_code, payload.status, now_iso(), user_id),
+             role_codes[0], payload.status, now_iso(), user_id),
         )
+        _replace_user_roles(conn, user_id, role_codes, now_iso())
         if payload.password:
             if len(payload.password) < 8:
                 raise BusinessError(400, "AUTH-4001", "密码至少8位")
@@ -555,7 +736,6 @@ def update_user(user_id: int, payload: UserPayload, x_role: Optional[str] = Head
 
 @router.post("/api/system/users/{user_id}/reset-password")
 def reset_password(user_id: int, x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
     with connect() as conn:
         if not conn.execute("SELECT 1 FROM system_users WHERE id=?", (user_id,)).fetchone():
             raise BusinessError(404, "REQ-4040", "用户不存在")
@@ -566,10 +746,9 @@ def reset_password(user_id: int, x_role: Optional[str] = Header(None)):
 
 @router.get("/api/system/roles")
 def list_roles(x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
     with connect() as conn:
         rows = conn.execute("SELECT * FROM system_roles ORDER BY built_in DESC, code").fetchall()
-        users = {r["role_code"]: r["c"] for r in conn.execute("SELECT role_code,COUNT(*) c FROM system_users GROUP BY role_code")}
+        users = {r["role_code"]: r["c"] for r in conn.execute("SELECT role_code,COUNT(*) c FROM system_user_roles GROUP BY role_code")}
     data = []
     for row in rows:
         d = _role_dict(row)
@@ -580,7 +759,6 @@ def list_roles(x_role: Optional[str] = Header(None)):
 
 @router.post("/api/system/roles")
 def create_role(payload: RolePayload, x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
     invalid = [p for p in payload.permissions if p != "*" and p not in PERMISSION_CATALOG]
     if invalid:
         raise BusinessError(400, "AUTH-4001", f"存在无效权限：{', '.join(invalid)}")
@@ -599,7 +777,6 @@ def create_role(payload: RolePayload, x_role: Optional[str] = Header(None)):
 
 @router.put("/api/system/roles/{code}")
 def update_role(code: str, payload: RolePayload, x_role: Optional[str] = Header(None)):
-    require_admin(x_role)
     invalid = [p for p in payload.permissions if p != "*" and p not in PERMISSION_CATALOG]
     if invalid:
         raise BusinessError(400, "AUTH-4001", f"存在无效权限：{', '.join(invalid)}")
@@ -611,6 +788,7 @@ def update_role(code: str, payload: RolePayload, x_role: Optional[str] = Header(
             "UPDATE system_roles SET label=?,description=?,permissions=?,status=?,updated_at=? WHERE code=?",
             (payload.label, payload.description, json.dumps(payload.permissions, ensure_ascii=False), payload.status, now_iso(), code),
         )
-        if payload.status != "启用":
-            conn.execute("DELETE FROM auth_sessions WHERE user_id IN (SELECT id FROM system_users WHERE role_code=?)", (code,))
+        # 不需要批量删除会话：resolve_session 每次都会重新合并“当前启用角色”。
+        # 多角色用户停用其中一个角色后仍可使用其他角色；若已无任何启用角色，
+        # resolve_session 会立即撤销该用户会话。
     return {"code": 0, "message": "角色权限已更新"}

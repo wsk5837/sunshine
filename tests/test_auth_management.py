@@ -18,10 +18,10 @@ def test_login_and_system_user_management():
         assert roles.status_code == 200
         assert any(r['code'] == 'admin' for r in roles.json()['data'])
         role_map = {r['code']: r for r in roles.json()['data']}
-        assert 'ai.create.demand' in role_map['applicant']['permissions']
-        assert 'ai.create.project' not in role_map['applicant']['permissions']
-        assert 'ai.create.project' in role_map['project_manager']['permissions']
+        assert 'demand.create' in role_map['applicant']['permissions']
+        assert 'initiative.create' in role_map['applicant']['permissions']
+        assert all(not any(p.startswith('ai.') for p in role['permissions']) for role in role_map.values())
         catalog = client.get('/api/system/permissions', headers=headers)
         assert catalog.status_code == 200
-        assert catalog.json()['data']['ai.query.budget'] == 'AI查询预算'
-        assert catalog.json()['data']['ai.create.project'] == 'AI创建项目'
+        assert catalog.json()['data']['ai'] == 'AI智能问答'
+        assert not any(code.startswith('ai.') for code in catalog.json()['data'])

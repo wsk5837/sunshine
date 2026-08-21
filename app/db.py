@@ -161,6 +161,8 @@ def init_db():
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(demand_id) REFERENCES demands(id) ON DELETE CASCADE
             );
+            CREATE INDEX IF NOT EXISTS idx_notifications_demand_title_role
+            ON notifications(demand_id,title,target_role);
 
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -288,6 +290,7 @@ def init_db():
             )
 
         conn.execute("UPDATE demands SET applicant_code='lili11-ghq' WHERE applicant_code IS NULL OR applicant_code=''")
+        conn.execute("PRAGMA optimize")
 
 
 def get_budget_by_name(conn, name: str):

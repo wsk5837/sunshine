@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from .db import connect, now_iso, row_to_dict
 from .rules import BusinessError, ROLE_LABELS
-from .auth import get_role_labels, has_permission
+from .auth import get_role_labels, has_ai_capability, has_permission, request_has_role, request_role_codes
 
 router = APIRouter(prefix="/api", tags=["完整平台功能"])
 
@@ -462,7 +462,6 @@ def update_initiative(item_id:int,payload:InitiativePayload,request:Request,x_us
 @router.post('/initiatives/{item_id}/submit')
 def submit_initiative(item_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('applicant','admin'): raise BusinessError(403,'AUTH-4030','仅申请人可提交立项')
     with connect() as conn:
         row=conn.execute('SELECT * FROM initiatives WHERE id=?',(item_id,)).fetchone()
         if not row: raise BusinessError(404,'REQ-4040','立项申请不存在')
@@ -472,10 +471,15 @@ def submit_initiative(item_id:int,request:Request,x_user:Optional[str]=Header(No
         return {'code':0,'message':'已提交部门负责人审批'}
 
 @router.get('/initiative-approvals/pending')
-def pending_initiatives(x_role:Optional[str]=Header(None)):
-    role=x_role or 'applicant'; node={'department_head':'部门负责人审批','finance':'财务评审','vp':'分管领导审批'}.get(role,'')
+def pending_initiatives(request:Request,x_role:Optional[str]=Header(None)):
+    roles=request_role_codes(request) or {x_role or 'applicant'}
+    nodes=[node for role,node in {'department_head':'部门负责人审批','finance':'财务评审','vp':'分管领导审批'}.items() if role in roles]
+    if 'admin' in roles: nodes=['部门负责人审批','财务评审','分管领导审批']
     with connect() as conn:
-        rows=[] if not node else [dict(x) for x in conn.execute("SELECT * FROM initiatives WHERE status='审批中' AND current_node=? ORDER BY updated_at DESC",(node,))]
+        if not nodes: rows=[]
+        else:
+            placeholders=','.join('?' for _ in nodes)
+            rows=[dict(x) for x in conn.execute(f"SELECT * FROM initiatives WHERE status='审批中' AND current_node IN ({placeholders}) ORDER BY updated_at DESC",nodes)]
         return {'code':0,'data':rows}
 
 @router.post('/initiatives/{item_id}/approve')
@@ -485,7 +489,7 @@ def approve_initiative(item_id:int,payload:ActionPayload,request:Request,x_user:
         row=conn.execute('SELECT * FROM initiatives WHERE id=?',(item_id,)).fetchone()
         if not row: raise BusinessError(404,'REQ-4040','立项申请不存在')
         node=row['current_node']; expected=mapping.get(node)
-        if role not in (expected,'admin'): raise BusinessError(403,'AUTH-4030',f'当前节点需要{expected}角色')
+        if not request_has_role(request,expected): raise BusinessError(403,'AUTH-4030',f'当前节点需要{expected}角色')
         action='通过' if payload.action=='通过' else '驳回'
         conn.execute('INSERT INTO initiative_approvals(initiative_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
         if action=='驳回': status='已驳回'; next_node='草稿'
@@ -497,7 +501,6 @@ def approve_initiative(item_id:int,payload:ActionPayload,request:Request,x_user:
 @router.post('/initiatives/{item_id}/convert-project')
 def convert_initiative(item_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('project_manager','admin'): raise BusinessError(403,'AUTH-4030','仅项目经理或管理员可转项目')
     with connect() as conn:
         ini=conn.execute('SELECT * FROM initiatives WHERE id=?',(item_id,)).fetchone()
         if not ini: raise BusinessError(404,'REQ-4040','立项申请不存在')
@@ -530,14 +533,12 @@ def project_detail(project_id:int):
 @router.post('/projects')
 def create_project(payload:ProjectPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('project_manager','admin'): raise BusinessError(403,'AUTH-4030','无项目创建权限')
     with connect() as conn:
         no=_next_no(conn,'projects','project_no',f'PRJ-{datetime.now().year}-'); now=now_iso(); cur=conn.execute("""INSERT INTO projects(project_no,name,manager,department,budget_id,total_budget,status,progress,start_date,end_date,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,payload.name,payload.manager,payload.department,payload.budget_id,payload.total_budget,payload.status,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.description,now,now)); pid=cur.lastrowid; _audit(conn,request,actor,role,'创建项目','project',pid); return {'code':0,'message':'项目已创建','data':{'id':pid,'project_no':no}}
 
 @router.put('/projects/{project_id}')
 def update_project(project_id:int,payload:ProjectPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('project_manager','admin'): raise BusinessError(403,'AUTH-4030','无项目维护权限')
     with connect() as conn:
         conn.execute("""UPDATE projects SET name=?,manager=?,department=?,budget_id=?,total_budget=?,status=?,progress=?,start_date=?,end_date=?,description=?,updated_at=? WHERE id=?""",(payload.name,payload.manager,payload.department,payload.budget_id,payload.total_budget,payload.status,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.description,now_iso(),project_id)); _audit(conn,request,actor,role,'更新项目','project',project_id); return {'code':0,'message':'项目已更新'}
 
@@ -582,14 +583,14 @@ def project_robot_query(project_id:int,payload:dict,request:Request):
     user=getattr(request.state,'auth_user',None)
     if not user: raise BusinessError(401,'AUTH-4010','登录已失效，请重新登录后使用项目360机器人')
     permissions=user.get('permissions') or []
-    if not has_permission(permissions,'ai') or not has_permission(permissions,'ai.query.project'):
+    if not has_permission(permissions,'ai') or not has_ai_capability(permissions,'query.project'):
         raise BusinessError(403,'AUTH-4030','当前角色未授权AI查询项目')
     q=str(payload.get('question','')).strip()
     detail=project_detail(project_id)['data']; task_count=len(detail['tasks']); done=sum(1 for x in detail['tasks'] if x['status']=='已完成'); overdue=sum(1 for x in detail['tasks'] if x.get('end_date') and x['status']!='已完成' and x['end_date'] < datetime.now().strftime('%Y-%m-%d'))
-    if has_permission(permissions,'ai.query.budget'):
+    if has_ai_capability(permissions,'query.budget'):
         budget=detail.get('budget'); budget_text='未关联预算' if not budget else f"预算{budget['total_budget']:,.0f}元，已使用{budget['used_budget']:,.0f}元，执行率{budget['used_budget']/budget['total_budget']*100:.1f}%"
     else: budget_text='当前角色无AI预算查询权限'
-    demand_text=f"关联需求{len(detail['demands'])}条" if has_permission(permissions,'ai.query.demand') else '关联需求数已按权限隐藏'
+    demand_text=f"关联需求{len(detail['demands'])}条" if has_ai_capability(permissions,'query.demand') else '关联需求数已按权限隐藏'
     answer=f"{detail['project_no']} {detail['name']} 当前状态为{detail['status']}，总体进度{detail['progress']}%。共有{task_count}项任务，已完成{done}项，逾期未完成{overdue}项；{budget_text}；{demand_text}、合同{len(detail['contracts'])}份、结算{len(detail['settlements'])}笔。"
     if '风险' in q or '预警' in q:
         answer += ' 当前重点关注：逾期任务、预算执行率、未完成里程碑以及需求/TAPD同步异常。'
@@ -606,20 +607,17 @@ def budget_ledger():
 @router.post('/budgets')
 def create_budget(payload:BudgetPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('finance','admin'): raise BusinessError(403,'AUTH-4030','仅财务或管理员可新建预算')
     with connect() as conn:
         no=payload.budget_no or _next_no(conn,'budgets','budget_no',f'BUD-{payload.year}-'); cur=conn.execute("""INSERT INTO budgets(budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year) VALUES (?,?,?,?,?,?,?,?,?)""",(no,payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year)); bid=cur.lastrowid; _audit(conn,request,actor,role,'创建预算','budget',bid); return {'code':0,'message':'预算已创建','data':{'id':bid,'budget_no':no}}
 
 @router.put('/budgets/{budget_id}')
 def update_budget(budget_id:int,payload:BudgetPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('finance','admin'): raise BusinessError(403,'AUTH-4030','仅财务或管理员可维护预算')
     with connect() as conn: conn.execute("""UPDATE budgets SET budget_name=?,total_budget=?,used_budget=?,internal_total=?,internal_used=?,digital_total=?,digital_used=?,year=? WHERE id=?""",(payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year,budget_id)); _audit(conn,request,actor,role,'更新预算','budget',budget_id); return {'code':0,'message':'预算已更新'}
 
 @router.post('/budgets/{budget_id}/transactions')
 def budget_transaction(budget_id:int,payload:BudgetTxnPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    if role not in ('finance','admin'): raise BusinessError(403,'AUTH-4030','仅财务或管理员可登记预算流水')
     if payload.amount<=0: raise BusinessError(400,'REQ-4001','金额必须大于0')
     with connect() as conn:
         b=conn.execute('SELECT * FROM budgets WHERE id=?',(budget_id,)).fetchone();
@@ -694,9 +692,14 @@ def submit_settlement(item_id:int,request:Request,x_user:Optional[str]=Header(No
         conn.execute("UPDATE settlements SET status='审批中',current_node='财务审批',updated_at=? WHERE id=?",(now_iso(),item_id));_audit(conn,request,actor,role,'提交结算申请','settlement',item_id);return {'code':0,'message':'结算申请已提交财务审批'}
 
 @router.get('/settlement-approvals/pending')
-def pending_settlements(x_role:Optional[str]=Header(None)):
-    node={'finance':'财务审批','business_owner':'业务负责人确认'}.get(x_role or '','')
-    with connect() as conn:return {'code':0,'data':[] if not node else [dict(x) for x in conn.execute("SELECT * FROM settlements WHERE status='审批中' AND current_node=? ORDER BY updated_at DESC",(node,))]}
+def pending_settlements(request:Request,x_role:Optional[str]=Header(None)):
+    roles=request_role_codes(request) or {x_role or ''}
+    nodes=[node for role,node in {'finance':'财务审批','business_owner':'业务负责人确认'}.items() if role in roles]
+    if 'admin' in roles:nodes=['财务审批','业务负责人确认']
+    with connect() as conn:
+        if not nodes:return {'code':0,'data':[]}
+        placeholders=','.join('?' for _ in nodes)
+        return {'code':0,'data':[dict(x) for x in conn.execute(f"SELECT * FROM settlements WHERE status='审批中' AND current_node IN ({placeholders}) ORDER BY updated_at DESC",nodes)]}
 
 @router.post('/settlements/{item_id}/approve')
 def approve_settlement(item_id:int,payload:ActionPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
@@ -705,7 +708,7 @@ def approve_settlement(item_id:int,payload:ActionPayload,request:Request,x_user:
         row=conn.execute('SELECT * FROM settlements WHERE id=?',(item_id,)).fetchone();
         if not row:raise BusinessError(404,'REQ-4040','结算单不存在')
         node=row['current_node']; expected=mapping.get(node)
-        if role not in (expected,'admin'):raise BusinessError(403,'AUTH-4030','当前角色无该审批权限')
+        if not request_has_role(request,expected):raise BusinessError(403,'AUTH-4030','当前角色无该审批权限')
         action='通过' if payload.action=='通过' else '驳回';conn.execute('INSERT INTO settlement_approvals(settlement_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
         if action=='驳回':status='已驳回';next_node='草稿'
         elif node=='财务审批':status='审批中';next_node='业务负责人确认'
@@ -783,9 +786,14 @@ def submit_contract(item_id:int,request:Request,x_user:Optional[str]=Header(None
         conn.execute("UPDATE contracts SET status='审批中',current_node='财务会签',updated_at=? WHERE id=?",(now_iso(),item_id));_audit(conn,request,actor,role,'提交合同审批','contract',item_id);return {'code':0,'message':'合同已提交财务会签'}
 
 @router.get('/contract-approvals/pending')
-def pending_contracts(x_role:Optional[str]=Header(None)):
-    node={'finance':'财务会签','business_owner':'业务负责人终审'}.get(x_role or '','')
-    with connect() as conn:return {'code':0,'data':[] if not node else [dict(x) for x in conn.execute("SELECT * FROM contracts WHERE status='审批中' AND current_node=? ORDER BY updated_at DESC",(node,))]}
+def pending_contracts(request:Request,x_role:Optional[str]=Header(None)):
+    roles=request_role_codes(request) or {x_role or ''}
+    nodes=[node for role,node in {'finance':'财务会签','business_owner':'业务负责人终审'}.items() if role in roles]
+    if 'admin' in roles:nodes=['财务会签','业务负责人终审']
+    with connect() as conn:
+        if not nodes:return {'code':0,'data':[]}
+        placeholders=','.join('?' for _ in nodes)
+        return {'code':0,'data':[dict(x) for x in conn.execute(f"SELECT * FROM contracts WHERE status='审批中' AND current_node IN ({placeholders}) ORDER BY updated_at DESC",nodes)]}
 
 @router.post('/contracts/{item_id}/approve')
 def approve_contract(item_id:int,payload:ActionPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
@@ -794,7 +802,7 @@ def approve_contract(item_id:int,payload:ActionPayload,request:Request,x_user:Op
         row=conn.execute('SELECT * FROM contracts WHERE id=?',(item_id,)).fetchone();
         if not row:raise BusinessError(404,'REQ-4040','合同不存在')
         node=row['current_node'];expected=mapping.get(node)
-        if role not in (expected,'admin'):raise BusinessError(403,'AUTH-4030','当前角色无该合同审批权限')
+        if not request_has_role(request,expected):raise BusinessError(403,'AUTH-4030','当前角色无该合同审批权限')
         action='通过' if payload.action=='通过' else '驳回';conn.execute('INSERT INTO contract_approvals(contract_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
         if action=='驳回':status='已驳回';next_node='草稿'
         elif node=='财务会签':status='审批中';next_node='业务负责人终审'

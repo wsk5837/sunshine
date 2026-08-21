@@ -22,7 +22,9 @@ from .extended import router as extended_router, init_extended_db, project_detai
 from .v4 import router as v4_router, init_v4_db
 from .auth import (
     DEFAULT_ROLE_PERMISSIONS,
-    get_ai_permissions,
+    get_ai_capabilities,
+    has_ai_capability,
+    has_any_permission,
     has_permission,
     issue_ai_delegation,
     router as auth_router,
@@ -30,13 +32,17 @@ from .auth import (
     resolve_session,
     get_role_labels,
     get_demo_users,
+    permissions_for_api,
+    request_has_role,
+    request_role_codes,
 )
 from .ai_gateway import AIServiceError, public_ai_config, run_agent_message
 from .trm_mcp import init_trm_mcp_db, mcp_asgi_app, public_mcp_status
 from .poc import (
     router as poc_router, init_poc_db, background_worker, create_oa_task, complete_oa_task,
     previous_nodes_for, create_tapd_requirements, schedule_tapd_retry, apply_tapd_payload,
-    build_mock_sync_payload, build_live_sync_payload, tapd_runtime_config, get_setting
+    build_mock_sync_payload, build_live_sync_payload, tapd_runtime_config, get_setting,
+    reconcile_work_deviation_notifications,
 )
 from .rules import (
     APPROVAL_FLOW,
@@ -71,6 +77,9 @@ async def lifespan(_app: FastAPI):
     init_auth_db()
     init_poc_db()
     init_trm_mcp_db()
+    # 启动时为旧版已有工时数据补齐真实的定向预警消息。
+    with connect() as conn:
+        reconcile_work_deviation_notifications(conn)
     async with mcp_asgi_app.run():
         worker = asyncio.create_task(background_worker())
         try:
@@ -108,8 +117,24 @@ async def auth_session_middleware(request: Request, call_next):
             })
         if session_user:
             request.state.auth_user = session_user
-            headers = [(k, v) for k, v in request.scope.get("headers", []) if k.lower() not in {b"x-user", b"x-role"}]
-            headers.extend([(b"x-user", session_user["username"].encode("ascii", "ignore")), (b"x-role", session_user["role_code"].encode("ascii", "ignore"))])
+            required = permissions_for_api(request.method, path)
+            if required and not has_any_permission(session_user.get("permissions") or [], required):
+                labels = ", ".join(required)
+                return JSONResponse(status_code=403, content={
+                    "code": "AUTH-4030",
+                    "message": f"当前账号未授权访问该功能（{labels}）",
+                    "requestId": request.headers.get("X-Request-Id") or str(uuid.uuid4()),
+                    "timestamp": now_iso(),
+                })
+            headers = [
+                (k, v) for k, v in request.scope.get("headers", [])
+                if k.lower() not in {b"x-user", b"x-role", b"x-roles"}
+            ]
+            headers.extend([
+                (b"x-user", session_user["username"].encode("ascii", "ignore")),
+                (b"x-role", session_user["role_code"].encode("ascii", "ignore")),
+                (b"x-roles", ",".join(session_user.get("role_codes") or []).encode("ascii", "ignore")),
+            ])
             request.scope["headers"] = headers
     return await call_next(request)
 
@@ -205,6 +230,10 @@ def demand_dict(conn, row):
     d["tapd_sync_runs"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_sync_runs WHERE demand_id=? ORDER BY id DESC LIMIT 20", (d["id"],))]
     d["tapd_retry_job"] = row_to_dict(conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? ORDER BY id DESC LIMIT 1", (d["id"],)).fetchone())
     d["tapd_events"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_events WHERE demand_id=? ORDER BY id DESC LIMIT 20", (d["id"],))]
+    d["deviation_notification_count"] = conn.execute(
+        "SELECT COUNT(*) c FROM notifications WHERE demand_id=? AND title='工时偏差预警'",
+        (d["id"],),
+    ).fetchone()["c"]
     return d
 
 
@@ -343,11 +372,11 @@ def build_ai_fact_context(
 ) -> str:
     """构建受控、紧凑的系统事实快照，供外部智能体回答业务问题。"""
     permissions = list(permissions or [])
-    can_budget = has_permission(permissions, "ai.query.budget")
-    can_demand = has_permission(permissions, "ai.query.demand")
-    can_project = has_permission(permissions, "ai.query.project")
-    can_create_demand = has_permission(permissions, "ai.create.demand")
-    can_create_project = has_permission(permissions, "ai.create.project")
+    can_budget = has_ai_capability(permissions, "query.budget")
+    can_demand = has_ai_capability(permissions, "query.demand")
+    can_project = has_ai_capability(permissions, "query.project")
+    can_create_demand = has_ai_capability(permissions, "create.demand")
+    can_create_project = has_ai_capability(permissions, "create.project")
     mcp_state = public_mcp_status()
     supported_writes = []
     if mcp_state["write_enabled"] and can_create_demand:
@@ -357,7 +386,8 @@ def build_ai_fact_context(
     facts: dict[str, Any] = {
         "data_scope": "仅可使用下方已授权的TRM事实；业务写操作必须通过已授权的TRM MCP工具执行",
         "current_role": ROLE_LABELS.get(role, role),
-        "ai_permissions": get_ai_permissions(permissions),
+        "effective_ai_capabilities": get_ai_capabilities(permissions),
+        "authorization_policy": "AI直接继承当前角色的业务权限，不存在独立AI操作权限",
         "mcp_action_capabilities": {
             "server_ready": mcp_state["enabled"],
             "write_enabled": mcp_state["write_enabled"],
@@ -455,9 +485,7 @@ def health():
 @app.get("/api/mcp/status")
 def mcp_status(x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     """Expose only non-secret MCP readiness information to signed-in administrators."""
-    _actor, role = actor_context(x_user, x_role)
-    if role != "admin":
-        raise BusinessError(403, "AUTH-4030", "仅系统管理员可查看MCP服务状态")
+    actor_context(x_user, x_role)
     return {"code": 0, "data": public_mcp_status()}
 
 
@@ -514,6 +542,7 @@ def list_demands(q: str = "", status: str = "", page: int = 1, page_size: int = 
 def get_demand(demand_id: int):
     with connect() as conn:
         row = get_demand_or_404(conn, demand_id)
+        reconcile_work_deviation_notifications(conn, demand_id)
         data = demand_dict(conn, row)
         data["budget_snapshot"] = budget_snapshot(conn, data)
     return {"code": 0, "data": data}
@@ -522,8 +551,6 @@ def get_demand(demand_id: int):
 @app.post("/api/demands")
 def create_demand(payload: DemandPayload, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("applicant", "admin"):
-        raise BusinessError(403, "AUTH-4030", "当前角色无权创建需求")
     title = validate_title(payload.title)
     validate_description(payload.description)
     validate_common(payload.demand_type, payload.priority, payload.budget_sources)
@@ -551,10 +578,8 @@ def update_demand(demand_id: int, payload: DemandPayload, request: Request, x_us
     validate_common(payload.demand_type, payload.priority, payload.budget_sources)
     with connect() as conn:
         old = demand_dict(conn, get_demand_or_404(conn, demand_id))
-        if role not in ("admin", "applicant"):
-            raise BusinessError(403, "AUTH-4030", "当前角色无权编辑需求基本信息")
-        if role == "applicant" and old["status"] not in ("草稿", "已驳回"):
-            raise BusinessError(409, "REQ-4091", "当前需求状态不允许申请人编辑")
+        if old["status"] not in ("草稿", "已驳回"):
+            raise BusinessError(409, "REQ-4091", "当前需求状态不允许编辑")
         conn.execute(
             """UPDATE demands SET title=?,description=?,demand_type=?,budget_sources=?,priority=?,applicant=?,applicant_code=?,applicant_dept=?,budget_amount=?,updated_at=? WHERE id=?""",
             (title, payload.description, payload.demand_type, json.dumps(payload.budget_sources, ensure_ascii=False), payload.priority,
@@ -622,8 +647,6 @@ def delete_attachment(attachment_id: int, request: Request, x_user: Optional[str
 @app.post("/api/demands/{demand_id}/submit")
 def submit_demand(demand_id: int, request: Request, confirm_warning: bool = Query(False), x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("applicant", "admin"):
-        raise BusinessError(403, "AUTH-4030", "当前角色无权提交需求")
     with connect() as conn:
         d = demand_dict(conn, get_demand_or_404(conn, demand_id))
         if d["status"] not in ("草稿", "已驳回"):
@@ -653,8 +676,6 @@ def submit_demand(demand_id: int, request: Request, confirm_warning: bool = Quer
 @app.post("/api/demands/{demand_id}/function-points")
 def add_function_point(demand_id: int, payload: FunctionPointPayload, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("product_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "仅产品经理可维护功能点评估")
     if not payload.system_name.strip() or not payload.evaluator.strip() or not payload.department.strip() or not payload.team.strip() or not payload.evaluation_date.strip():
         raise BusinessError(400, "REQ-4002", "归属系统、评估人、所属部门、所属团队、评估日期均为必填项")
     with connect() as conn:
@@ -699,8 +720,6 @@ def list_function_point_catalog(q: str = "", system_name: str = ""):
 @app.post("/api/demands/{demand_id}/function-points/link")
 def link_function_point(demand_id: int, payload: LinkFunctionPointPayload, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("product_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "仅产品经理可关联功能点")
     with connect() as conn:
         get_demand_or_404(conn, demand_id)
         count = conn.execute("SELECT COUNT(*) c FROM function_points WHERE demand_id=?", (demand_id,)).fetchone()["c"]
@@ -729,8 +748,6 @@ def link_function_point(demand_id: int, payload: LinkFunctionPointPayload, reque
 @app.put("/api/function-points/{fp_id}")
 def update_function_point(fp_id: int, payload: FunctionPointPayload, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("product_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "仅产品经理可编辑功能点")
     if payload.fp_count < 0 or payload.unit_price < 0:
         raise BusinessError(400, "REQ-4001", "功能点数量和单价不能为负数")
     if not payload.system_name.strip() or not payload.evaluator.strip() or not payload.department.strip() or not payload.team.strip() or not payload.evaluation_date.strip():
@@ -754,8 +771,6 @@ def update_function_point(fp_id: int, payload: FunctionPointPayload, request: Re
 @app.delete("/api/function-points/{fp_id}")
 def delete_function_point(fp_id: int, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("product_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "无权限删除功能点")
     with connect() as conn:
         row = conn.execute("SELECT * FROM function_points WHERE id=?", (fp_id,)).fetchone()
         if not row:
@@ -795,8 +810,6 @@ def export_function_points(demand_id: int):
 @app.post("/api/demands/{demand_id}/function-points/import")
 async def import_function_points(demand_id: int, request: Request, file: UploadFile = File(...), x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("product_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "仅产品经理可导入功能点")
     if not (file.filename or "").lower().endswith(".xlsx"):
         raise BusinessError(400, "REQ-4003", "功能点导入仅支持xlsx格式")
     content = await file.read()
@@ -847,8 +860,6 @@ async def import_function_points(demand_id: int, request: Request, file: UploadF
 @app.put("/api/demands/{demand_id}/allocations")
 def save_allocations(demand_id: int, payload: AllocationPayload, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("product_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "仅产品经理可维护费用分摊")
     if len(payload.rows) > MAX_ALLOCATION_ROWS:
         raise BusinessError(400, "REQ-4003", "单条需求费用分摊最多50行")
     total_ratio = sum(r.ratio for r in payload.rows)
@@ -902,7 +913,7 @@ def approve(demand_id: int, payload: ApprovalPayload, request: Request, x_user: 
         if node not in APPROVAL_FLOW:
             raise BusinessError(409, "REQ-4091", "当前需求不在可审批节点")
         expected_role, next_node = APPROVAL_FLOW[node]
-        if role not in (expected_role, "admin"):
+        if not request_has_role(request, expected_role):
             raise BusinessError(403, "AUTH-4030", f"当前节点需要角色：{ROLE_LABELS.get(expected_role, expected_role)}")
 
         if node == "产品经理审批" and action == "通过":
@@ -967,8 +978,6 @@ def approve(demand_id: int, payload: ApprovalPayload, request: Request, x_user: 
 @app.post("/api/demands/{demand_id}/tapd/push")
 def push_tapd(demand_id: int, request: Request, simulate_failure: bool = Query(False), x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None), automatic: bool = False):
     actor, role = actor_context(x_user, x_role)
-    if not automatic and role not in ("business_owner", "project_manager", "admin"):
-        raise BusinessError(403, "AUTH-4030", "当前角色无权推送TAPD")
     with connect() as conn:
         d = demand_dict(conn, get_demand_or_404(conn, demand_id))
         if d["status"] not in ("审批通过", "TAPD同步失败", "TAPD同步重试中", "已创建", "开发中", "测试中", "待发布", "已完成"):
@@ -993,8 +1002,6 @@ def push_tapd(demand_id: int, request: Request, simulate_failure: bool = Query(F
 @app.post("/api/demands/{demand_id}/tapd/sync")
 def sync_tapd(demand_id: int, request: Request, tapd_status: Optional[str] = Query(None), x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = actor_context(x_user, x_role)
-    if role not in ("applicant", "project_manager", "admin", "product_manager"):
-        raise BusinessError(403, "AUTH-4030", "当前角色无权手动同步TAPD状态")
     with connect() as conn:
         d = demand_dict(conn, get_demand_or_404(conn, demand_id))
         if not d.get("tapd_id") and not d.get("tapd_requirements"):
@@ -1021,10 +1028,10 @@ def sync_tapd(demand_id: int, request: Request, tapd_status: Optional[str] = Que
 
 
 @app.get("/api/approvals/pending")
-def pending_approvals(x_role: Optional[str] = Header(None)):
-    role = x_role or "department_head"
-    nodes = [n for n,(r,_) in APPROVAL_FLOW.items() if r == role]
-    if role == "admin":
+def pending_approvals(request: Request, x_role: Optional[str] = Header(None)):
+    roles = request_role_codes(request) or {x_role or "department_head"}
+    nodes = [n for n, (r, _) in APPROVAL_FLOW.items() if r in roles]
+    if "admin" in roles:
         nodes = list(APPROVAL_FLOW.keys())
     with connect() as conn:
         if nodes:
@@ -1037,10 +1044,18 @@ def pending_approvals(x_role: Optional[str] = Header(None)):
 
 
 @app.get("/api/notifications")
-def notifications(x_role: Optional[str] = Header(None)):
-    role = x_role or "applicant"
+def notifications(request: Request, x_role: Optional[str] = Header(None)):
+    roles = request_role_codes(request) or {x_role or "applicant"}
     with connect() as conn:
-        rows = conn.execute("SELECT * FROM notifications WHERE target_role IS NULL OR target_role=? ORDER BY id DESC LIMIT 50", (role,)).fetchall()
+        reconcile_work_deviation_notifications(conn)
+        if "admin" in roles:
+            rows = conn.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 50").fetchall()
+        else:
+            placeholders = ",".join("?" for _ in roles)
+            rows = conn.execute(
+                f"SELECT * FROM notifications WHERE target_role IS NULL OR target_role IN ({placeholders}) ORDER BY id DESC LIMIT 50",
+                tuple(roles),
+            ).fetchall()
     return {"code":0,"data":[dict(r) for r in rows]}
 
 
@@ -1091,7 +1106,7 @@ async def ai_chat(
     permissions = list(user.get("permissions") or [])
     if not has_permission(permissions, "ai"):
         raise BusinessError(403, "AUTH-4030", "当前角色未授权使用AI助手")
-    if payload.project_id and not has_permission(permissions, "ai.query.project"):
+    if payload.project_id and not has_ai_capability(permissions, "query.project"):
         raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询项目")
     actor = f"{user['display_name']} {user['username']}".strip()
     role = user["role_code"]
@@ -1128,7 +1143,7 @@ async def ai_chat(
             )
             audit(
                 conn, request, actor, role, "调用AI智能体", "ai_session", payload.session_id or "new",
-                result="失败", details={"source": payload.source, "project_id": payload.project_id, "error": str(exc)[:300]},
+                result="失败", details={"source": payload.source, "project_id": payload.project_id, "roles": user.get("role_codes") or [], "error": str(exc)[:300]},
             )
         raise BusinessError(502, "AI-5020", str(exc)) from exc
 
@@ -1147,13 +1162,18 @@ async def ai_chat(
                 "source": payload.source,
                 "project_id": payload.project_id,
                 "agent_id": result["agent_id"],
-                "ai_permissions": get_ai_permissions(permissions),
+                "roles": user.get("role_codes") or [],
+                "effective_ai_capabilities": get_ai_capabilities(permissions),
             },
         )
     return {
         "code": 0,
         "message": "智能体回答成功",
-        "data": {**result, "scope": "当前账号可访问的TRM系统事实数据", "role": ROLE_LABELS.get(role, role)},
+        "data": {
+            **result,
+            "scope": "当前账号可访问的TRM系统事实数据",
+            "role": "、".join(user.get("role_labels") or [ROLE_LABELS.get(role, role)]),
+        },
     }
 
 
@@ -1175,16 +1195,16 @@ def ai_query(payload: AIQueryPayload, request: Request, x_role: Optional[str] = 
     asks_demand = bool(re.search(r"REQ-\d{8}-\d{4}", q.upper())) or any(
         word in q for word in ("需求", "审批", "功能点", "TAPD", "进度", "工时", "历史", "过往")
     )
-    if asks_budget and not has_permission(permissions, "ai.query.budget"):
+    if asks_budget and not has_ai_capability(permissions, "query.budget"):
         raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询预算")
-    if asks_project and not has_permission(permissions, "ai.query.project"):
+    if asks_project and not has_ai_capability(permissions, "query.project"):
         raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询项目")
-    if asks_demand and not has_permission(permissions, "ai.query.demand"):
+    if asks_demand and not has_ai_capability(permissions, "query.demand"):
         raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询需求")
     with connect() as conn:
         rows = (
             [demand_dict(conn, r) for r in conn.execute("SELECT * FROM demands ORDER BY id DESC LIMIT 1000")]
-            if has_permission(permissions, "ai.query.demand") else []
+            if has_ai_capability(permissions, "query.demand") else []
         )
         target = None
         m = re.search(r"REQ-\d{8}-\d{4}", q.upper())
@@ -1292,7 +1312,7 @@ def ai_query(payload: AIQueryPayload, request: Request, x_role: Optional[str] = 
                 answer = "当前数据中尚无同时具备提交时间和关闭时间的已完成需求；历史追溯能力已启用，产生已完成需求后会自动计算平均交付周期并展示过往审批、评估与TAPD处理记录。"
 
         elif "多少" in q and ("需求" in q or "条" in q):
-            if not has_permission(permissions, "ai.query.demand"):
+            if not has_ai_capability(permissions, "query.demand"):
                 raise BusinessError(403, "AUTH-4030", "当前角色未授权AI查询需求")
             answer = f"当前系统共有{len(rows)}条需求，其中审批中{sum(1 for d in rows if '审批' in (d.get('current_node') or '') or d.get('current_node')=='终审')}条，已完成{sum(1 for d in rows if d.get('status')=='已完成')}条。"
         elif "预算" in q and target:

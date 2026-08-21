@@ -335,8 +335,6 @@ def update_initiative_profile(item_id: int, payload: InitiativeProfile, request:
 @router.delete("/initiatives/{item_id}")
 def delete_initiative(item_id: int, request: Request, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = _actor(x_user, x_role)
-    if role not in ("applicant", "admin"):
-        raise BusinessError(403, "AUTH-4030", "当前角色无删除立项权限")
     with connect() as conn:
         row = conn.execute("SELECT status,project_id FROM initiatives WHERE id=?", (item_id,)).fetchone()
         if not row:
@@ -534,8 +532,6 @@ def create_contract_change(item_id: int, payload: ContractChangePayload, request
 def effective_contract_change(change_id: int, request: Request,
                               x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = _actor(x_user, x_role)
-    if role not in ("business_owner", "admin"):
-        raise BusinessError(403, "AUTH-4030", "仅业务负责人或管理员可确认合同变更生效")
     with connect() as conn:
         ch = conn.execute("SELECT * FROM contract_changes WHERE id=?", (change_id,)).fetchone()
         if not ch:
@@ -593,8 +589,6 @@ def integrations():
 def update_integration(code: str, payload: IntegrationPayload, request: Request,
                        x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
     actor, role = _actor(x_user, x_role)
-    if role != "admin":
-        raise BusinessError(403, "AUTH-4030", "仅系统管理员可维护集成配置")
     if payload.mode not in ("mock", "live"):
         raise BusinessError(400, "REQ-4001", "集成模式仅支持 mock/live")
     if payload.mode == "live" and not payload.base_url:

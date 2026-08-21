@@ -134,19 +134,45 @@ def test_mcp_prepare_create_and_idempotency(monkeypatch, tmp_path):
             assert not applicant_demand.is_error
             assert applicant_demand.structured_content["preview"]["applicant_code"] == "lili11-ghq"
 
-            denied_project = await client.call_tool("trm_prepare_create_project", {
+            applicant_project = await client.call_tool("trm_prepare_create_project", {
                 **args,
                 "delegation_token": applicant_token,
-                "name": "不应创建的项目",
+                "name": "申请人同步立项权限测试",
             })
-            assert denied_project.is_error
-            assert "ai.create.project" in str(denied_project.content)
+            assert not applicant_project.is_error
+            assert applicant_project.structured_content["preview"]["name"] == "申请人同步立项权限测试"
+            applicant_created = await client.call_tool("trm_create_project", {
+                **args,
+                "delegation_token": applicant_token,
+                "name": "申请人同步立项权限测试",
+                "confirmation_token": applicant_project.structured_content["confirmation_token"],
+                "idempotency_key": "applicant-project-create-001",
+            })
+            assert not applicant_created.is_error
+            assert applicant_created.structured_content["created"] is True
+
+            # 申请人页面的“新建立项”权限一旦撤销，AI立即同步失去创建项目能力。
+            with db.connect() as conn:
+                role = conn.execute("SELECT permissions FROM system_roles WHERE code='applicant'").fetchone()
+                permissions = json.loads(role["permissions"])
+                permissions.remove("initiative.create")
+                conn.execute(
+                    "UPDATE system_roles SET permissions=? WHERE code='applicant'",
+                    (json.dumps(permissions, ensure_ascii=False),),
+                )
+            applicant_revoked = await client.call_tool("trm_prepare_create_project", {
+                **args,
+                "delegation_token": applicant_token,
+                "name": "申请人撤权后不应创建的项目",
+            })
+            assert applicant_revoked.is_error
+            assert "initiative.create" in str(applicant_revoked.content)
 
             # 后台撤销角色权限后，已签发的委托令牌也要立即失去该能力。
             with db.connect() as conn:
                 role = conn.execute("SELECT permissions FROM system_roles WHERE code='project_manager'").fetchone()
                 permissions = json.loads(role["permissions"])
-                permissions.remove("ai.create.project")
+                permissions.remove("project")
                 conn.execute(
                     "UPDATE system_roles SET permissions=? WHERE code='project_manager'",
                     (json.dumps(permissions, ensure_ascii=False),),
@@ -156,13 +182,14 @@ def test_mcp_prepare_create_and_idempotency(monkeypatch, tmp_path):
                 "name": "实时撤权测试项目",
             })
             assert revoked.is_error
-            assert "ai.create.project" in str(revoked.content)
+            assert "initiative.create" in str(revoked.content)
+            assert "project" in str(revoked.content)
 
     asyncio.run(scenario())
     with db.connect() as conn:
         assert conn.execute("SELECT COUNT(*) c FROM projects WHERE name=?", ("MCP幂等联调项目",)).fetchone()["c"] == 1
-        assert conn.execute("SELECT COUNT(*) c FROM mcp_tool_calls WHERE tool_name='trm_create_project'").fetchone()["c"] == 2
-        assert conn.execute("SELECT COUNT(*) c FROM audit_logs WHERE action='MCP创建项目'").fetchone()["c"] == 1
+        assert conn.execute("SELECT COUNT(*) c FROM mcp_tool_calls WHERE tool_name='trm_create_project'").fetchone()["c"] == 3
+        assert conn.execute("SELECT COUNT(*) c FROM audit_logs WHERE action='MCP创建项目'").fetchone()["c"] == 2
         audit_row = conn.execute(
             "SELECT actor,role,user_id,service_actor,required_permission FROM mcp_tool_calls WHERE tool_name='trm_create_project' ORDER BY id LIMIT 1"
         ).fetchone()
@@ -170,4 +197,4 @@ def test_mcp_prepare_create_and_idempotency(monkeypatch, tmp_path):
         assert audit_row["role"] == "project_manager"
         assert audit_row["user_id"]
         assert audit_row["service_actor"] == "gaios-mcp-agent"
-        assert audit_row["required_permission"] == "ai.create.project"
+        assert audit_row["required_permission"] == "initiative.create|project"
