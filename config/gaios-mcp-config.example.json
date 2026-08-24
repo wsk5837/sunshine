@@ -1,6 +1,6 @@
 {
   "name": "TRM科技资源管理",
-  "description": "查询TRM预算、项目、需求，并在用户确认后受控创建项目或需求草稿",
+  "description": "查询TRM预算、项目、需求，并在用户确认后受控创建项目、需求草稿或维护需求工时",
   "type": "http_streamable",
   "endpoint": "https://<TRM公网域名>/mcp/",
   "enabled": true,

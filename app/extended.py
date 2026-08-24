@@ -323,40 +323,40 @@ def init_extended_db():
 
 
 class InitiativePayload(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=100)
     description: str = ""
     applicant: str = "李莉 lili11-ghq"
     department: str = "数字化管理部"
     owner: str = ""
-    estimated_budget: float = 0
+    estimated_budget: float = Field(default=0, ge=0, le=999_999_999.99)
     budget_id: Optional[int] = None
     planned_start: Optional[str] = None
     planned_end: Optional[str] = None
 
 class ProjectPayload(BaseModel):
-    name: str
-    manager: str
+    name: str = Field(min_length=1, max_length=100)
+    manager: str = Field(min_length=1, max_length=100)
     department: str = ""
     budget_id: Optional[int] = None
-    total_budget: float = 0
+    total_budget: float = Field(default=0, ge=0, le=999_999_999.99)
     status: str = "规划中"
-    progress: float = 0
+    progress: float = Field(default=0, ge=0, le=100)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     description: str = ""
 
 class TaskPayload(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=200)
     owner: str = ""
     status: str = "未开始"
     priority: str = "中"
-    progress: float = 0
+    progress: float = Field(default=0, ge=0, le=100)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     parent_id: Optional[int] = None
 
 class MilestonePayload(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     planned_date: Optional[str] = None
     actual_date: Optional[str] = None
     status: str = "未完成"
@@ -365,13 +365,13 @@ class MilestonePayload(BaseModel):
 
 class BudgetPayload(BaseModel):
     budget_no: Optional[str] = None
-    budget_name: str
-    total_budget: float
-    used_budget: float = 0
-    internal_total: float = 0
-    internal_used: float = 0
-    digital_total: float = 0
-    digital_used: float = 0
+    budget_name: str = Field(min_length=1, max_length=200)
+    total_budget: float = Field(ge=0, le=9_999_999_999.99)
+    used_budget: float = Field(default=0, ge=0, le=9_999_999_999.99)
+    internal_total: float = Field(default=0, ge=0, le=9_999_999_999.99)
+    internal_used: float = Field(default=0, ge=0, le=9_999_999_999.99)
+    digital_total: float = Field(default=0, ge=0, le=9_999_999_999.99)
+    digital_used: float = Field(default=0, ge=0, le=9_999_999_999.99)
     year: int = 2026
 
 class BudgetTxnPayload(BaseModel):
@@ -397,14 +397,14 @@ class SettlementPayload(BaseModel):
     project_id: Optional[int] = None
     contract_id: Optional[int] = None
     budget_id: Optional[int] = None
-    amount: float
+    amount: float = Field(ge=0, le=999_999_999.99)
     settlement_type: str = "项目结算"
     applicant: str = "李莉 lili11-ghq"
     description: str = ""
 
 class IndicatorPayload(BaseModel):
-    name: str
-    category: str
+    name: str = Field(min_length=1, max_length=200)
+    category: str = Field(min_length=1, max_length=100)
     unit: str = ""
     formula: str = ""
     target_value: float = 0
@@ -421,19 +421,19 @@ class IndicatorRecordPayload(BaseModel):
     source: str = ""
 
 class ContractPayload(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     project_id: Optional[int] = None
     budget_id: Optional[int] = None
-    supplier: str
-    total_amount: float
+    supplier: str = Field(min_length=1, max_length=200)
+    total_amount: float = Field(gt=0, le=999_999_999.99)
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     owner: str = ""
     description: str = ""
 
 class PaymentPayload(BaseModel):
-    payment_type: str
-    amount: float
+    payment_type: str = Field(min_length=1, max_length=100)
+    amount: float = Field(gt=0, le=999_999_999.99)
     planned_date: Optional[str] = None
     actual_date: Optional[str] = None
     status: str = "待支付"
@@ -442,6 +442,41 @@ class PaymentPayload(BaseModel):
 class ActionPayload(BaseModel):
     action: str = "通过"
     comment: str = ""
+
+
+def _validate_date_range(start_date: Optional[str], end_date: Optional[str], label: str):
+    if start_date and end_date and start_date > end_date:
+        raise BusinessError(400, 'REQ-4001', f'{label}开始日期不能晚于结束日期')
+
+
+def _validate_budget_payload(payload: BudgetPayload):
+    if payload.used_budget > payload.total_budget:
+        raise BusinessError(422, 'BUD-4220', '已使用预算不能超过总预算')
+    if payload.internal_used > payload.internal_total:
+        raise BusinessError(422, 'BUD-4220', '内部研发已使用预算不能超过内部研发预算')
+    if payload.digital_used > payload.digital_total:
+        raise BusinessError(422, 'BUD-4220', '数科已使用预算不能超过数科预算')
+    if payload.internal_total + payload.digital_total > payload.total_budget + 0.01:
+        raise BusinessError(422, 'BUD-4221', '内部研发与数科分项预算合计不能超过总预算')
+
+
+def _recalculate_project_progress(conn, project_id: int):
+    row = conn.execute(
+        'SELECT COUNT(*) c,COALESCE(AVG(progress),0) p FROM project_tasks WHERE project_id=?',
+        (project_id,),
+    ).fetchone()
+    if row and row['c']:
+        progress = round(float(row['p'] or 0), 2)
+        conn.execute('UPDATE projects SET progress=?,updated_at=? WHERE id=?', (progress, now_iso(), project_id))
+        return progress
+    return None
+
+
+def _approval_action(value: str) -> str:
+    action = str(value or '').strip()
+    if action not in ('通过', '驳回'):
+        raise BusinessError(400, 'REQ-4001', '审批动作仅支持通过或驳回')
+    return action
 
 
 @router.get('/platform-dashboard')
@@ -478,6 +513,7 @@ def initiative_detail(item_id:int):
 @router.post('/initiatives')
 def create_initiative(payload:InitiativePayload, request:Request, x_user:Optional[str]=Header(None), x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.planned_start, payload.planned_end, '立项')
     with connect() as conn:
         no=_next_no(conn,'initiatives','initiative_no',f'INI-{datetime.now().year}-')
         now=now_iso(); cur=conn.execute("""INSERT INTO initiatives(initiative_no,title,description,applicant,department,owner,estimated_budget,budget_id,planned_start,planned_end,status,current_node,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,payload.title,payload.description,payload.applicant,payload.department,payload.owner,payload.estimated_budget,payload.budget_id,payload.planned_start,payload.planned_end,'草稿','草稿',now,now))
@@ -487,6 +523,7 @@ def create_initiative(payload:InitiativePayload, request:Request, x_user:Optiona
 @router.put('/initiatives/{item_id}')
 def update_initiative(item_id:int,payload:InitiativePayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.planned_start, payload.planned_end, '立项')
     with connect() as conn:
         row=conn.execute('SELECT * FROM initiatives WHERE id=?',(item_id,)).fetchone()
         if not row: raise BusinessError(404,'REQ-4040','立项申请不存在')
@@ -526,7 +563,7 @@ def approve_initiative(item_id:int,payload:ActionPayload,request:Request,x_user:
         if not row: raise BusinessError(404,'REQ-4040','立项申请不存在')
         node=row['current_node']; expected=mapping.get(node)
         if not request_has_role(request,expected): raise BusinessError(403,'AUTH-4030',f'当前节点需要{expected}角色')
-        action='通过' if payload.action=='通过' else '驳回'
+        action=_approval_action(payload.action)
         conn.execute('INSERT INTO initiative_approvals(initiative_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
         if action=='驳回': status='已驳回'; next_node='草稿'
         else:
@@ -569,42 +606,56 @@ def project_detail(project_id:int):
 @router.post('/projects')
 def create_project(payload:ProjectPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.start_date, payload.end_date, '项目')
     with connect() as conn:
         no=_next_no(conn,'projects','project_no',f'PRJ-{datetime.now().year}-'); now=now_iso(); cur=conn.execute("""INSERT INTO projects(project_no,name,manager,department,budget_id,total_budget,status,progress,start_date,end_date,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,payload.name,payload.manager,payload.department,payload.budget_id,payload.total_budget,payload.status,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.description,now,now)); pid=cur.lastrowid; _audit(conn,request,actor,role,'创建项目','project',pid); return {'code':0,'message':'项目已创建','data':{'id':pid,'project_no':no}}
 
 @router.put('/projects/{project_id}')
 def update_project(project_id:int,payload:ProjectPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.start_date, payload.end_date, '项目')
     with connect() as conn:
+        if not conn.execute('SELECT id FROM projects WHERE id=?',(project_id,)).fetchone(): raise BusinessError(404,'REQ-4040','项目不存在')
         conn.execute("""UPDATE projects SET name=?,manager=?,department=?,budget_id=?,total_budget=?,status=?,progress=?,start_date=?,end_date=?,description=?,updated_at=? WHERE id=?""",(payload.name,payload.manager,payload.department,payload.budget_id,payload.total_budget,payload.status,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.description,now_iso(),project_id)); _audit(conn,request,actor,role,'更新项目','project',project_id); return {'code':0,'message':'项目已更新'}
 
 @router.post('/projects/{project_id}/tasks')
 def create_task(project_id:int,payload:TaskPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.start_date, payload.end_date, '任务')
     with connect() as conn:
-        no=_next_no(conn,'project_tasks','task_no',f'TSK-{datetime.now().year}-'); now=now_iso(); cur=conn.execute("""INSERT INTO project_tasks(project_id,task_no,title,owner,status,priority,progress,start_date,end_date,parent_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",(project_id,no,payload.title,payload.owner,payload.status,payload.priority,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.parent_id,now,now)); tid=cur.lastrowid; _audit(conn,request,actor,role,'创建项目任务','project_task',tid); return {'code':0,'message':'任务已创建','data':{'id':tid,'task_no':no}}
+        if not conn.execute('SELECT id FROM projects WHERE id=?',(project_id,)).fetchone(): raise BusinessError(404,'REQ-4040','项目不存在')
+        no=_next_no(conn,'project_tasks','task_no',f'TSK-{datetime.now().year}-'); now=now_iso(); cur=conn.execute("""INSERT INTO project_tasks(project_id,task_no,title,owner,status,priority,progress,start_date,end_date,parent_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",(project_id,no,payload.title,payload.owner,payload.status,payload.priority,payload.progress,payload.start_date,payload.end_date,payload.parent_id,now,now)); tid=cur.lastrowid; progress=_recalculate_project_progress(conn,project_id); _audit(conn,request,actor,role,'创建项目任务','project_task',tid); return {'code':0,'message':'任务已创建','data':{'id':tid,'task_no':no,'project_progress':progress}}
 
 @router.put('/project-tasks/{task_id}')
 def update_task(task_id:int,payload:TaskPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.start_date, payload.end_date, '任务')
     with connect() as conn:
-        conn.execute("""UPDATE project_tasks SET title=?,owner=?,status=?,priority=?,progress=?,start_date=?,end_date=?,parent_id=?,updated_at=? WHERE id=?""",(payload.title,payload.owner,payload.status,payload.priority,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.parent_id,now_iso(),task_id)); _audit(conn,request,actor,role,'更新项目任务','project_task',task_id); return {'code':0,'message':'任务已更新'}
+        row=conn.execute('SELECT project_id FROM project_tasks WHERE id=?',(task_id,)).fetchone()
+        if not row: raise BusinessError(404,'REQ-4040','任务不存在')
+        conn.execute("""UPDATE project_tasks SET title=?,owner=?,status=?,priority=?,progress=?,start_date=?,end_date=?,parent_id=?,updated_at=? WHERE id=?""",(payload.title,payload.owner,payload.status,payload.priority,payload.progress,payload.start_date,payload.end_date,payload.parent_id,now_iso(),task_id)); progress=_recalculate_project_progress(conn,row['project_id']); _audit(conn,request,actor,role,'更新项目任务','project_task',task_id); return {'code':0,'message':'任务已更新','data':{'project_progress':progress}}
 
 @router.delete('/project-tasks/{task_id}')
 def delete_task(task_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn: conn.execute('DELETE FROM project_tasks WHERE id=?',(task_id,)); _audit(conn,request,actor,role,'删除项目任务','project_task',task_id); return {'code':0,'message':'任务已删除'}
+    with connect() as conn:
+        row=conn.execute('SELECT project_id FROM project_tasks WHERE id=?',(task_id,)).fetchone()
+        if not row: raise BusinessError(404,'REQ-4040','任务不存在')
+        conn.execute('DELETE FROM project_tasks WHERE id=?',(task_id,)); progress=_recalculate_project_progress(conn,row['project_id']); _audit(conn,request,actor,role,'删除项目任务','project_task',task_id); return {'code':0,'message':'任务已删除','data':{'project_progress':progress}}
 
 @router.post('/projects/{project_id}/milestones')
 def create_milestone(project_id:int,payload:MilestonePayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
     with connect() as conn:
+        if not conn.execute('SELECT id FROM projects WHERE id=?',(project_id,)).fetchone(): raise BusinessError(404,'REQ-4040','项目不存在')
         now=now_iso(); cur=conn.execute("""INSERT INTO milestones(project_id,name,planned_date,actual_date,status,owner,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)""",(project_id,payload.name,payload.planned_date,payload.actual_date,payload.status,payload.owner,payload.description,now,now)); mid=cur.lastrowid; _audit(conn,request,actor,role,'创建里程碑','milestone',mid); return {'code':0,'message':'里程碑已创建','data':{'id':mid}}
 
 @router.put('/milestones/{milestone_id}')
 def update_milestone(milestone_id:int,payload:MilestonePayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn: conn.execute("""UPDATE milestones SET name=?,planned_date=?,actual_date=?,status=?,owner=?,description=?,updated_at=? WHERE id=?""",(payload.name,payload.planned_date,payload.actual_date,payload.status,payload.owner,payload.description,now_iso(),milestone_id)); _audit(conn,request,actor,role,'更新里程碑','milestone',milestone_id); return {'code':0,'message':'里程碑已更新'}
+    with connect() as conn:
+        if not conn.execute('SELECT id FROM milestones WHERE id=?',(milestone_id,)).fetchone(): raise BusinessError(404,'REQ-4040','里程碑不存在')
+        conn.execute("""UPDATE milestones SET name=?,planned_date=?,actual_date=?,status=?,owner=?,description=?,updated_at=? WHERE id=?""",(payload.name,payload.planned_date,payload.actual_date,payload.status,payload.owner,payload.description,now_iso(),milestone_id)); _audit(conn,request,actor,role,'更新里程碑','milestone',milestone_id); return {'code':0,'message':'里程碑已更新'}
 
 @router.delete('/milestones/{milestone_id}')
 def delete_milestone(milestone_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
@@ -643,18 +694,24 @@ def budget_ledger():
 @router.post('/budgets')
 def create_budget(payload:BudgetPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_budget_payload(payload)
     with connect() as conn:
         no=payload.budget_no or _next_no(conn,'budgets','budget_no',f'BUD-{payload.year}-'); cur=conn.execute("""INSERT INTO budgets(budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year) VALUES (?,?,?,?,?,?,?,?,?)""",(no,payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year)); bid=cur.lastrowid; _audit(conn,request,actor,role,'创建预算','budget',bid); return {'code':0,'message':'预算已创建','data':{'id':bid,'budget_no':no}}
 
 @router.put('/budgets/{budget_id}')
 def update_budget(budget_id:int,payload:BudgetPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn: conn.execute("""UPDATE budgets SET budget_name=?,total_budget=?,used_budget=?,internal_total=?,internal_used=?,digital_total=?,digital_used=?,year=? WHERE id=?""",(payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year,budget_id)); _audit(conn,request,actor,role,'更新预算','budget',budget_id); return {'code':0,'message':'预算已更新'}
+    _validate_budget_payload(payload)
+    with connect() as conn:
+        if not conn.execute('SELECT id FROM budgets WHERE id=?',(budget_id,)).fetchone(): raise BusinessError(404,'REQ-4040','预算不存在')
+        conn.execute("""UPDATE budgets SET budget_name=?,total_budget=?,used_budget=?,internal_total=?,internal_used=?,digital_total=?,digital_used=?,year=? WHERE id=?""",(payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year,budget_id)); _audit(conn,request,actor,role,'更新预算','budget',budget_id); return {'code':0,'message':'预算已更新'}
 
 @router.post('/budgets/{budget_id}/transactions')
 def budget_transaction(budget_id:int,payload:BudgetTxnPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
     if payload.amount<=0: raise BusinessError(400,'REQ-4001','金额必须大于0')
+    if payload.txn_type not in ('支出','占用','冲销','释放','追加预算','调减预算'):
+        raise BusinessError(400,'REQ-4001','无效的预算流水类型')
     with connect() as conn:
         b=conn.execute('SELECT * FROM budgets WHERE id=?',(budget_id,)).fetchone();
         if not b: raise BusinessError(404,'REQ-4040','预算不存在')
@@ -662,7 +719,9 @@ def budget_transaction(budget_id:int,payload:BudgetTxnPayload,request:Request,x_
         if payload.txn_type in ('支出','占用'): used+=payload.amount
         elif payload.txn_type in ('冲销','释放'): used=max(0,used-payload.amount)
         elif payload.txn_type=='追加预算': total+=payload.amount
-        elif payload.txn_type=='调减预算': total=max(0,total-payload.amount)
+        elif payload.txn_type=='调减预算':
+            if payload.amount>total: raise BusinessError(422,'BUD-4221','调减金额不能超过当前总预算')
+            total-=payload.amount
         if used>total: raise BusinessError(422,'BUD-4220','预算不足')
         conn.execute('UPDATE budgets SET used_budget=?,total_budget=? WHERE id=?',(used,total,budget_id))
         cur=conn.execute('INSERT INTO budget_transactions(budget_id,txn_type,amount,reference_type,reference_id,description,department,created_at) VALUES (?,?,?,?,?,?,?,?)',(budget_id,payload.txn_type,payload.amount,payload.reference_type,payload.reference_id,payload.description,payload.department,now_iso()))
@@ -745,15 +804,23 @@ def approve_settlement(item_id:int,payload:ActionPayload,request:Request,x_user:
         if not row:raise BusinessError(404,'REQ-4040','结算单不存在')
         node=row['current_node']; expected=mapping.get(node)
         if not request_has_role(request,expected):raise BusinessError(403,'AUTH-4030','当前角色无该审批权限')
-        action='通过' if payload.action=='通过' else '驳回';conn.execute('INSERT INTO settlement_approvals(settlement_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
+        action=_approval_action(payload.action)
+        if action=='通过' and node=='财务审批':
+            if not row['budget_id']: raise BusinessError(422,'BUD-4220','结算单未关联预算，财务无法通过')
+            budget=conn.execute('SELECT * FROM budgets WHERE id=?',(row['budget_id'],)).fetchone()
+            if not budget: raise BusinessError(422,'BUD-4220','关联预算不存在')
+            if float(budget['used_budget'])+float(row['amount'])>float(budget['total_budget'])+0.01:
+                raise BusinessError(422,'BUD-4220','预算不足，结算财务审批不可通过')
+        conn.execute('INSERT INTO settlement_approvals(settlement_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
         if action=='驳回':status='已驳回';next_node='草稿'
         elif node=='财务审批':status='审批中';next_node='业务负责人确认'
         else:status='已完成';next_node='已完成'
         conn.execute('UPDATE settlements SET status=?,current_node=?,updated_at=? WHERE id=?',(status,next_node,now_iso(),item_id))
         if status=='已完成' and row['budget_id']:
             b=conn.execute('SELECT * FROM budgets WHERE id=?',(row['budget_id'],)).fetchone()
-            if b and b['used_budget']+row['amount']<=b['total_budget']:
-                conn.execute('UPDATE budgets SET used_budget=used_budget+? WHERE id=?',(row['amount'],row['budget_id']));conn.execute('INSERT INTO budget_transactions(budget_id,txn_type,amount,reference_type,reference_id,description,created_at) VALUES (?,?,?,?,?,?,?)',(row['budget_id'],'支出',row['amount'],'结算',row['settlement_no'],'结算审批完成自动记账',now_iso()))
+            if not b or b['used_budget']+row['amount']>b['total_budget']+0.01:
+                raise BusinessError(422,'BUD-4220','终审时预算已不足，未生成结算和预算流水')
+            conn.execute('UPDATE budgets SET used_budget=used_budget+? WHERE id=?',(row['amount'],row['budget_id']));conn.execute('INSERT INTO budget_transactions(budget_id,txn_type,amount,reference_type,reference_id,description,created_at) VALUES (?,?,?,?,?,?,?)',(row['budget_id'],'支出',row['amount'],'结算',row['settlement_no'],'结算审批完成自动记账',now_iso()))
         _audit(conn,request,actor,role,f'结算{action}','settlement',item_id);return {'code':0,'message':f'结算{action}成功','data':{'status':status,'current_node':next_node}}
 
 @router.get('/indicators')
@@ -801,11 +868,13 @@ def contract_detail(item_id:int):
 @router.post('/contracts')
 def create_contract(payload:ContractPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.start_date, payload.end_date, '合同')
     with connect() as conn:no=_next_no(conn,'contracts','contract_no',f'CT-{datetime.now().year}-');now=now_iso();cur=conn.execute("""INSERT INTO contracts(contract_no,name,project_id,budget_id,supplier,total_amount,start_date,end_date,owner,description,status,current_node,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,payload.name,payload.project_id,payload.budget_id,payload.supplier,payload.total_amount,payload.start_date,payload.end_date,payload.owner,payload.description,'草稿','草稿',now,now));_audit(conn,request,actor,role,'创建合同','contract',cur.lastrowid);return {'code':0,'message':'合同已创建','data':{'id':cur.lastrowid,'contract_no':no}}
 
 @router.put('/contracts/{item_id}')
 def update_contract(item_id:int,payload:ContractPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
+    _validate_date_range(payload.start_date, payload.end_date, '合同')
     with connect() as conn:
         row=conn.execute('SELECT * FROM contracts WHERE id=?',(item_id,)).fetchone();
         if not row:raise BusinessError(404,'REQ-4040','合同不存在')
@@ -839,7 +908,7 @@ def approve_contract(item_id:int,payload:ActionPayload,request:Request,x_user:Op
         if not row:raise BusinessError(404,'REQ-4040','合同不存在')
         node=row['current_node'];expected=mapping.get(node)
         if not request_has_role(request,expected):raise BusinessError(403,'AUTH-4030','当前角色无该合同审批权限')
-        action='通过' if payload.action=='通过' else '驳回';conn.execute('INSERT INTO contract_approvals(contract_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
+        action=_approval_action(payload.action);conn.execute('INSERT INTO contract_approvals(contract_id,node,role,approver,action,comment,created_at) VALUES (?,?,?,?,?,?,?)',(item_id,node,role,actor,action,payload.comment,now_iso()))
         if action=='驳回':status='已驳回';next_node='草稿'
         elif node=='财务会签':status='审批中';next_node='业务负责人终审'
         else:status='执行中';next_node='已完成审批'
@@ -858,4 +927,10 @@ def create_payment(item_id:int,payload:PaymentPayload,request:Request,x_user:Opt
 @router.put('/payment-plans/{item_id}')
 def update_payment(item_id:int,payload:PaymentPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn:conn.execute("""UPDATE payment_plans SET payment_type=?,amount=?,planned_date=?,actual_date=?,status=?,description=?,updated_at=? WHERE id=?""",(payload.payment_type,payload.amount,payload.planned_date,payload.actual_date,payload.status,payload.description,now_iso(),item_id));_audit(conn,request,actor,role,'更新付款计划','payment_plan',item_id);return {'code':0,'message':'付款计划已更新'}
+    with connect() as conn:
+        current=conn.execute('SELECT * FROM payment_plans WHERE id=?',(item_id,)).fetchone()
+        if not current: raise BusinessError(404,'REQ-4040','付款计划不存在')
+        contract=conn.execute('SELECT total_amount FROM contracts WHERE id=?',(current['contract_id'],)).fetchone()
+        other=conn.execute('SELECT COALESCE(SUM(amount),0) v FROM payment_plans WHERE contract_id=? AND id<>?',(current['contract_id'],item_id)).fetchone()['v']
+        if not contract or other+payload.amount>contract['total_amount']+0.01: raise BusinessError(422,'BUD-4221','付款计划累计金额不能超过合同总金额')
+        conn.execute("""UPDATE payment_plans SET payment_type=?,amount=?,planned_date=?,actual_date=?,status=?,description=?,updated_at=? WHERE id=?""",(payload.payment_type,payload.amount,payload.planned_date,payload.actual_date,payload.status,payload.description,now_iso(),item_id));_audit(conn,request,actor,role,'更新付款计划','payment_plan',item_id);return {'code':0,'message':'付款计划已更新'}

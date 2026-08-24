@@ -476,7 +476,7 @@ function amountCalculationTooltip(items = [], totalAmount = 0) {
     ? items.map((fp) => `<span class="calc-line"><span>${esc(fp.fp_no || '未编号')} · ${esc(fp.name || fp.demand_summary || '功能点')}</span><span>${Number(fp.fp_count || 0).toFixed(2)} FP × ¥${money(fp.unit_price)} = <strong>¥${money(fp.estimated_amount)}</strong></span></span>`).join('')
     : '<span class="calc-empty">尚无功能点计算明细</span>';
   return `<span class="calc-tooltip" tabindex="0">
-    <span class="calc-tooltip-trigger" aria-label="聚焦查看功能点金额计算过程">¥ ${money(totalAmount)}</span>
+    <span class="calc-tooltip-trigger" aria-label="悬停或聚焦查看功能点金额计算过程">¥ ${money(totalAmount)}</span>
     <span class="calc-tooltip-panel" role="tooltip"><span class="calc-title">功能点金额计算</span><span class="calc-breakdown-list">${lines}</span><span class="calc-total">合计：¥ ${money(totalAmount)}</span></span>
   </span>`;
 }
@@ -1375,7 +1375,7 @@ async function renderDemandDetail(id, query) {
     ['approval','审批记录'],
     ...((hasPermission('function_points') || hasPermission('demand.evaluate')) ? [['fp','功能点评估']] : []),
     ...((hasPermission('budget') || hasPermission('demand.evaluate')) ? [['budget','预算与分摊']] : []),
-    ...(hasPermission('tapd') ? [['tapd','TAPD与工时']] : [])
+    ...((hasPermission('tapd') || hasPermission('demand.evaluate') || hasPermission('project')) ? [['tapd','TAPD与工时']] : [])
   ];
   const requestedTab = query.get('tab') || 'basic';
   const tab = tabs.some(([key]) => key === requestedTab) ? requestedTab : 'basic';
@@ -1398,7 +1398,7 @@ async function renderDemandDetail(id, query) {
 
 function renderDemandDetailTab(demand, tab) {
   if (tab === 'approval') return `<div class="grid-2"><div><div class="section flat"><div class="section-title">审批记录</div>${approvalRecords(demand.approvals)}</div></div><aside><div class="section flat"><div class="section-title">审批节点</div>${approvalFlow(demand)}</div></aside></div>`;
-  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
+  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
   if (tab === 'budget') return `<div class="section flat"><div class="section-title">预算校验</div>${budgetSnapshot(demand.budget_snapshot)}<div class="section-title" style="margin-top:18px">费用分摊</div>${allocationTable(demand.allocations)}</div>`;
   if (tab === 'tapd') {
     const reqs = demand.tapd_requirements || [];
@@ -1414,18 +1414,30 @@ function renderDemandDetailTab(demand, tab) {
       `${Number(t.completed_hours||0).toFixed(1)}h`, `${Number(t.remaining_hours||0).toFixed(1)}h`, `${Number(t.overrun_hours||0).toFixed(1)}h`
     ]);
     const costRows = costs.map(c=>[c.spent_date||'—', `${Number(c.hours||0).toFixed(1)}h`, esc(c.creator||'—'), esc(c.description||'—'), esc(c.task_external_id||'—')]);
-    const deviation = Number(demand.estimated_hours||0) ? Math.abs(Number(demand.actual_hours||0)-Number(demand.estimated_hours||0))/Number(demand.estimated_hours||0)*100 : 0;
+    const estimatedHours = Number(demand.estimated_hours||0);
+    const actualHours = Number(demand.actual_hours||0);
+    const deviation = estimatedHours ? Math.max(0,(actualHours-estimatedHours)/estimatedHours*100) : 0;
     const warningDelivered = Number(demand.deviation_notification_count || 0) >= 2;
     const deviationMessage = deviation > 30
       ? (warningDelivered
-        ? '已向产品经理和项目经理发送工时偏差预警。'
+        ? '已向产品经理和项目经理发送工时偏差预警（实际超支口径）。'
         : '已超过30%预警阈值，通知正在补发，请刷新后查看。')
       : '当前未超过30%预警阈值。';
+    const canManageWork = hasPermission('demand.evaluate') || hasPermission('project');
+    const dueDate = demand.expected_completion_date || demand.planned_online_date || '';
+    const isClosed = ['已完成','已终止','已验收','已关闭','已拒绝'].includes(demand.status);
+    const overdue = Boolean(dueDate && !isClosed && new Date(`${dueDate}T23:59:59`).getTime() < Date.now());
+    const workRows = (demand.work_logs||[]).map(x=>[
+      esc(x.work_date), esc(x.worker), esc(x.task_name||'未关联具体任务'), `${Number(x.hours||0).toFixed(2)}h`, esc(x.description||'—'), esc(x.source),
+      canManageWork ? `<button class="link work-log-delete" data-id="${x.id}">删除</button>` : '—'
+    ]);
+    const workActions = canManageWork ? `<div class="action-group">${btn('调整工时计划','btn','editWorkPlan')}${btn('登记实际工时','btn primary','addWorkLog')}</div>` : '';
     return `<div class="section flat"><div class="section-title">TAPD需求创建结果</div>${reqRows.length ? simpleTable(['归属系统','TAPD需求ID','需求链接','TAPD状态','同步状态','最近同步'],reqRows) : '<div class="empty">尚未创建TAPD需求</div>'}</div>
     <div class="section flat" style="margin-top:12px"><div class="section-title">需求信息回读</div><div class="info-grid"><div>需求描述</div><div>${esc(demand.tapd_description||demand.description||'—')}</div><div>研发主体</div><div>${esc(demand.rd_owner||'—')}</div><div>研发部门</div><div>${esc(demand.rd_department||'—')}</div><div>内部人天数</div><div>${Number(demand.internal_days||0).toFixed(1)}</div><div>外部人天数</div><div>${Number(demand.external_days||0).toFixed(1)}</div><div>计划上线时间</div><div>${esc(demand.planned_online_date||'—')}</div><div>实际升级时间</div><div>${esc(demand.actual_online_date||'—')}</div><div>需求状态</div><div>${esc(demand.tapd_status||'—')} → ${esc(demand.status||'—')}</div><div>用户测试时间</div><div>${esc(demand.user_test_date||'—')}</div><div>测试完成时间</div><div>${esc(demand.test_complete_date||'—')}</div><div>需求确认时间</div><div>${esc(demand.demand_confirm_date||'—')}</div><div>同步来源</div><div>${esc(demand.last_sync_source||'—')}</div></div></div>
     <div class="section flat" style="margin-top:12px"><div class="section-title">需求关联任务信息</div>${taskRows.length ? simpleTable(['任务ID','任务标题','任务描述','任务分类','预计开始','预计结束','预估工时','创建人','创建时间','完成时间','完成工时','剩余工时','超出工时'],taskRows) : '<div class="empty">暂无任务回读数据</div>'}</div>
     <div class="section flat" style="margin-top:12px"><div class="section-title">任务关联花费信息</div>${costRows.length ? simpleTable(['花费日期','花费工时','花费创建人','花费描述','关联任务'],costRows) : '<div class="empty">暂无花费回读数据</div>'}</div>
-    <div class="grid-2" style="margin-top:12px"><div class="section flat"><div class="section-title">工时偏差</div><div class="info-grid" style="grid-template-columns:120px 1fr"><div>预估工时</div><div>${Number(demand.estimated_hours||0).toFixed(1)} h</div><div>实际工时</div><div>${Number(demand.actual_hours||0).toFixed(1)} h</div><div>偏差率</div><div>${deviation.toFixed(1)}%</div></div><div class="callout ${deviation>30?'warn':'success'}" style="margin-top:10px">${deviationMessage}</div></div><div class="section flat"><div class="section-title">同步记录</div>${(demand.tapd_sync_runs||[]).length ? simpleTable(['来源','变更数','结果','说明','时间'],demand.tapd_sync_runs.map(x=>[esc(x.source),x.changed_count,x.success?'成功':'失败',esc(x.message),esc(x.created_at)])) : '<div class="empty">暂无同步记录</div>'}</div></div>`;
+    <div class="section flat" style="margin-top:12px"><div class="toolbar"><div><div class="section-title">工时计划与登记</div><div class="section-subtitle">计划来源：${esc(demand.work_plan_source||'未维护')} · 实际工时来源：${esc(demand.actual_hours_source||demand.work_hour_source||'未登记')}${demand.work_plan_updated_by?` · 最后维护 ${esc(demand.work_plan_updated_by)}`:''}</div></div>${workActions}</div><div class="grid-4"><div class="metric soft"><div class="k">预估工时</div><div class="v">${estimatedHours.toFixed(1)}h</div></div><div class="metric soft"><div class="k">实际工时</div><div class="v">${actualHours.toFixed(1)}h</div></div><div class="metric soft"><div class="k">超支率</div><div class="v">${deviation.toFixed(1)}%</div></div><div class="metric soft"><div class="k">计划完成</div><div class="v" style="font-size:18px">${esc(dueDate||'未设置')}</div><div class="sub">${overdue?'<span class="status danger">已逾期</span>':statusPill(isClosed?'已完成':'计划内')}</div></div></div><div class="callout ${deviation>30||overdue?'warn':'success'}" style="margin-top:10px">${overdue?`计划完成日期 ${esc(dueDate)} 已超期。 `:''}${deviationMessage}</div><div style="margin-top:12px">${workRows.length?simpleTable(['日期','登记人','任务','工时','说明','来源','操作'],workRows):'<div class="empty" style="min-height:90px">尚未登记人工工时；接入TAPD后也可从工时填报自动汇总。</div>'}</div></div>
+    <div class="section flat" style="margin-top:12px"><div class="section-title">同步记录</div>${(demand.tapd_sync_runs||[]).length ? simpleTable(['来源','变更数','结果','说明','时间'],demand.tapd_sync_runs.map(x=>[esc(x.source),x.changed_count,x.success?'成功':'失败',esc(x.message),esc(x.created_at)])) : '<div class="empty">暂无同步记录</div>'}</div>`;
   }
   const functionPointSummary = (hasPermission('function_points') || hasPermission('demand.evaluate'))
     ? `<div>预估功能点</div><div><button class="link fp-summary-link go-fp-detail" type="button">${functionPointTotal(demand.function_points).toFixed(2)} FP · 查看评估详情</button></div><div>预估金额</div><div>${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div>`
@@ -1436,6 +1448,41 @@ function renderDemandDetailTab(demand, tab) {
 function bindDetailTabActions(demand, tab) {
   if (tab === 'fp') $$('.fp-detail').forEach((button) => button.addEventListener('click', () => openFunctionPointDetail(demand, Number(button.dataset.id))));
   if (tab === 'basic') $$('.go-fp-detail').forEach((button) => button.addEventListener('click', () => navigate(`demand-detail/${demand.id}`, { tab: 'fp' })));
+  if (tab === 'tapd') {
+    if ($('#editWorkPlan')) $('#editWorkPlan').addEventListener('click', () => openWorkPlanForm(demand));
+    if ($('#addWorkLog')) $('#addWorkLog').addEventListener('click', () => openWorkLogForm(demand));
+    $$('.work-log-delete').forEach((button) => button.addEventListener('click', async () => {
+      if (!confirm('确认删除该工时记录？删除后实际工时将自动重新汇总。')) return;
+      try { await api(`/api/work-logs/${button.dataset.id}`, {method:'DELETE'}); toast('工时记录已删除','success'); await loadNotifications(false); renderRoute(); }
+      catch (error) { toast(error.message,'error'); }
+    }));
+  }
+}
+
+function openWorkPlanForm(demand) {
+  showModal(`<h3 id="modalTitle">调整工时计划</h3><div class="grid-2"><div><label>预估工时 *</label><input id="workEstimated" type="number" min="0.01" step="0.25" class="field" value="${Number(demand.estimated_hours||0)}"></div><div><label>计划完成日期</label><input id="workDueDate" type="date" class="field" value="${esc(demand.expected_completion_date||demand.planned_online_date||'')}"></div></div><div style="margin-top:10px"><label>调整说明</label><textarea id="workPlanNote" class="textarea" maxlength="500" placeholder="记录评估依据或计划变更原因"></textarea></div><div class="modal-actions">${btn('取消','btn','workPlanCancel')}${btn('保存计划','btn primary','workPlanSave')}</div>`);
+  $('#workPlanCancel').addEventListener('click', closeModal);
+  $('#workPlanSave').addEventListener('click', async () => {
+    const estimated_hours=Number($('#workEstimated').value);
+    if (!(estimated_hours>0)) return toast('预估工时必须大于0','error');
+    try { const r=await api(`/api/demands/${demand.id}/work-plan`,{method:'PUT',body:JSON.stringify({estimated_hours,expected_completion_date:$('#workDueDate').value||null,note:$('#workPlanNote').value})}); closeModal(); toast(r.message,'success'); await loadNotifications(false); renderRoute(); }
+    catch(error){toast(error.message,'error');}
+  });
+}
+
+function openWorkLogForm(demand) {
+  const user=currentUser();
+  const externalSource=String(demand.actual_hours_source||demand.work_hour_source||'').startsWith('TAPD');
+  showModal(`<h3 id="modalTitle">登记实际工时</h3>${externalSource?'<div class="callout warn">当前实际工时来自TAPD。切换为人工维护后，本次登记将作为新的实际工时起点，后续TAPD同步可再次覆盖人工汇总。</div>':''}<div class="grid-2" style="margin-top:10px"><div><label>工时日期 *</label><input id="workLogDate" type="date" class="field" max="${new Date().toISOString().slice(0,10)}" value="${new Date().toISOString().slice(0,10)}"></div><div><label>工时（小时）*</label><input id="workLogHours" type="number" min="0.01" max="24" step="0.25" class="field" value="8"></div></div><div class="grid-2" style="margin-top:10px"><div><label>登记人 *</label><input id="workLogWorker" class="field" maxlength="100" value="${esc(user.name)}"></div><div><label>关联任务</label><input id="workLogTask" class="field" maxlength="200" placeholder="例如：接口开发"></div></div><div style="margin-top:10px"><label>工作说明</label><textarea id="workLogDesc" class="textarea" maxlength="500" placeholder="填写完成内容"></textarea></div>${externalSource?'<label class="permission-all" style="margin-top:10px"><input id="replaceExternalHours" type="checkbox"> 确认改为人工工时口径</label>':''}<div class="modal-actions">${btn('取消','btn','workLogCancel')}${btn('确认登记','btn primary','workLogSave')}</div>`);
+  $('#workLogCancel').addEventListener('click', closeModal);
+  $('#workLogSave').addEventListener('click', async () => {
+    const hours=Number($('#workLogHours').value),worker=$('#workLogWorker').value.trim();
+    if (!(hours>0&&hours<=24)) return toast('单笔工时必须大于0且不超过24小时','error');
+    if (!worker) return toast('请填写登记人','error');
+    if (externalSource && !$('#replaceExternalHours')?.checked) return toast('请先确认改为人工工时口径','error');
+    try { const r=await api(`/api/demands/${demand.id}/work-logs`,{method:'POST',body:JSON.stringify({work_date:$('#workLogDate').value,hours,worker,task_name:$('#workLogTask').value,description:$('#workLogDesc').value,replace_external:Boolean($('#replaceExternalHours')?.checked)})}); closeModal(); toast(r.message,'success'); await loadNotifications(false); renderRoute(); }
+    catch(error){toast(error.message,'error');}
+  });
 }
 
 async function renderApprovals() {
@@ -1512,7 +1559,7 @@ async function renderProductEval(query) {
   appView.innerHTML = `${workflow(2)}<div class="fp-layout">
     <aside class="section"><div class="section-title">待评估需求</div><div class="demand-selector-list">${demands.map((d) => `<button class="demand-selector-card ${d.id===demand.id?'active':''}" type="button" data-id="${d.id}"><strong>${esc(d.demand_no || '草稿')} · ${esc(d.title)}</strong><span class="status ${statusClass(d.status)}">${esc(d.status)}</span><div class="help">预估 ¥${money(d.estimated_amount || d.budget_amount)}</div></button>`).join('')}</div></aside>
     <div>
-      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
+      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
       <div class="section"><div class="toolbar"><div class="section-title" style="margin:0">功能点评估明细</div>${editable ? btn('添加功能点','btn small primary','addFunctionPointInline') : ''}</div>${functionPointTable(demand.function_points, editable)}</div>
       <div class="section"><div class="section-title">费用分摊</div>${editable ? allocationEditor(demand) : allocationTable(demand.allocations)}</div>
       <div class="section"><div class="section-title">预算校验与执行率</div>${budgetSnapshot(demand.budget_snapshot)}</div>
@@ -2044,7 +2091,7 @@ function openRoleForm(item,permissions){
 async function renderIntegrations(){
   setPage({title:'集成配置',iconName:'settings',crumbs:['系统管理']});
   const items=(await api('/api/integrations')).data;
-  appView.innerHTML=`<div class="grid-3">${items.map(x=>`<div class="metric"><div class="toolbar"><div><div class="k">${esc(x.code.toUpperCase())}</div><div class="v" style="font-size:17px">${esc(x.name)}</div></div>${statusPill(x.enabled?x.status:'停用')}</div><div class="sub">模式：${esc(x.mode)} · ${x.base_url?esc(x.base_url):'内置服务'}</div>${x.code==='ai'?`<div class="sub" style="margin-top:6px">智能体：<span class="detail-no">${esc(x.agent_id||'未配置')}</span></div>`:''}${x.code==='mcp'?'<div class="sub" style="margin-top:6px">协议：Streamable HTTP · Bearer鉴权 · 9个工具</div>':''}<div class="sub" style="margin-top:6px">${esc(x.description)}</div><div class="action-group" style="margin-top:12px"><button class="btn intCheck" data-code="${x.code}">连通性检查</button>${hasPermission('system.integrations')?`<button class="btn primary intEdit" data-code="${x.code}">配置</button>`:''}</div></div>`).join('')}</div>`;
+  appView.innerHTML=`<div class="grid-3">${items.map(x=>`<div class="metric"><div class="toolbar"><div><div class="k">${esc(x.code.toUpperCase())}</div><div class="v" style="font-size:17px">${esc(x.name)}</div></div>${statusPill(x.enabled?x.status:'停用')}</div><div class="sub">模式：${esc(x.mode)} · ${x.base_url?esc(x.base_url):'内置服务'}</div>${x.code==='ai'?`<div class="sub" style="margin-top:6px">智能体：<span class="detail-no">${esc(x.agent_id||'未配置')}</span></div>`:''}${x.code==='mcp'?'<div class="sub" style="margin-top:6px">协议：Streamable HTTP · Bearer鉴权 · 13个工具</div>':''}<div class="sub" style="margin-top:6px">${esc(x.description)}</div><div class="action-group" style="margin-top:12px"><button class="btn intCheck" data-code="${x.code}">连通性检查</button>${hasPermission('system.integrations')?`<button class="btn primary intEdit" data-code="${x.code}">配置</button>`:''}</div></div>`).join('')}</div>`;
   $$('.intCheck').forEach(b=>b.addEventListener('click',async()=>{try{const r=await api(`/api/integrations/${b.dataset.code}/check`,{method:'POST'});toast(r.message,'success');renderIntegrations();}catch(e){toast(e.message,'error')}}));
   $$('.intEdit').forEach(b=>b.addEventListener('click',()=>{
     const x=items.find(i=>i.code===b.dataset.code);

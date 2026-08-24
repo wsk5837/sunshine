@@ -65,6 +65,9 @@ AI_CAPABILITY_RULES: dict[str, tuple[str, ...]] = {
     "query.project": ("project360", "project"),
     "create.demand": ("demand.create",),
     "create.project": ("initiative.create", "project"),
+    # AI 与页面共用同一套实时角色权限：能维护项目/功能评估的用户，
+    # 才能通过智能体维护工时计划和实际工时。
+    "manage.work_hours": ("demand.evaluate", "project"),
 }
 
 
@@ -372,6 +375,8 @@ def permissions_for_api(method: str, path: str) -> tuple[str, ...]:
         return ("demand.list",) if method == "GET" else ("demand.create",)
     if path.startswith("/api/function-point"):
         return ("function_points", "demand.evaluate")
+    if path.startswith("/api/work-logs"):
+        return ("demand.evaluate", "project")
     if path.startswith("/api/demands"):
         if path.endswith("/approve") or path.endswith("/oa-tasks"):
             return ("demand.approve",)
@@ -379,6 +384,8 @@ def permissions_for_api(method: str, path: str) -> tuple[str, ...]:
             return ("function_points", "demand.evaluate")
         if path.endswith("/allocations"):
             return ("demand.evaluate",)
+        if path.endswith("/work-plan") or path.endswith("/work-logs"):
+            return ("demand.evaluate", "project")
         if path.endswith("/budget-check"):
             return ("budget", "demand.evaluate")
         if "/tapd/" in path:

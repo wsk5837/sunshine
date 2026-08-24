@@ -84,11 +84,15 @@ def init_poc_db():
             "demand_confirm_date": "TEXT",
             "expected_completion_date": "TEXT",
             "oa_sync_status": "TEXT DEFAULT '未推送'",
+            "work_hour_source": "TEXT DEFAULT '人工维护'",
+            "work_plan_source": "TEXT DEFAULT '人工维护'",
+            "actual_hours_source": "TEXT DEFAULT '未登记'",
+            "work_plan_updated_by": "TEXT DEFAULT ''",
+            "work_plan_updated_at": "TEXT",
         }.items():
             _add_column(conn, "demands", col, ddl)
         _add_column(conn, "approval_records", "return_to", "TEXT DEFAULT ''")
         _add_column(conn, "budget_transactions", "department", "TEXT DEFAULT ''")
-
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS oa_tasks (
@@ -163,6 +167,22 @@ def init_poc_db():
                 FOREIGN KEY(demand_id) REFERENCES demands(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS demand_work_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                demand_id INTEGER NOT NULL,
+                work_date TEXT NOT NULL,
+                hours REAL NOT NULL,
+                worker TEXT NOT NULL,
+                task_name TEXT DEFAULT '',
+                description TEXT DEFAULT '',
+                source TEXT NOT NULL DEFAULT '人工登记',
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(demand_id) REFERENCES demands(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_demand_work_logs_demand_date
+            ON demand_work_logs(demand_id,work_date,id);
+
             CREATE TABLE IF NOT EXISTS tapd_sync_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 demand_id INTEGER NOT NULL,
@@ -208,6 +228,7 @@ def init_poc_db():
             );
             """
         )
+        _add_column(conn, "tapd_costs", "tapd_requirement_id", "INTEGER")
         now = now_iso()
         conn.execute(
             "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
@@ -703,10 +724,19 @@ class TapdWebhookPayload(BaseModel):
 
 def _notify_deviation(conn, demand_id: int, estimated_hours: float, actual_hours: float):
     if estimated_hours <= 0:
+        conn.execute(
+            "DELETE FROM notifications WHERE demand_id=? AND title='工时偏差预警' AND is_read=0",
+            (demand_id,),
+        )
         return None
-    deviation = abs(actual_hours - estimated_hours) / estimated_hours * 100
+    # “超支”只在实际工时超过预估时成立；实际工时较少不应误报为超时。
+    deviation = max(0.0, (actual_hours - estimated_hours) / estimated_hours * 100)
     if deviation > 30:
-        content = f"工时偏差率 {deviation:.1f}% > 30%，请及时分析并推动异常闭环。"
+        content = f"实际工时 {actual_hours:.1f}h，预估工时 {estimated_hours:.1f}h，超支率 {deviation:.1f}% > 30%，请及时处理。"
+        conn.execute(
+            "DELETE FROM notifications WHERE demand_id=? AND title IN ('工时偏差预警','工时超支预警') AND is_read=0 AND content<>?",
+            (demand_id, content),
+        )
         for role in ("product_manager", "project_manager"):
             exists = conn.execute(
                 """SELECT 1 FROM notifications
@@ -716,7 +746,38 @@ def _notify_deviation(conn, demand_id: int, estimated_hours: float, actual_hours
             ).fetchone()
             if not exists:
                 _notification(conn, demand_id, "warning", "工时偏差预警", content, role)
+    else:
+        conn.execute(
+            "DELETE FROM notifications WHERE demand_id=? AND title IN ('工时偏差预警','工时超支预警') AND is_read=0",
+            (demand_id,),
+        )
     return deviation
+
+
+def _notify_work_overdue(conn, demand_id: int, due_date: Optional[str], status: str):
+    closed = status in ("已完成", "已终止", "已验收", "已关闭", "已拒绝")
+    due = _parse_iso(due_date)
+    overdue = bool(due and not closed and due.date() < _now_dt().date())
+    if not overdue:
+        conn.execute(
+            "DELETE FROM notifications WHERE demand_id=? AND title='工时计划逾期预警' AND is_read=0",
+            (demand_id,),
+        )
+        return False
+    content = f"计划完成日期 {due.date().isoformat()} 已超期，需要更新计划或推动任务闭环。"
+    conn.execute(
+        "DELETE FROM notifications WHERE demand_id=? AND title='工时计划逾期预警' AND is_read=0 AND content<>?",
+        (demand_id, content),
+    )
+    for role in ("product_manager", "project_manager"):
+        exists = conn.execute(
+            """SELECT 1 FROM notifications WHERE demand_id=? AND title='工时计划逾期预警'
+               AND target_role=? AND content=? LIMIT 1""",
+            (demand_id, role, content),
+        ).fetchone()
+        if not exists:
+            _notification(conn, demand_id, "warning", "工时计划逾期预警", content, role)
+    return True
 
 
 def reconcile_work_deviation_notifications(conn, demand_id: Optional[int] = None) -> int:
@@ -725,10 +786,10 @@ def reconcile_work_deviation_notifications(conn, demand_id: Optional[int] = None
     相同需求、相同偏差值、相同目标角色只写入一次，避免用户刷新详情或
     消息中心时重复刷屏。
     """
-    sql = "SELECT id,estimated_hours,actual_hours FROM demands WHERE estimated_hours>0"
+    sql = "SELECT id,estimated_hours,actual_hours,expected_completion_date,status FROM demands"
     params: tuple = ()
     if demand_id is not None:
-        sql += " AND id=?"
+        sql += " WHERE id=?"
         params = (demand_id,)
     before = conn.total_changes
     for row in conn.execute(sql, params):
@@ -738,6 +799,7 @@ def reconcile_work_deviation_notifications(conn, demand_id: Optional[int] = None
             float(row["estimated_hours"] or 0),
             float(row["actual_hours"] or 0),
         )
+        _notify_work_overdue(conn, int(row["id"]), row["expected_completion_date"], row["status"])
     return conn.total_changes - before
 
 
@@ -752,6 +814,18 @@ def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source
         requirement = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id LIMIT 1", (demand_id,)).fetchone()
     req_id = requirement["id"] if requirement else None
 
+    # 回读是该TAPD需求当前任务的完整快照，移除上次已存在、本次已删除的任务。
+    incoming_task_ids = [t.task_id for t in payload.tasks if t.task_id]
+    if req_id is not None:
+        if incoming_task_ids:
+            placeholders = ",".join("?" for _ in incoming_task_ids)
+            conn.execute(
+                f"DELETE FROM tapd_tasks WHERE demand_id=? AND tapd_requirement_id=? AND external_task_id NOT IN ({placeholders})",
+                (demand_id, req_id, *incoming_task_ids),
+            )
+        else:
+            conn.execute("DELETE FROM tapd_tasks WHERE demand_id=? AND tapd_requirement_id=?", (demand_id, req_id))
+
     for t in payload.tasks:
         conn.execute(
             """INSERT INTO tapd_tasks(demand_id,tapd_requirement_id,external_task_id,title,description,task_type,planned_start,planned_end,
@@ -765,12 +839,18 @@ def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source
             (demand_id, req_id, t.task_id, t.title, t.description, t.task_type, t.planned_start, t.planned_end,
              t.estimated_hours, t.creator, t.created_at, t.completed_at, t.completed_hours, t.remaining_hours, t.overrun_hours, now_iso()),
         )
-    if payload.costs:
+    if req_id is None:
         conn.execute("DELETE FROM tapd_costs WHERE demand_id=?", (demand_id,))
+    else:
+        conn.execute(
+            "DELETE FROM tapd_costs WHERE demand_id=? AND (tapd_requirement_id=? OR tapd_requirement_id IS NULL)",
+            (demand_id, req_id),
+        )
+    if payload.costs:
         for c in payload.costs:
             conn.execute(
-                "INSERT INTO tapd_costs(demand_id,task_external_id,spent_date,hours,creator,description,created_at) VALUES (?,?,?,?,?,?,?)",
-                (demand_id, c.task_id, c.spent_date, c.hours, c.creator, c.description, now_iso()),
+                "INSERT INTO tapd_costs(demand_id,tapd_requirement_id,task_external_id,spent_date,hours,creator,description,created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (demand_id, req_id, c.task_id, c.spent_date, c.hours, c.creator, c.description, now_iso()),
             )
 
     sums = conn.execute(
@@ -778,15 +858,22 @@ def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source
         (demand_id,),
     ).fetchone()
     estimated_hours = float(sums["e"] or 0)
-    actual_hours = float(sums["a"] or 0)
+    cost_sum = conn.execute(
+        "SELECT COALESCE(SUM(hours),0) a,COUNT(*) c FROM tapd_costs WHERE demand_id=?",
+        (demand_id,),
+    ).fetchone()
+    # TAPD工时填报是实际投入的权威来源；无填报时才回退到任务已完成工时。
+    actual_hours = float(cost_sum["a"] or 0) if int(cost_sum["c"] or 0) else float(sums["a"] or 0)
+    work_hour_source = "TAPD工时填报" if int(cost_sum["c"] or 0) else "TAPD任务进度"
     closed_at = now_iso() if sys_status in ("已完成", "已终止") else None
     conn.execute(
         """UPDATE demands SET tapd_description=?,rd_owner=?,rd_department=?,internal_days=?,external_days=?,planned_online_date=?,actual_online_date=?,
            user_test_date=?,test_complete_date=?,demand_confirm_date=?,expected_completion_date=?,tapd_status=?,status=?,current_node=?,tapd_sync_status='成功',tapd_last_sync_at=?,
-           last_sync_source=?,estimated_hours=?,actual_hours=?,closed_at=COALESCE(?,closed_at),updated_at=? WHERE id=?""",
+           last_sync_source=?,estimated_hours=?,actual_hours=?,work_hour_source=?,work_plan_source='TAPD任务',actual_hours_source=?,work_plan_updated_at=?,closed_at=COALESCE(?,closed_at),updated_at=? WHERE id=?""",
         (payload.demand_description, payload.rd_owner, payload.rd_department, payload.internal_days, payload.external_days,
          payload.planned_online_date, payload.actual_online_date, payload.user_test_date, payload.test_complete_date, payload.demand_confirm_date,
-         payload.planned_online_date, payload.status, sys_status, sys_status, now_iso(), source, estimated_hours, actual_hours, closed_at, now_iso(), demand_id),
+         payload.planned_online_date, payload.status, sys_status, sys_status, now_iso(), source, estimated_hours, actual_hours,
+         work_hour_source, work_hour_source, now_iso(), closed_at, now_iso(), demand_id),
     )
     if requirement:
         conn.execute("UPDATE tapd_requirements SET tapd_status=?,sync_status='成功',last_sync_at=? WHERE id=?", (payload.status, now_iso(), requirement["id"]))
@@ -797,6 +884,7 @@ def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source
     )
     _integration_log(conn, "tapd", "in", "readback", payload.tapd_id or demand_id, True, f"{source}回读完成", request_id)
     deviation = _notify_deviation(conn, demand_id, estimated_hours, actual_hours)
+    _notify_work_overdue(conn, demand_id, payload.planned_online_date, sys_status)
     return {"system_status": sys_status, "deviation": deviation, "changed_count": changed}
 
 

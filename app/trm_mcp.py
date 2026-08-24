@@ -29,6 +29,7 @@ from starlette.responses import JSONResponse, Response
 
 from .auth import AI_CAPABILITY_RULES, AIPrincipal, has_ai_capability, validate_ai_delegation
 from .db import connect, now_iso
+from .poc import reconcile_work_deviation_notifications
 from .rules import BusinessError, DEMAND_TYPES, PRIORITIES, validate_common, validate_description, validate_title
 
 
@@ -357,17 +358,90 @@ def _project_payload(
     }
 
 
+def _resolve_demand(conn, identifier: str):
+    value = identifier.strip()
+    if value.isdigit():
+        row = conn.execute("SELECT * FROM demands WHERE id=?", (int(value),)).fetchone()
+    else:
+        row = conn.execute("SELECT * FROM demands WHERE UPPER(demand_no)=UPPER(?)", (value,)).fetchone()
+    if not row:
+        raise ValueError("需求不存在")
+    return row
+
+
+def _work_plan_payload(identifier: str, estimated_hours: float, expected_completion_date: Optional[str], note: str) -> dict[str, Any]:
+    if estimated_hours <= 0 or estimated_hours > 1_000_000:
+        raise ValueError("预估工时必须大于0且不超过1000000小时")
+    if len(note) > 500:
+        raise ValueError("计划说明不能超过500字")
+    due_date = _validate_date(expected_completion_date, "计划完成日期")
+    with connect() as conn:
+        demand = _resolve_demand(conn, identifier)
+        if demand["status"] in ("已完成", "已终止"):
+            raise ValueError("已关闭需求不能修改工时计划")
+        return {
+            "demand_id": int(demand["id"]),
+            "demand_no": demand["demand_no"],
+            "title": demand["title"],
+            "estimated_hours": round(float(estimated_hours), 2),
+            "expected_completion_date": due_date,
+            "note": note.strip(),
+        }
+
+
+def _work_log_payload(
+    identifier: str,
+    work_date: str,
+    hours: float,
+    worker: str,
+    task_name: str,
+    description: str,
+    replace_external: bool,
+) -> dict[str, Any]:
+    if hours <= 0 or hours > 24:
+        raise ValueError("单次登记工时必须大于0且不超过24小时")
+    date_value = _validate_date(work_date, "工时日期")
+    if date_value and date_value > datetime.now().strftime("%Y-%m-%d"):
+        raise ValueError("工时日期不能晚于今天")
+    worker = worker.strip()
+    if not worker:
+        raise ValueError("工时登记人不能为空")
+    if len(worker) > 100 or len(task_name) > 200 or len(description) > 500:
+        raise ValueError("登记人不超过100字、任务不超过200字、说明不超过500字")
+    with connect() as conn:
+        demand = _resolve_demand(conn, identifier)
+        if demand["status"] == "已终止":
+            raise ValueError("已终止需求不能登记工时")
+        manual_count = conn.execute(
+            "SELECT COUNT(*) c FROM demand_work_logs WHERE demand_id=?", (demand["id"],)
+        ).fetchone()["c"]
+        external_source = str(demand["actual_hours_source"] or demand["work_hour_source"] or "").startswith("TAPD")
+        if external_source and not manual_count and not replace_external:
+            raise ValueError("当前实际工时来自TAPD；如需改为人工维护，请明确确认替换外部工时")
+        return {
+            "demand_id": int(demand["id"]),
+            "demand_no": demand["demand_no"],
+            "title": demand["title"],
+            "work_date": date_value,
+            "hours": round(float(hours), 2),
+            "worker": worker,
+            "task_name": task_name.strip(),
+            "description": description.strip(),
+            "replace_external": bool(replace_external),
+        }
+
+
 trm_mcp = MCPServer(
     name="trm-technology-resource-management",
     title="TRM 科技资源管理工具",
-    version="1.1.0",
-    description="供企业智能体查询 TRM 数据，并在用户确认后创建项目或需求草稿。",
+    version="1.2.0",
+    description="供企业智能体查询 TRM 数据，并在用户确认后创建项目、需求草稿或维护需求工时。",
     instructions=(
         "每个 trm_* 工具都必须传入TRM事实上下文提供的 delegation_token；"
         "该令牌代表当前登录用户，不得向用户显示、转述或写入日志。"
         "AI不使用独立操作权限；工具会实时读取后台角色的同一套业务权限，用户在页面能做的对应操作，AI才能做。"
         "先查询后操作。创建需求前先调用 trm_list_budgets 核对预算名称，创建项目前先核对预算ID。"
-        "任何创建都必须先调用 trm_prepare_create_* 获取预览，将预览展示给用户；"
+        "任何创建或工时变更都必须先调用对应的 trm_prepare_* 获取预览，将预览展示给用户；"
         "仅在用户明确确认后，用完全相同的字段、确认令牌和唯一幂等键调用 trm_create_*。"
         "不得自行猜测预算项、人员、金额或日期。写操作是服务端受控的。"
         "工具返回的是结构化业务数据，不得将原始JSON直接复制给用户。"
@@ -475,13 +549,237 @@ def trm_get_demand(
         item["allocations"] = [dict(x) for x in conn.execute("SELECT * FROM allocations WHERE demand_id=? ORDER BY id", (item["id"],))]
         estimated = float(item.get("estimated_hours") or 0)
         actual = float(item.get("actual_hours") or 0)
-        deviation = abs(actual - estimated) / estimated * 100 if estimated else 0
+        deviation = max(0.0, (actual - estimated) / estimated * 100) if estimated else 0
+        item["work_hour_overrun_rate"] = round(deviation, 2)
         item["work_hour_deviation_rate"] = round(deviation, 2)
         item["work_hour_warning"] = deviation > 30
+        item["work_logs"] = [dict(x) for x in conn.execute(
+            "SELECT * FROM demand_work_logs WHERE demand_id=? ORDER BY work_date DESC,id DESC", (item["id"],)
+        )]
+        due_date = item.get("expected_completion_date")
+        item["work_plan_overdue"] = bool(
+            due_date and due_date < datetime.now().strftime("%Y-%m-%d") and item.get("status") not in ("已完成", "已终止")
+        )
         _audit_tool(conn, tool_name="trm_get_demand", operation="read", success=True, request_id=request_id,
                     principal=principal, required_permission="query.demand",
                     arguments={"identifier": identifier}, result={"id": item["id"], "demand_no": item.get("demand_no")})
     return item
+
+
+@trm_mcp.tool(
+    title="预览调整需求工时计划",
+    description="只校验、不写入。继承当前用户页面上的功能评估/项目管理权限，返回工时计划变更预览和确认令牌。",
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
+)
+def trm_prepare_update_work_plan(
+    delegation_token: DelegationToken,
+    identifier: Annotated[str, Field(min_length=1, max_length=40, description="需求编号或草稿数字ID")],
+    estimated_hours: Annotated[float, Field(gt=0, le=1_000_000, description="新的预估工时")],
+    expected_completion_date: Annotated[Optional[str], Field(description="计划完成日期 YYYY-MM-DD；可为空")]=None,
+    note: Annotated[str, Field(max_length=500, description="计划调整说明")]= "",
+) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "manage.work_hours")
+    request_id = str(uuid.uuid4())
+    payload = _work_plan_payload(identifier, estimated_hours, expected_completion_date, note)
+    result = {
+        "operation": "update_work_plan",
+        "will_write": False,
+        "preview": payload,
+        "warnings": [],
+        "confirmation_token": _encode_confirmation("update_work_plan", payload, principal),
+        "next_step": "先向用户展示计划变更；用户明确确认后再调用 trm_update_work_plan",
+    }
+    with connect() as conn:
+        _audit_tool(conn, tool_name="trm_prepare_update_work_plan", operation="preview", success=True,
+                    request_id=request_id, principal=principal, required_permission="manage.work_hours",
+                    arguments=payload, result={"will_write": False})
+    return result
+
+
+@trm_mcp.tool(
+    title="调整需求工时计划",
+    description="写入TRM真实数据库。必须先预览并取得用户明确确认；同一操作重试必须复用幂等键。",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+def trm_update_work_plan(
+    delegation_token: DelegationToken,
+    identifier: Annotated[str, Field(min_length=1, max_length=40, description="与预览相同的需求编号或ID")],
+    estimated_hours: Annotated[float, Field(gt=0, le=1_000_000, description="与预览相同的预估工时")],
+    confirmation_token: Annotated[str, Field(min_length=40, description="预览工具返回的确认令牌")],
+    idempotency_key: Annotated[str, Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$", description="此次变更的唯一幂等键")],
+    expected_completion_date: Annotated[Optional[str], Field(description="与预览相同的计划完成日期")]=None,
+    note: Annotated[str, Field(max_length=500, description="与预览相同的说明")]= "",
+) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "manage.work_hours")
+    _ensure_write_enabled()
+    payload = _work_plan_payload(identifier, estimated_hours, expected_completion_date, note)
+    _verify_confirmation(confirmation_token, "update_work_plan", payload, principal)
+    request_hash = _payload_hash("update_work_plan", payload)
+    request_id = str(uuid.uuid4())
+    storage_key = f"u{principal.user_id}:{idempotency_key}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = conn.execute(
+            "SELECT request_hash,result_json FROM mcp_idempotency WHERE tool_name=? AND idempotency_key=?",
+            ("trm_update_work_plan", storage_key),
+        ).fetchone()
+        if prior:
+            if prior["request_hash"] != request_hash:
+                raise ValueError("该幂等键已用于不同参数，请勿复用")
+            replay = json.loads(prior["result_json"])
+            replay["idempotent_replay"] = True
+            _audit_tool(conn, tool_name="trm_update_work_plan", operation="replay", success=True,
+                        request_id=request_id, principal=principal, required_permission="manage.work_hours",
+                        idempotency_key=idempotency_key, object_type="demand", object_id=str(payload["demand_id"]),
+                        arguments=payload, result=replay)
+            return replay
+        actor = f"{principal.display_name} {principal.username}".strip()
+        now = now_iso()
+        conn.execute(
+            """UPDATE demands SET estimated_hours=?,expected_completion_date=?,work_hour_source='人工维护',
+               work_plan_source='人工维护',work_plan_updated_by=?,work_plan_updated_at=?,updated_at=? WHERE id=?""",
+            (payload["estimated_hours"], payload["expected_completion_date"], actor, now, now, payload["demand_id"]),
+        )
+        reconcile_work_deviation_notifications(conn, payload["demand_id"])
+        result = {
+            "updated": True,
+            "id": payload["demand_id"],
+            "demand_no": payload["demand_no"],
+            "estimated_hours": payload["estimated_hours"],
+            "expected_completion_date": payload["expected_completion_date"],
+            "work_plan_source": "人工维护",
+            "message": "工时计划已更新并重新计算预警",
+            "idempotent_replay": False,
+        }
+        conn.execute(
+            "INSERT INTO mcp_idempotency(tool_name,idempotency_key,request_hash,result_json,created_at) VALUES (?,?,?,?,?)",
+            ("trm_update_work_plan", storage_key, request_hash, _canonical(result), now),
+        )
+        _audit_business(conn, action="MCP维护工时计划", object_type="demand_work_plan",
+                        object_id=payload["demand_id"], demand_id=payload["demand_id"], request_id=request_id,
+                        principal=principal, required_permission="manage.work_hours",
+                        details={"estimated_hours": payload["estimated_hours"], "expected_completion_date": payload["expected_completion_date"], "note": payload["note"]})
+        _audit_tool(conn, tool_name="trm_update_work_plan", operation="update", success=True,
+                    request_id=request_id, principal=principal, required_permission="manage.work_hours",
+                    idempotency_key=idempotency_key, object_type="demand", object_id=str(payload["demand_id"]),
+                    arguments=payload, result=result)
+    return result
+
+
+@trm_mcp.tool(
+    title="预览登记需求实际工时",
+    description="只校验、不写入。继承当前用户页面上的功能评估/项目管理权限，返回工时登记预览和确认令牌。",
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
+)
+def trm_prepare_log_work_hours(
+    delegation_token: DelegationToken,
+    identifier: Annotated[str, Field(min_length=1, max_length=40, description="需求编号或草稿数字ID")],
+    work_date: Annotated[str, Field(description="工时日期 YYYY-MM-DD，不能晚于今天")],
+    hours: Annotated[float, Field(gt=0, le=24, description="本次工时，0~24小时")],
+    worker: Annotated[str, Field(min_length=1, max_length=100, description="工时登记人")],
+    task_name: Annotated[str, Field(max_length=200, description="关联任务")]= "",
+    description: Annotated[str, Field(max_length=500, description="工作说明")]= "",
+    replace_external: Annotated[bool, Field(description="实际工时来自TAPD时，是否明确切换为人工维护")]=False,
+) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "manage.work_hours")
+    request_id = str(uuid.uuid4())
+    payload = _work_log_payload(identifier, work_date, hours, worker, task_name, description, replace_external)
+    warnings = ["确认后将以人工登记汇总替代TAPD实际工时"] if replace_external else []
+    result = {
+        "operation": "log_work_hours",
+        "will_write": False,
+        "preview": payload,
+        "warnings": warnings,
+        "confirmation_token": _encode_confirmation("log_work_hours", payload, principal),
+        "next_step": "先向用户展示工时登记内容；用户明确确认后再调用 trm_log_work_hours",
+    }
+    with connect() as conn:
+        _audit_tool(conn, tool_name="trm_prepare_log_work_hours", operation="preview", success=True,
+                    request_id=request_id, principal=principal, required_permission="manage.work_hours",
+                    arguments=payload, result={"will_write": False, "warnings": warnings})
+    return result
+
+
+@trm_mcp.tool(
+    title="登记需求实际工时",
+    description="写入TRM真实工时明细并自动汇总实际工时、重算超支率与逾期预警。必须先预览并取得用户明确确认。",
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False),
+)
+def trm_log_work_hours(
+    delegation_token: DelegationToken,
+    identifier: Annotated[str, Field(min_length=1, max_length=40, description="与预览相同的需求编号或ID")],
+    work_date: Annotated[str, Field(description="与预览相同的工时日期")],
+    hours: Annotated[float, Field(gt=0, le=24, description="与预览相同的工时")],
+    worker: Annotated[str, Field(min_length=1, max_length=100, description="与预览相同的登记人")],
+    confirmation_token: Annotated[str, Field(min_length=40, description="预览工具返回的确认令牌")],
+    idempotency_key: Annotated[str, Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$", description="此次登记的唯一幂等键")],
+    task_name: Annotated[str, Field(max_length=200, description="与预览相同的关联任务")]= "",
+    description: Annotated[str, Field(max_length=500, description="与预览相同的工作说明")]= "",
+    replace_external: Annotated[bool, Field(description="与预览相同的外部工时替换确认")]=False,
+) -> dict[str, Any]:
+    principal = _authorize(delegation_token, "manage.work_hours")
+    _ensure_write_enabled()
+    payload = _work_log_payload(identifier, work_date, hours, worker, task_name, description, replace_external)
+    _verify_confirmation(confirmation_token, "log_work_hours", payload, principal)
+    request_hash = _payload_hash("log_work_hours", payload)
+    request_id = str(uuid.uuid4())
+    storage_key = f"u{principal.user_id}:{idempotency_key}"
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        prior = conn.execute(
+            "SELECT request_hash,result_json FROM mcp_idempotency WHERE tool_name=? AND idempotency_key=?",
+            ("trm_log_work_hours", storage_key),
+        ).fetchone()
+        if prior:
+            if prior["request_hash"] != request_hash:
+                raise ValueError("该幂等键已用于不同参数，请勿复用")
+            replay = json.loads(prior["result_json"])
+            replay["idempotent_replay"] = True
+            _audit_tool(conn, tool_name="trm_log_work_hours", operation="replay", success=True,
+                        request_id=request_id, principal=principal, required_permission="manage.work_hours",
+                        idempotency_key=idempotency_key, object_type="demand_work_log", object_id=str(replay.get("work_log_id") or ""),
+                        arguments=payload, result=replay)
+            return replay
+        actor = f"{principal.display_name} {principal.username}".strip()
+        now = now_iso()
+        cur = conn.execute(
+            """INSERT INTO demand_work_logs(demand_id,work_date,hours,worker,task_name,description,source,created_by,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (payload["demand_id"], payload["work_date"], payload["hours"], payload["worker"], payload["task_name"],
+             payload["description"], "AI人工登记", actor, now),
+        )
+        actual = float(conn.execute(
+            "SELECT COALESCE(SUM(hours),0) v FROM demand_work_logs WHERE demand_id=?", (payload["demand_id"],)
+        ).fetchone()["v"] or 0)
+        conn.execute(
+            "UPDATE demands SET actual_hours=?,work_hour_source='人工登记',actual_hours_source='人工登记',updated_at=? WHERE id=?",
+            (round(actual, 2), now, payload["demand_id"]),
+        )
+        reconcile_work_deviation_notifications(conn, payload["demand_id"])
+        result = {
+            "created": True,
+            "work_log_id": int(cur.lastrowid),
+            "demand_id": payload["demand_id"],
+            "demand_no": payload["demand_no"],
+            "hours": payload["hours"],
+            "actual_hours_total": round(actual, 2),
+            "actual_hours_source": "人工登记",
+            "message": "实际工时已登记并重新计算预警",
+            "idempotent_replay": False,
+        }
+        conn.execute(
+            "INSERT INTO mcp_idempotency(tool_name,idempotency_key,request_hash,result_json,created_at) VALUES (?,?,?,?,?)",
+            ("trm_log_work_hours", storage_key, request_hash, _canonical(result), now),
+        )
+        _audit_business(conn, action="MCP登记实际工时", object_type="demand_work_log",
+                        object_id=cur.lastrowid, demand_id=payload["demand_id"], request_id=request_id,
+                        principal=principal, required_permission="manage.work_hours",
+                        details={"hours": payload["hours"], "work_date": payload["work_date"], "worker": payload["worker"], "task_name": payload["task_name"]})
+        _audit_tool(conn, tool_name="trm_log_work_hours", operation="create", success=True,
+                    request_id=request_id, principal=principal, required_permission="manage.work_hours",
+                    idempotency_key=idempotency_key, object_type="demand_work_log", object_id=str(cur.lastrowid),
+                    arguments=payload, result=result)
+    return result
 
 
 @trm_mcp.tool(
@@ -908,6 +1206,6 @@ def public_mcp_status() -> dict[str, Any]:
         "endpoint_path": "/mcp/",
         "authentication": "Bearer token" if token_ready else "未配置",
         "user_authorization": "live_role_delegation",
-        "tool_count": 9,
+        "tool_count": 13,
         "service_actor": _service_actor(),
     }

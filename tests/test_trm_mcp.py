@@ -11,6 +11,7 @@ from app.auth import init_auth_db, issue_ai_delegation
 from app.db import init_db
 from app.extended import init_extended_db
 from app.main import app
+from app.poc import init_poc_db
 from app.trm_mcp import init_trm_mcp_db, trm_mcp
 from app.v4 import init_v4_db
 
@@ -72,17 +73,20 @@ def test_mcp_prepare_create_and_idempotency(monkeypatch, tmp_path):
     init_db()
     init_extended_db()
     init_v4_db()
+    init_poc_db()
     init_auth_db()
     init_trm_mcp_db()
     project_manager_token = delegation_for("wangwj")
     applicant_token = delegation_for("lili11-ghq")
+    product_manager_token = delegation_for("zhaomin")
 
     async def scenario():
         async with Client(trm_mcp) as client:
             listed = await client.list_tools()
             names = {tool.name for tool in listed.tools}
-            assert len(names) == 9
+            assert len(names) == 13
             assert {"trm_prepare_create_project", "trm_create_project"} <= names
+            assert {"trm_prepare_update_work_plan", "trm_update_work_plan", "trm_prepare_log_work_hours", "trm_log_work_hours"} <= names
             for tool in listed.tools:
                 schema = tool.model_dump(by_alias=True)["inputSchema"]
                 assert "delegation_token" in schema.get("required", [])
@@ -150,6 +154,72 @@ def test_mcp_prepare_create_and_idempotency(monkeypatch, tmp_path):
             })
             assert not applicant_created.is_error
             assert applicant_created.structured_content["created"] is True
+
+            # 工时与页面能力共用实时权限，并通过预览、确认、幂等写入形成闭环。
+            # prepare 本身不创建，先使用前面的需求参数完成草稿创建。
+            demand_created = await client.call_tool("trm_create_demand", {
+                "delegation_token": applicant_token,
+                "title": "申请人AI需求权限测试",
+                "description": "验证申请人可通过AI创建需求草稿，且身份由服务端绑定。",
+                "demand_type": "系统功能新增",
+                "budget_sources": [],
+                "priority": "中",
+                "budget_amount": 0,
+                "confirmation_token": applicant_demand.structured_content["confirmation_token"],
+                "idempotency_key": "applicant-demand-create-001",
+            })
+            assert not demand_created.is_error
+            demand_id = demand_created.structured_content["id"]
+            plan_args = {
+                "delegation_token": product_manager_token,
+                "identifier": str(demand_id),
+                "estimated_hours": 40,
+                "expected_completion_date": "2099-12-31",
+                "note": "AI协助评估",
+            }
+            plan_preview = await client.call_tool("trm_prepare_update_work_plan", plan_args)
+            assert not plan_preview.is_error
+            plan_saved = await client.call_tool("trm_update_work_plan", {
+                **plan_args,
+                "confirmation_token": plan_preview.structured_content["confirmation_token"],
+                "idempotency_key": "work-plan-update-001",
+            })
+            assert not plan_saved.is_error
+            assert plan_saved.structured_content["estimated_hours"] == 40
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            log_args = {
+                "delegation_token": product_manager_token,
+                "identifier": str(demand_id),
+                "work_date": today,
+                "hours": 6,
+                "worker": "赵敏",
+                "task_name": "需求评审",
+                "description": "评审并拆分功能点",
+                "replace_external": False,
+            }
+            log_preview = await client.call_tool("trm_prepare_log_work_hours", log_args)
+            assert not log_preview.is_error
+            log_saved = await client.call_tool("trm_log_work_hours", {
+                **log_args,
+                "confirmation_token": log_preview.structured_content["confirmation_token"],
+                "idempotency_key": "work-log-create-001",
+            })
+            assert not log_saved.is_error
+            assert log_saved.structured_content["actual_hours_total"] == 6
+            log_replay = await client.call_tool("trm_log_work_hours", {
+                **log_args,
+                "confirmation_token": log_preview.structured_content["confirmation_token"],
+                "idempotency_key": "work-log-create-001",
+            })
+            assert log_replay.structured_content["idempotent_replay"] is True
+
+            applicant_work = await client.call_tool("trm_prepare_update_work_plan", {
+                **plan_args,
+                "delegation_token": applicant_token,
+            })
+            assert applicant_work.is_error
+            assert "demand.evaluate" in str(applicant_work.content)
 
             # 申请人页面的“新建立项”权限一旦撤销，AI立即同步失去创建项目能力。
             with db.connect() as conn:

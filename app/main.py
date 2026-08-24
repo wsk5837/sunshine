@@ -227,6 +227,9 @@ def demand_dict(conn, row):
             tr["payload"] = {}
     d["tapd_tasks"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_tasks WHERE demand_id=? ORDER BY id", (d["id"],))]
     d["tapd_costs"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_costs WHERE demand_id=? ORDER BY id", (d["id"],))]
+    d["work_logs"] = [dict(r) for r in conn.execute(
+        "SELECT * FROM demand_work_logs WHERE demand_id=? ORDER BY work_date DESC,id DESC", (d["id"],)
+    )]
     d["tapd_sync_runs"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_sync_runs WHERE demand_id=? ORDER BY id DESC LIMIT 20", (d["id"],))]
     d["tapd_retry_job"] = row_to_dict(conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? ORDER BY id DESC LIMIT 1", (d["id"],)).fetchone())
     d["tapd_events"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_events WHERE demand_id=? ORDER BY id DESC LIMIT 20", (d["id"],))]
@@ -325,6 +328,21 @@ class ApprovalPayload(BaseModel):
     action: str
     comment: str = ""
     return_to: Optional[str] = None
+
+
+class WorkPlanPayload(BaseModel):
+    estimated_hours: float = Field(gt=0, le=1_000_000)
+    expected_completion_date: Optional[str] = None
+    note: str = Field(default="", max_length=500)
+
+
+class WorkLogPayload(BaseModel):
+    work_date: str
+    hours: float = Field(gt=0, le=24)
+    worker: str = Field(min_length=1, max_length=100)
+    task_name: str = Field(default="", max_length=200)
+    description: str = Field(default="", max_length=500)
+    replace_external: bool = False
 
 
 class FunctionPointPayload(BaseModel):
@@ -588,6 +606,104 @@ def update_demand(demand_id: int, payload: DemandPayload, request: Request, x_us
         audit(conn, request, actor, role, "更新需求", "demand", demand_id, demand_id=demand_id)
         data = demand_dict(conn, get_demand_or_404(conn, demand_id))
     return {"code": 0, "message": "保存成功", "data": data}
+
+
+def _validate_work_date(value: Optional[str], field_name: str, allow_future: bool = True) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise BusinessError(400, "REQ-4001", f"{field_name}必须为YYYY-MM-DD格式") from exc
+    if not allow_future and parsed > datetime.now().date():
+        raise BusinessError(400, "REQ-4001", f"{field_name}不能晚于今天")
+    return parsed.isoformat()
+
+
+@app.put("/api/demands/{demand_id}/work-plan")
+def save_work_plan(demand_id: int, payload: WorkPlanPayload, request: Request,
+                   x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
+    actor, role = actor_context(x_user, x_role)
+    due_date = _validate_work_date(payload.expected_completion_date, "计划完成日期")
+    with connect() as conn:
+        demand = get_demand_or_404(conn, demand_id)
+        if demand["status"] in ("已完成", "已终止"):
+            raise BusinessError(409, "REQ-4091", "已关闭需求不能修改工时计划")
+        conn.execute(
+            """UPDATE demands SET estimated_hours=?,expected_completion_date=?,work_hour_source='人工维护',work_plan_source='人工维护',
+               work_plan_updated_by=?,work_plan_updated_at=?,updated_at=? WHERE id=?""",
+            (round(payload.estimated_hours, 2), due_date, actor, now_iso(), now_iso(), demand_id),
+        )
+        audit(conn, request, actor, role, "维护工时计划", "demand_work_plan", demand_id, demand_id=demand_id,
+              details={"estimated_hours": payload.estimated_hours, "expected_completion_date": due_date, "note": payload.note})
+        reconcile_work_deviation_notifications(conn, demand_id)
+        data = demand_dict(conn, get_demand_or_404(conn, demand_id))
+    return {"code": 0, "message": "工时计划已更新", "data": data}
+
+
+@app.post("/api/demands/{demand_id}/work-logs")
+def create_work_log(demand_id: int, payload: WorkLogPayload, request: Request,
+                    x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
+    actor, role = actor_context(x_user, x_role)
+    work_date = _validate_work_date(payload.work_date, "工时日期", allow_future=False)
+    worker = payload.worker.strip()
+    if not worker:
+        raise BusinessError(400, "REQ-4002", "工时登记人不能为空")
+    with connect() as conn:
+        demand = get_demand_or_404(conn, demand_id)
+        if demand["status"] in ("已终止",):
+            raise BusinessError(409, "REQ-4091", "已终止需求不能登记工时")
+        manual_count = conn.execute(
+            "SELECT COUNT(*) c FROM demand_work_logs WHERE demand_id=?", (demand_id,)
+        ).fetchone()["c"]
+        external_source = str(demand["actual_hours_source"] or demand["work_hour_source"] or "").startswith("TAPD")
+        if external_source and not manual_count and not payload.replace_external:
+            raise BusinessError(
+                409, "REQ-4091", "当前实际工时来自TAPD；如需改为人工维护，请确认替换外部工时",
+                {"requires_replace_external": True},
+            )
+        cur = conn.execute(
+            """INSERT INTO demand_work_logs(demand_id,work_date,hours,worker,task_name,description,source,created_by,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (demand_id, work_date, round(payload.hours, 2), worker, payload.task_name.strip(),
+             payload.description.strip(), "人工登记", actor, now_iso()),
+        )
+        actual = conn.execute(
+            "SELECT COALESCE(SUM(hours),0) v FROM demand_work_logs WHERE demand_id=?", (demand_id,)
+        ).fetchone()["v"]
+        conn.execute(
+            "UPDATE demands SET actual_hours=?,work_hour_source='人工登记',actual_hours_source='人工登记',updated_at=? WHERE id=?",
+            (round(float(actual or 0), 2), now_iso(), demand_id),
+        )
+        audit(conn, request, actor, role, "登记实际工时", "demand_work_log", cur.lastrowid, demand_id=demand_id,
+              details={"work_date": work_date, "hours": payload.hours, "worker": worker, "task_name": payload.task_name})
+        reconcile_work_deviation_notifications(conn, demand_id)
+        data = demand_dict(conn, get_demand_or_404(conn, demand_id))
+    return {"code": 0, "message": "实际工时已登记并重新计算预警", "data": data}
+
+
+@app.delete("/api/work-logs/{work_log_id}")
+def delete_work_log(work_log_id: int, request: Request,
+                    x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
+    actor, role = actor_context(x_user, x_role)
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM demand_work_logs WHERE id=?", (work_log_id,)).fetchone()
+        if not row:
+            raise BusinessError(404, "REQ-4040", "工时记录不存在")
+        demand_id = int(row["demand_id"])
+        conn.execute("DELETE FROM demand_work_logs WHERE id=?", (work_log_id,))
+        actual = conn.execute(
+            "SELECT COALESCE(SUM(hours),0) v FROM demand_work_logs WHERE demand_id=?", (demand_id,)
+        ).fetchone()["v"]
+        conn.execute(
+            "UPDATE demands SET actual_hours=?,work_hour_source='人工登记',actual_hours_source='人工登记',updated_at=? WHERE id=?",
+            (round(float(actual or 0), 2), now_iso(), demand_id),
+        )
+        audit(conn, request, actor, role, "删除工时记录", "demand_work_log", work_log_id, demand_id=demand_id,
+              details={"hours": row["hours"], "worker": row["worker"]})
+        reconcile_work_deviation_notifications(conn, demand_id)
+        data = demand_dict(conn, get_demand_or_404(conn, demand_id))
+    return {"code": 0, "message": "工时记录已删除并重新汇总", "data": data}
 
 
 @app.post("/api/demands/{demand_id}/attachments")

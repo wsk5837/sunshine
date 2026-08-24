@@ -189,7 +189,7 @@ def init_v4_db():
                 "mcp", "TRM MCP工具服务", "live",
                 f"{public_base}/mcp/",
                 "",
-                "供G.AIOS智能体查询TRM数据，并在用户确认后幂等创建项目或需求草稿",
+                "供G.AIOS智能体查询TRM数据，并在用户确认后幂等创建项目、需求草稿或维护需求工时",
             ),
         ]:
             conn.execute(
@@ -286,8 +286,8 @@ class ContractChangePayload(BaseModel):
 class SettlementItemPayload(BaseModel):
     item_name: str = Field(min_length=1, max_length=200)
     item_type: str = "服务费"
-    quantity: float = 1
-    unit_price: float = 0
+    quantity: float = Field(default=1, gt=0, le=1_000_000)
+    unit_price: float = Field(gt=0, le=999_999_999.99)
     description: str = ""
 
 
@@ -634,9 +634,9 @@ def check_integration(code: str, request: Request,
             if not state["enabled"]:
                 status, message, success = "未配置", "MCP端点已封装，但未配置TRM_MCP_API_TOKEN", 0
             elif not state["write_enabled"]:
-                status, message, success = "只读", "MCP鉴权已就绪，9个工具可发现；写操作开关当前关闭", 1
+                status, message, success = "只读", "MCP鉴权已就绪，13个工具可发现；写操作开关当前关闭", 1
             else:
-                status, message, success = "正常", "MCP鉴权与写操作已就绪，支持受控创建项目/需求", 1
+                status, message, success = "正常", "MCP鉴权与写操作已就绪，支持受控创建项目、需求及维护工时", 1
         else:
             # 其他第三方系统没有提供只读健康端点时，不伪造真实调用成功。
             status, message, success = "待验证", "已配置Live地址；真实鉴权凭据由部署环境注入后执行连通性验证", 1
