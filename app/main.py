@@ -1326,5 +1326,5 @@ def ai_query(payload: AIQueryPayload, request: Request, x_role: Optional[str] = 
         elif target:
             answer = f"{target.get('demand_no') or '该需求'}：{target['title']}。当前状态“{target['status']}”，申请人{target['applicant']}，优先级{target['priority']}，预估金额¥{target.get('estimated_amount',0):,.2f}，功能点{len(target['function_points'])}条。"
         else:
-            answer = "我可以基于系统数据回答五类POC问题：单条需求完整信息、项目批量需求状态与工时统计、部门月度/季度预算执行趋势、需求当前环节与预计完成时间、历史处理方式与平均交付周期。"
+            answer = "您可以查询以下内容：\n\n- 单条需求的完整信息\n- 项目需求状态与工时统计\n- 部门月度或季度预算执行趋势\n- 需求当前环节与预计完成时间\n- 历史同类需求的处理方式与平均交付周期"
     return {"code": 0, "data": {"answer": answer, "scope": "系统事实数据", "role": ROLE_LABELS.get(role, role)}}

@@ -177,6 +177,7 @@ def init_extended_db():
             frequency TEXT DEFAULT '月度',
             owner TEXT DEFAULT '',
             status TEXT NOT NULL DEFAULT '启用',
+            direction TEXT NOT NULL DEFAULT 'higher',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -232,6 +233,9 @@ def init_extended_db():
             FOREIGN KEY(contract_id) REFERENCES contracts(id) ON DELETE CASCADE
         );
         """)
+        indicator_columns = {row["name"] for row in conn.execute("PRAGMA table_info(indicators)")}
+        if "direction" not in indicator_columns:
+            conn.execute("ALTER TABLE indicators ADD COLUMN direction TEXT NOT NULL DEFAULT 'higher'")
         now = now_iso()
         if conn.execute("SELECT COUNT(*) c FROM initiatives").fetchone()["c"] == 0:
             conn.executemany("""INSERT INTO initiatives(initiative_no,title,description,applicant,department,owner,estimated_budget,budget_id,planned_start,planned_end,status,current_node,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",[
@@ -263,12 +267,43 @@ def init_extended_db():
                 (1,"质量","需求信息一致性",99,96.5,"%","2026Q3","赵敏","跟踪中",now,now),
                 (2,"成本","人工操作工时节约",600,285,"小时/年","2026","曾卫平","跟踪中",now,now)
             ])
-        if conn.execute("SELECT COUNT(*) c FROM indicators").fetchone()["c"] == 0:
-            conn.executemany("""INSERT INTO indicators(indicator_no,name,category,unit,formula,target_value,current_value,data_source,frequency,owner,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",[
-                ("KPI-2026-0001","需求按期交付率","交付效率","%","按期完成需求数/已完成需求数*100",95,92.4,"需求管理","月度","项目管理办公室","启用",now,now),
-                ("KPI-2026-0002","预算执行率","预算管理","%","已使用预算/总预算*100",90,64,"预算管理","月度","财务部","启用",now,now),
-                ("KPI-2026-0003","审批平均时长","流程效率","小时","审批总耗时/审批单数",24,19.6,"审批日志","周度","产品运营部","启用",now,now)
-            ])
+        indicator_seeds = [
+            ("KPI-2026-0001","需求按期交付率","交付效率","%","按期完成需求数 ÷ 已完成需求数 × 100",95,92.4,"需求管理","月度","项目管理办公室","启用","higher",now,now),
+            ("KPI-2026-0002","预算执行率","预算管理","%","已使用预算 ÷ 总预算 × 100",90,64,"预算管理","月度","财务部","启用","higher",now,now),
+            ("KPI-2026-0003","审批平均时长","流程效率","小时","审批总耗时 ÷ 已完成审批单数",24,19.6,"审批日志","周度","产品运营部","启用","lower",now,now),
+            ("KPI-2026-0004","需求一次通过率","质量管理","%","首次审批通过需求数 ÷ 已审批需求数 × 100",85,88.5,"审批日志","月度","产品运营部","启用","higher",now,now),
+            ("KPI-2026-0005","工时估算偏差率","质量管理","%","|实际工时-预估工时| ÷ 预估工时 × 100",30,18.7,"TAPD工时回读","周度","产品研发部","启用","lower",now,now),
+            ("KPI-2026-0006","TAPD同步成功率","系统运行","%","成功同步次数 ÷ 总同步次数 × 100",99,98.2,"TAPD同步记录","日度","平台运维组","启用","higher",now,now),
+            ("KPI-2026-0007","需求关闭率","交付效率","%","已关闭需求数 ÷ 到期需求数 × 100",90,76,"需求管理","月度","项目管理办公室","启用","higher",now,now),
+            ("KPI-2026-0008","项目里程碑按期率","项目管理","%","按期完成里程碑数 ÷ 已到期里程碑数 × 100",95,86.7,"项目里程碑","月度","项目管理办公室","启用","higher",now,now),
+            ("KPI-2026-0009","合同付款计划达成率","合同结算","%","按计划完成付款数 ÷ 已到期付款数 × 100",98,100,"收付款计划","月度","财务部","启用","higher",now,now),
+            ("KPI-2026-0010","预算预测偏差率","预算管理","%","|实际支出-预测支出| ÷ 预测支出 × 100",10,7.4,"预算执行快照","月度","财务部","启用","lower",now,now),
+            ("KPI-2026-0011","关键风险关闭率","风险管理","%","已关闭关键风险数 ÷ 关键风险总数 × 100",90,83.3,"项目风险台账","周度","风险管理岗","启用","higher",now,now),
+            ("KPI-2026-0012","AI问题解决率","智能化运营","%","有效解决会话数 ÷ AI会话总数 × 100",85,91.6,"AI会话反馈","周度","数字化管理部","启用","higher",now,now),
+            ("KPI-2026-0013","系统可用率","系统运行","%","正常服务时长 ÷ 统计周期总时长 × 100",99.9,99.95,"服务监控","日度","平台运维组","启用","higher",now,now),
+            ("KPI-2026-0014","需求平均交付周期","交付效率","天","需求交付总天数 ÷ 已交付需求数",20,23.5,"需求全生命周期","月度","项目管理办公室","启用","lower",now,now),
+            ("KPI-2026-0015","业务价值达成率","项目管理","%","已实现价值 ÷ 计划价值 × 100",90,72.5,"业务价值台账","季度","项目管理办公室","启用","higher",now,now),
+        ]
+        conn.executemany("""INSERT OR IGNORE INTO indicators(indicator_no,name,category,unit,formula,target_value,current_value,data_source,frequency,owner,status,direction,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", indicator_seeds)
+        conn.execute("UPDATE indicators SET direction='lower' WHERE indicator_no IN ('KPI-2026-0003','KPI-2026-0005','KPI-2026-0010','KPI-2026-0014')")
+        indicator_histories = {
+            "KPI-2026-0001": [91.0, 91.8, 92.1, 92.4], "KPI-2026-0002": [48.2, 53.6, 58.9, 64.0],
+            "KPI-2026-0003": [27.8, 24.9, 21.2, 19.6], "KPI-2026-0004": [81.3, 83.8, 86.2, 88.5],
+            "KPI-2026-0005": [28.4, 24.6, 21.1, 18.7], "KPI-2026-0006": [96.5, 97.1, 97.8, 98.2],
+            "KPI-2026-0007": [68.0, 71.5, 73.2, 76.0], "KPI-2026-0008": [80.0, 82.5, 84.1, 86.7],
+            "KPI-2026-0009": [96.0, 98.0, 100.0, 100.0], "KPI-2026-0010": [12.6, 10.8, 8.9, 7.4],
+            "KPI-2026-0011": [70.0, 75.0, 80.0, 83.3], "KPI-2026-0012": [84.0, 87.2, 89.8, 91.6],
+            "KPI-2026-0013": [99.82, 99.88, 99.92, 99.95], "KPI-2026-0014": [29.0, 27.2, 25.4, 23.5],
+            "KPI-2026-0015": [58.0, 63.5, 68.0, 72.5],
+        }
+        periods = ["2026-05", "2026-06", "2026-07", "2026-08"]
+        for indicator_no, values in indicator_histories.items():
+            indicator = conn.execute("SELECT id,data_source FROM indicators WHERE indicator_no=?", (indicator_no,)).fetchone()
+            if indicator and conn.execute("SELECT COUNT(*) c FROM indicator_records WHERE indicator_id=?", (indicator["id"],)).fetchone()["c"] == 0:
+                conn.executemany(
+                    "INSERT INTO indicator_records(indicator_id,period,value,source,created_at) VALUES (?,?,?,?,?)",
+                    [(indicator["id"], period, value, indicator["data_source"], now) for period, value in zip(periods, values)],
+                )
         if conn.execute("SELECT COUNT(*) c FROM contracts").fetchone()["c"] == 0:
             conn.executemany("""INSERT INTO contracts(contract_no,name,project_id,budget_id,supplier,total_amount,start_date,end_date,owner,description,status,current_node,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",[
                 ("CT-2026-0088","机构透视管理机器人研发服务合同",1,1,"上海速擎软件有限公司",1280000,"2026-06-15","2027-01-31","王卫嘉","项目研发与实施服务。","执行中","已完成审批",now,now),
@@ -378,6 +413,7 @@ class IndicatorPayload(BaseModel):
     frequency: str = "月度"
     owner: str = ""
     status: str = "启用"
+    direction: str = Field(default="higher", pattern="^(higher|lower)$")
 
 class IndicatorRecordPayload(BaseModel):
     period: str
@@ -731,17 +767,17 @@ def list_indicators():
 @router.post('/indicators')
 def create_indicator(payload:IndicatorPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn:no=_next_no(conn,'indicators','indicator_no',f'KPI-{datetime.now().year}-');now=now_iso();cur=conn.execute("""INSERT INTO indicators(indicator_no,name,category,unit,formula,target_value,current_value,data_source,frequency,owner,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,payload.name,payload.category,payload.unit,payload.formula,payload.target_value,payload.current_value,payload.data_source,payload.frequency,payload.owner,payload.status,now,now));_audit(conn,request,actor,role,'创建指标','indicator',cur.lastrowid);return {'code':0,'message':'指标已创建','data':{'id':cur.lastrowid,'indicator_no':no}}
+    with connect() as conn:no=_next_no(conn,'indicators','indicator_no',f'KPI-{datetime.now().year}-');now=now_iso();cur=conn.execute("""INSERT INTO indicators(indicator_no,name,category,unit,formula,target_value,current_value,data_source,frequency,owner,status,direction,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,payload.name,payload.category,payload.unit,payload.formula,payload.target_value,payload.current_value,payload.data_source,payload.frequency,payload.owner,payload.status,payload.direction,now,now));_audit(conn,request,actor,role,'创建指标','indicator',cur.lastrowid);return {'code':0,'message':'指标已创建','data':{'id':cur.lastrowid,'indicator_no':no}}
 
 @router.put('/indicators/{item_id}')
 def update_indicator(item_id:int,payload:IndicatorPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn:conn.execute("""UPDATE indicators SET name=?,category=?,unit=?,formula=?,target_value=?,current_value=?,data_source=?,frequency=?,owner=?,status=?,updated_at=? WHERE id=?""",(payload.name,payload.category,payload.unit,payload.formula,payload.target_value,payload.current_value,payload.data_source,payload.frequency,payload.owner,payload.status,now_iso(),item_id));_audit(conn,request,actor,role,'更新指标','indicator',item_id);return {'code':0,'message':'指标已更新'}
+    with connect() as conn:conn.execute("""UPDATE indicators SET name=?,category=?,unit=?,formula=?,target_value=?,current_value=?,data_source=?,frequency=?,owner=?,status=?,direction=?,updated_at=? WHERE id=?""",(payload.name,payload.category,payload.unit,payload.formula,payload.target_value,payload.current_value,payload.data_source,payload.frequency,payload.owner,payload.status,payload.direction,now_iso(),item_id));_audit(conn,request,actor,role,'更新指标','indicator',item_id);return {'code':0,'message':'指标已更新'}
 
 @router.delete('/indicators/{item_id}')
 def delete_indicator(item_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
-    with connect() as conn:conn.execute('DELETE FROM indicators WHERE id=?',(item_id,));_audit(conn,request,actor,role,'删除指标','indicator',item_id);return {'code':0,'message':'指标已删除'}
+    with connect() as conn:conn.execute('DELETE FROM indicator_records WHERE indicator_id=?',(item_id,));conn.execute('DELETE FROM indicators WHERE id=?',(item_id,));_audit(conn,request,actor,role,'删除指标','indicator',item_id);return {'code':0,'message':'指标已删除'}
 
 @router.post('/indicators/{item_id}/records')
 def add_indicator_record(item_id:int,payload:IndicatorRecordPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):

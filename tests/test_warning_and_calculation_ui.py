@@ -55,7 +55,7 @@ def test_function_point_amount_uses_hover_breakdown_and_clickable_detail():
     assert "amountCalculationTooltip" in javascript
     assert "功能点金额计算" in javascript
     assert "go-fp-detail" in javascript
-    assert "预警已真实写入消息中心" in javascript
+    assert "已向产品经理和项目经理发送工时偏差预警" in javascript
     assert ".calc-tooltip:hover .calc-tooltip-panel" in stylesheet
     assert ".calc-tooltip:focus .calc-tooltip-panel" in stylesheet
 

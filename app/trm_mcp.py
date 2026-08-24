@@ -360,7 +360,7 @@ def _project_payload(
 trm_mcp = MCPServer(
     name="trm-technology-resource-management",
     title="TRM 科技资源管理工具",
-    version="1.0.0",
+    version="1.1.0",
     description="供企业智能体查询 TRM 数据，并在用户确认后创建项目或需求草稿。",
     instructions=(
         "每个 trm_* 工具都必须传入TRM事实上下文提供的 delegation_token；"
@@ -370,13 +370,16 @@ trm_mcp = MCPServer(
         "任何创建都必须先调用 trm_prepare_create_* 获取预览，将预览展示给用户；"
         "仅在用户明确确认后，用完全相同的字段、确认令牌和唯一幂等键调用 trm_create_*。"
         "不得自行猜测预算项、人员、金额或日期。写操作是服务端受控的。"
+        "工具返回的是结构化业务数据，不得将原始JSON直接复制给用户。"
+        "调用完成后必须重新组织为简洁中文：结论在前，关键数据在后；列表优先，只在对比多条数据时使用带表头和分隔行的标准Markdown表格。"
+        "正常回答不提及MCP、工具名、权限校验、后端实现或委托令牌。"
     ),
 )
 
 
 @trm_mcp.tool(
     title="查询TRM预算",
-    description="Read-only。直接继承当前角色的 budget（预算管理）权限。列出可用预算ID、预算名称、总预算、已使用、剩余可用和执行率。",
+    description="只读查询预算。返回预算ID、名称、总预算、已使用、剩余可用和执行率等结构化字段。",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_list_budgets(
@@ -407,7 +410,7 @@ def trm_list_budgets(
 
 @trm_mcp.tool(
     title="搜索TRM需求",
-    description="Read-only。直接继承当前角色的 demand.list（需求列表）权限。按需求编号、标题或申请人搜索需求。",
+    description="只读搜索需求。按需求编号、标题、申请人或状态返回结构化列表。",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_search_demands(
@@ -445,7 +448,7 @@ def trm_search_demands(
 
 @trm_mcp.tool(
     title="获取TRM需求详情",
-    description="Read-only。直接继承当前角色的 demand.list（需求列表）权限。返回需求全生命周期详情。",
+    description="只读获取需求全生命周期详情，包含附件、审批、功能点、费用分摊和工时偏差。",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_get_demand(
@@ -483,7 +486,7 @@ def trm_get_demand(
 
 @trm_mcp.tool(
     title="搜索TRM项目",
-    description="Read-only。直接继承当前角色的 project360 或 project 权限。按编号、名称、项目经理或部门查询项目。",
+    description="只读搜索项目。按编号、名称、项目经理、部门或状态返回结构化列表。",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_list_projects(
@@ -520,7 +523,7 @@ def trm_list_projects(
 
 @trm_mcp.tool(
     title="获取TRM项目360详情",
-    description="Read-only。直接继承当前角色的 project360 或 project 权限。预算和需求子数据还会同步校验 budget / demand.list 权限。",
+    description="只读获取项目360详情，包含基本信息、任务、里程碑、风险以及已授权的预算和需求数据。",
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True, openWorldHint=False),
 )
 def trm_get_project(
