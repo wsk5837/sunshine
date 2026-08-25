@@ -36,6 +36,37 @@ def _next_no(conn, table, field, prefix):
     return f"{prefix}{seq:04d}"
 
 
+def _ensure_project_for_initiative(conn, initiative, request: Request, actor: str, role: str):
+    """为已通过的立项幂等创建项目台账。
+
+    审批接口和旧版兼容接口共用该逻辑：即使客户端重试，一个立项也只会对应一个项目。
+    """
+    initiative_id = initiative['id']
+    project_id = initiative['project_id']
+    existing = conn.execute('SELECT id,project_no FROM projects WHERE id=?', (project_id,)).fetchone() if project_id else None
+    if not existing:
+        existing = conn.execute('SELECT id,project_no FROM projects WHERE initiative_id=? ORDER BY id LIMIT 1', (initiative_id,)).fetchone()
+    if existing:
+        if project_id != existing['id']:
+            conn.execute('UPDATE initiatives SET project_id=?,updated_at=? WHERE id=?', (existing['id'], now_iso(), initiative_id))
+        return {'project_id': existing['id'], 'project_no': existing['project_no'], 'created': False}
+
+    no = _next_no(conn, 'projects', 'project_no', f'PRJ-{datetime.now().year}-')
+    now = now_iso()
+    cur = conn.execute(
+        """INSERT INTO projects(project_no,name,initiative_id,manager,department,budget_id,total_budget,status,progress,start_date,end_date,description,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (no, initiative['title'], initiative_id, initiative['owner'] or actor, initiative['department'],
+         initiative['budget_id'], initiative['estimated_budget'], '规划中', 0, initiative['planned_start'],
+         initiative['planned_end'], initiative['description'], now, now),
+    )
+    project_id = cur.lastrowid
+    conn.execute('UPDATE initiatives SET project_id=?,updated_at=? WHERE id=?', (project_id, now, initiative_id))
+    _audit(conn, request, actor, role, '立项审批通过自动创建项目', 'project', project_id,
+           details={'initiative_id': initiative_id, 'initiative_no': initiative['initiative_no']})
+    return {'project_id': project_id, 'project_no': no, 'created': True}
+
+
 def init_extended_db():
     with connect() as conn:
         conn.executescript("""
@@ -573,7 +604,14 @@ def approve_initiative(item_id:int,payload:ActionPayload,request:Request,x_user:
         else:
             next_node={'部门负责人审批':'财务评审','财务评审':'分管领导审批','分管领导审批':'已完成审批'}[node]; status='已通过' if next_node=='已完成审批' else '审批中'
         conn.execute('UPDATE initiatives SET status=?,current_node=?,updated_at=? WHERE id=?',(status,next_node,now_iso(),item_id)); _audit(conn,request,actor,role,f'立项{action}','initiative',item_id)
-        return {'code':0,'message':f'立项{action}成功','data':{'status':status,'current_node':next_node}}
+        data={'status':status,'current_node':next_node}
+        message=f'立项{action}成功'
+        if status=='已通过':
+            refreshed=conn.execute('SELECT * FROM initiatives WHERE id=?',(item_id,)).fetchone()
+            project_result=_ensure_project_for_initiative(conn,refreshed,request,actor,role)
+            data.update(project_result)
+            message=f"立项已通过，项目 {project_result['project_no']} 已自动进入项目台账"
+        return {'code':0,'message':message,'data':data}
 
 @router.post('/initiatives/{item_id}/convert-project')
 def convert_initiative(item_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
@@ -581,13 +619,9 @@ def convert_initiative(item_id:int,request:Request,x_user:Optional[str]=Header(N
     with connect() as conn:
         ini=conn.execute('SELECT * FROM initiatives WHERE id=?',(item_id,)).fetchone()
         if not ini: raise BusinessError(404,'REQ-4040','立项申请不存在')
-        if ini['status']!='已通过': raise BusinessError(409,'REQ-4091','立项审批通过后才能生成项目')
-        if ini['project_id']:
-            return {'code':0,'message':'已生成项目','data':{'project_id':ini['project_id']}}
-        no=_next_no(conn,'projects','project_no',f'PRJ-{datetime.now().year}-'); now=now_iso()
-        cur=conn.execute("""INSERT INTO projects(project_no,name,initiative_id,manager,department,budget_id,total_budget,status,progress,start_date,end_date,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",(no,ini['title'],item_id,ini['owner'] or actor,ini['department'],ini['budget_id'],ini['estimated_budget'],'规划中',0,ini['planned_start'],ini['planned_end'],ini['description'],now,now))
-        pid=cur.lastrowid; conn.execute('UPDATE initiatives SET project_id=?,updated_at=? WHERE id=?',(pid,now,item_id)); _audit(conn,request,actor,role,'立项转项目','project',pid,details={'initiative_id':item_id})
-        return {'code':0,'message':'项目已创建','data':{'project_id':pid,'project_no':no}}
+        if ini['status']!='已通过': raise BusinessError(409,'REQ-4091','立项审批通过后系统才会自动创建项目')
+        result=_ensure_project_for_initiative(conn,ini,request,actor,role)
+        return {'code':0,'message':'项目已自动生成' if result['created'] else '项目已存在','data':result}
 
 @router.get('/projects')
 def list_projects():

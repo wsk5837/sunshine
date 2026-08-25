@@ -11,7 +11,7 @@ def test_complete_business_modules():
         budgets = c.get('/api/budget-ledger').json()['data']
         budget_id = budgets[0]['id']
 
-        # 立项：创建 -> 扩展信息 -> 提交 -> 三级审批 -> 转项目
+        # 立项：创建 -> 扩展信息 -> 提交 -> 三级审批 -> 自动生成项目
         r = c.post('/api/initiatives', headers=h('applicant'), json={
             'title':'V4自动化测试立项','description':'用于验证完整立项流程','applicant':'测试申请人',
             'department':'数字化管理部','owner':'测试项目经理','estimated_budget':120000,
@@ -26,9 +26,16 @@ def test_complete_business_modules():
         for role in ['department_head','finance','vp']:
             rr=c.post(f'/api/initiatives/{iid}/approve',headers=h(role),json={'action':'通过','comment':'同意'})
             assert rr.status_code == 200, rr.text
-        rr=c.post(f'/api/initiatives/{iid}/convert-project',headers=h('project_manager'))
-        assert rr.status_code == 200, rr.text
+        assert '自动进入项目台账' in rr.json()['message']
         pid=rr.json()['data']['project_id']
+        initiative=c.get(f'/api/initiatives/{iid}',headers=h('applicant')).json()['data']
+        assert initiative['project_id']==pid
+        assert initiative['project']['initiative_id']==iid
+        # 旧版重试接口仅作兼容，不会重复创建项目。
+        replay=c.post(f'/api/initiatives/{iid}/convert-project',headers=h('project_manager'))
+        assert replay.status_code == 200, replay.text
+        assert replay.json()['data']['project_id']==pid
+        assert replay.json()['data']['created'] is False
 
         # 项目：任务、风险、交付物
         rr=c.post(f'/api/projects/{pid}/tasks',headers=h('project_manager'),json={

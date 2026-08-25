@@ -91,6 +91,8 @@ def test_project_ui_distinguishes_initiation_from_legacy_entry_and_manages_relat
     assert "发起立项" in script
     assert "录入存量项目" in script
     assert "仅用于已完成线下立项审批或历史数据迁移" in script
+    assert "生成项目','btn primary','iniConvert" not in script
+    assert "立项审批生成" in script
     assert "pContractLink" in script
     assert "pSettlementLink" in script
     assert "pCreateContract" in script
