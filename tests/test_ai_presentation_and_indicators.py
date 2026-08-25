@@ -63,3 +63,17 @@ def test_indicator_direction_is_persisted():
         created = next(item for item in client.get("/api/indicators").json()["data"] if item["id"] == item_id)
         assert created["direction"] == "lower"
         assert client.delete(f"/api/indicators/{item_id}", headers={"X-Role": "admin", "X-User": "admin"}).status_code == 200
+
+
+def test_indicator_board_uses_compact_command_center_layout():
+    script = (BASE_DIR / "app" / "static" / "app.js").read_text(encoding="utf-8")
+    stylesheet = (BASE_DIR / "app" / "static" / "app.css").read_text(encoding="utf-8")
+    assert "科技资源指标运行态势" in script
+    assert "indicator-summary-grid" in script
+    assert "indicator-screen-main" in script
+    assert "indicator-matrix" in script
+    assert "indicator-board-mode" in script
+    assert "groups.map(category=>`<div class=\"section\"" not in script
+    assert ".indicator-screen" in stylesheet
+    assert ".indicator-board-mode footer" in stylesheet
+    assert "grid-template-columns:repeat(5,minmax(0,1fr))" in stylesheet

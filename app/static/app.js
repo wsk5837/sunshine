@@ -476,7 +476,7 @@ function amountCalculationTooltip(items = [], totalAmount = 0) {
     ? items.map((fp) => `<span class="calc-line"><span>${esc(fp.fp_no || '未编号')} · ${esc(fp.name || fp.demand_summary || '功能点')}</span><span>${Number(fp.fp_count || 0).toFixed(2)} FP × ¥${money(fp.unit_price)} = <strong>¥${money(fp.estimated_amount)}</strong></span></span>`).join('')
     : '<span class="calc-empty">尚无功能点计算明细</span>';
   return `<span class="calc-tooltip" tabindex="0">
-    <span class="calc-tooltip-trigger" aria-label="聚焦查看功能点金额计算过程">¥ ${money(totalAmount)}</span>
+    <span class="calc-tooltip-trigger" aria-label="悬停或聚焦查看功能点金额计算过程">¥ ${money(totalAmount)}</span>
     <span class="calc-tooltip-panel" role="tooltip"><span class="calc-title">功能点金额计算</span><span class="calc-breakdown-list">${lines}</span><span class="calc-total">合计：¥ ${money(totalAmount)}</span></span>
   </span>`;
 }
@@ -952,6 +952,7 @@ async function init() {
 async function renderRoute() {
   const route = parseRoute();
   const [base, id] = route.path.split('/');
+  document.body.classList.toggle('indicator-board-mode', base === 'indicator-board');
   if (!canAccessRoute(base)) {
     const fallback = defaultAccessibleRoute(base);
     heroActions.innerHTML = '';
@@ -1430,7 +1431,7 @@ async function renderDemandDetail(id, query) {
 
 function renderDemandDetailTab(demand, tab) {
   if (tab === 'approval') return `<div class="grid-2"><div><div class="section flat"><div class="section-title">审批记录</div>${approvalRecords(demand.approvals)}</div></div><aside><div class="section flat"><div class="section-title">审批节点</div>${approvalFlow(demand)}</div></aside></div>`;
-  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
+  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
   if (tab === 'budget') return `<div class="section flat"><div class="section-title">预算校验</div>${budgetSnapshot(demand.budget_snapshot)}<div class="section-title" style="margin-top:18px">费用分摊</div>${allocationTable(demand.allocations)}</div>`;
   if (tab === 'tapd') {
     const reqs = demand.tapd_requirements || [];
@@ -1590,7 +1591,7 @@ async function renderProductEval(query) {
   appView.innerHTML = `${workflow(2)}<div class="fp-layout">
     <aside class="section"><div class="section-title">待评估需求</div><div class="demand-selector-list">${demands.map((d) => `<button class="demand-selector-card ${d.id===demand.id?'active':''}" type="button" data-id="${d.id}"><strong>${esc(d.demand_no || '草稿')} · ${esc(d.title)}</strong><span class="status ${statusClass(d.status)}">${esc(d.status)}</span><div class="help">预估 ¥${money(d.estimated_amount || d.budget_amount)}</div></button>`).join('')}</div></aside>
     <div>
-      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
+      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
       <div class="section"><div class="toolbar"><div class="section-title" style="margin:0">功能点评估明细</div>${editable ? btn('添加功能点','btn small primary','addFunctionPointInline') : ''}</div>${functionPointTable(demand.function_points, editable)}</div>
       <div class="section"><div class="section-title">费用分摊</div>${editable ? allocationEditor(demand) : allocationTable(demand.allocations)}</div>
       <div class="section"><div class="section-title">预算校验与执行率</div>${budgetSnapshot(demand.budget_snapshot)}</div>
@@ -2036,8 +2037,52 @@ async function renderIndicatorBoard(){
   setPage({title:'指标看板',iconName:'indicator',crumbs:['指标库']});
   const items=(await api('/api/indicators')).data.filter(x=>x.status==='启用');
   const groups=[...new Set(items.map(x=>x.category))];
-  const achieved=items.filter(x=>indicatorAchievement(x)>=100).length,critical=items.filter(x=>indicatorAchievement(x)<90).length;
-  appView.innerHTML=`<div class="grid-3"><div class="metric"><div class="k">纳入监测</div><div class="v">${items.length}</div><div class="sub">${groups.length} 个管理维度</div></div><div class="metric"><div class="k">达标率</div><div class="v">${items.length?(achieved/items.length*100).toFixed(1):0}%</div><div class="sub">${achieved} 项已达标</div></div><div class="metric"><div class="k">重点关注</div><div class="v">${critical}</div><div class="sub">达成度低于90%</div></div></div>${groups.map(category=>`<div class="section" style="margin-top:12px"><div class="toolbar"><div class="section-title">${esc(category)}</div><span class="status gray">${items.filter(x=>x.category===category).length} 项</span></div><div class="indicator-card-grid">${items.filter(x=>x.category===category).map(x=>{const rate=indicatorAchievement(x),healthInfo=indicatorHealth(x);return `<div class="indicator-card ${healthInfo.cls}"><div class="toolbar"><span class="detail-no">${esc(x.indicator_no)}</span><span class="status ${healthInfo.cls}">${healthInfo.label}</span></div><strong>${esc(x.name)}</strong><div class="indicator-value">${x.current_value}<small>${esc(x.unit)}</small></div><div class="sub">目标 ${x.direction==='lower'?'≤':'≥'} ${x.target_value}${esc(x.unit)} · ${esc(x.frequency)}</div><div class="progress"><span style="width:${Math.min(100,Math.max(0,rate))}%"></span></div><div class="toolbar indicator-card-foot"><span>达成度 ${rate.toFixed(1)}%</span><span>${esc(x.owner)}</span></div>${indicatorTrend(x)}</div>`;}).join('')}</div></div>`).join('')}`;
+  const healthCounts={success:0,warn:0,danger:0};
+  items.forEach(item=>{healthCounts[indicatorHealth(item).cls]++;});
+  const achieved=healthCounts.success,critical=healthCounts.danger;
+  const average=items.length?items.reduce((sum,item)=>sum+Math.min(120,indicatorAchievement(item)),0)/items.length:0;
+  const categoryStats=groups.map(category=>{
+    const categoryItems=items.filter(item=>item.category===category);
+    const rate=categoryItems.length?categoryItems.reduce((sum,item)=>sum+Math.min(120,indicatorAchievement(item)),0)/categoryItems.length:0;
+    return {category,items:categoryItems,rate};
+  }).sort((a,b)=>a.rate-b.rate);
+  const focusItems=[...items].sort((a,b)=>indicatorAchievement(a)-indicatorAchievement(b)).slice(0,5);
+  const periods=items.flatMap(item=>(item.records||[]).map(record=>record.period)).filter(Boolean).sort();
+  const latestPeriod=periods.at(-1)||'当前周期';
+  const successAngle=items.length?healthCounts.success/items.length*360:0;
+  const warnAngle=items.length?(healthCounts.success+healthCounts.warn)/items.length*360:0;
+  const summaryCards=[
+    ['监测指标',items.length,`${groups.length} 个管理维度`,'cyan'],
+    ['综合达成度',`${average.toFixed(1)}%`,'按目标口径自动计算','violet'],
+    ['已达标',achieved,`达标率 ${items.length?(achieved/items.length*100).toFixed(1):0}%`,'green'],
+    ['重点关注',critical,'达成度低于 90%','orange'],
+  ];
+  appView.innerHTML=`<div class="indicator-screen">
+    <div class="indicator-screen-head">
+      <div><div class="indicator-screen-title"><span class="indicator-live-dot"></span>科技资源指标运行态势</div><div class="indicator-screen-sub">覆盖交付、预算、质量、风险、项目及系统运行等关键管理维度</div></div>
+      <div class="indicator-screen-period"><span>${esc(latestPeriod)}</span><small>数据周期</small></div>
+    </div>
+    <div class="indicator-summary-grid">${summaryCards.map(card=>`<div class="indicator-summary ${card[3]}"><div><span>${card[0]}</span><small>${card[2]}</small></div><strong>${card[1]}</strong></div>`).join('')}</div>
+    <div class="indicator-screen-main">
+      <section class="indicator-screen-panel indicator-category-panel">
+        <div class="indicator-panel-title"><span>管理维度达成度</span><small>由低到高</small></div>
+        <div class="indicator-category-list">${categoryStats.map(group=>`<div class="indicator-category-row"><div class="indicator-category-meta"><span>${esc(group.category)}</span><small>${group.items.length}项</small><b>${group.rate.toFixed(1)}%</b></div><div class="indicator-screen-progress"><i style="width:${Math.min(100,Math.max(0,group.rate))}%"></i></div></div>`).join('')}</div>
+      </section>
+      <section class="indicator-screen-panel indicator-focus-panel">
+        <div class="indicator-panel-title"><span>关键指标监测</span><small>优先展示低达成度指标</small></div>
+        <div class="indicator-focus-list">${focusItems.map(x=>{const rate=indicatorAchievement(x),health=indicatorHealth(x);return `<div class="indicator-focus-row"><div class="indicator-focus-info"><span class="indicator-health-dot ${health.cls}"></span><div><b>${esc(x.name)}</b><small>${esc(x.category)} · ${esc(x.owner)}</small></div></div><div class="indicator-focus-value"><strong>${x.current_value}<small>${esc(x.unit)}</small></strong><span>目标 ${x.direction==='lower'?'≤':'≥'} ${x.target_value}</span></div>${indicatorTrend(x)}<div class="indicator-focus-rate ${health.cls}">${rate.toFixed(1)}%</div></div>`;}).join('')}</div>
+      </section>
+      <section class="indicator-screen-panel indicator-health-panel">
+        <div class="indicator-panel-title"><span>健康度分布</span><small>${items.length}项指标</small></div>
+        <div class="indicator-donut-wrap"><div class="indicator-donut" style="--success-angle:${successAngle}deg;--warn-angle:${warnAngle}deg"><div><strong>${items.length?(achieved/items.length*100).toFixed(0):0}%</strong><span>达标率</span></div></div></div>
+        <div class="indicator-health-legend"><div><i class="success"></i><span>已达标</span><strong>${healthCounts.success}</strong></div><div><i class="warn"></i><span>临界</span><strong>${healthCounts.warn}</strong></div><div><i class="danger"></i><span>需关注</span><strong>${healthCounts.danger}</strong></div></div>
+      </section>
+    </div>
+    <section class="indicator-screen-panel indicator-matrix-panel">
+      <div class="indicator-panel-title"><span>全量指标矩阵</span><small>当前值 / 目标值 · 达成度</small></div>
+      <div class="indicator-matrix">${items.map(x=>{const rate=indicatorAchievement(x),health=indicatorHealth(x);return `<div class="indicator-matrix-card ${health.cls}" title="${esc(x.formula||x.name)}"><div class="indicator-matrix-head"><span>${esc(x.name)}</span><i class="indicator-health-dot ${health.cls}"></i></div><div class="indicator-matrix-value"><strong>${x.current_value}<small>${esc(x.unit)}</small></strong><span>${x.direction==='lower'?'≤':'≥'} ${x.target_value}${esc(x.unit)}</span></div><div class="indicator-screen-progress"><i style="width:${Math.min(100,Math.max(0,rate))}%"></i></div><div class="indicator-matrix-foot"><span>${esc(x.frequency)}</span><b>${rate.toFixed(1)}%</b></div></div>`;}).join('')}</div>
+    </section>
+  </div>`;
 }
 
 async function renderContractList(){setPage({title:'合同台账',iconName:'contract',crumbs:['合同管理'],actions:btn(`${icon('plus')} 新建合同`,'btn primary','cNew')});const items=(await api('/api/contracts')).data;appView.innerHTML=`<div class="section">${simpleTable(['合同编号','合同名称','项目','供应商','合同金额','周期','状态','当前节点','操作'],items.map(x=>[x.contract_no,esc(x.name),esc(x.project_name||'—'),esc(x.supplier),`¥${money(x.total_amount)}`,`${x.start_date||'—'} ~ ${x.end_date||'—'}`,statusPill(x.status),x.current_node,`<button class="link cView" data-id="${x.id}">详情</button>`]))}</div>`;$('#cNew').addEventListener('click',()=>openContractForm());$$('.cView').forEach(b=>b.addEventListener('click',()=>navigate(`contract-detail/${b.dataset.id}`)));}
