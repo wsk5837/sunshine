@@ -70,3 +70,12 @@ def test_literal_buttons_have_a_binding_or_delegated_action():
         if len(re.findall(re.escape(button_id), source)) < 2
     )
     assert not unbound, f"buttons without a binding: {unbound}"
+
+
+def test_dashboard_header_has_no_business_action_buttons():
+    with TestClient(app) as client:
+        javascript = client.get("/app.js").text
+
+    assert "'dashNew'" not in javascript
+    assert "'dashExport'" not in javascript
+    assert "title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: ''" in javascript

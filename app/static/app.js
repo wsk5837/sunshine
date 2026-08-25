@@ -1040,7 +1040,7 @@ async function renderDashboard() {
   const canViewBudget = hasPermission('budget');
   const canViewTapd = hasPermission('tapd');
   const canViewInitiatives = hasPermission('initiative.list');
-  setPage({ title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: `${hasPermission('demand.create')?btn(`${icon('plus')} 新建需求`, 'btn primary', 'dashNew'):''}${btn('导出汇总','btn','dashExport')}` });
+  setPage({ title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: '' });
   const [platformResp, demandResp, pendingResp, noteResp, tapdResp] = await Promise.all([
     api('/api/platform-dashboard'),
     api('/api/dashboard'),
@@ -1080,8 +1080,6 @@ async function renderDashboard() {
   appView.innerHTML = `${metricCards.length ? `<div class="dashboard-metrics">${metricCards.join('')}</div>` : ''}${sectionGroup(primarySections)}${sectionGroup(overviewSections)}${sectionGroup(bottomSections)}`;
   bindCommonDemandActions(appView);
   $$('.dash-approve').forEach(b=>b.addEventListener('click',()=>navigate(`approval/${b.dataset.id}`)));
-  if($('#dashNew'))$('#dashNew').addEventListener('click',()=>navigate('demand-form'));
-  if ($('#dashExport')) $('#dashExport').addEventListener('click',(event)=>downloadProtectedFile('/api/exports/platform-summary.csv','trm-platform-summary.csv',event.currentTarget));
   const quickRoutes = { quickDemand:'demand-form', quickIni:'initiative-form', quickProject:hasPermission('project')?'project-list':'project360', quickContract:'contract-list', quickBudget:'budget', quickTapd:'tapd' };
   Object.entries(quickRoutes).forEach(([id, route]) => { if ($(`#${id}`)) $(`#${id}`).addEventListener('click',()=>navigate(route)); });
 }
