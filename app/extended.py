@@ -345,6 +345,10 @@ class ProjectPayload(BaseModel):
     end_date: Optional[str] = None
     description: str = ""
 
+class ProjectRelationsPayload(BaseModel):
+    contract_ids: Optional[list[int]] = None
+    settlement_ids: Optional[list[int]] = None
+
 class TaskPayload(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     owner: str = ""
@@ -587,7 +591,11 @@ def convert_initiative(item_id:int,request:Request,x_user:Optional[str]=Header(N
 
 @router.get('/projects')
 def list_projects():
-    with connect() as conn: return {'code':0,'data':[dict(x) for x in conn.execute('SELECT * FROM projects ORDER BY updated_at DESC')]}
+    with connect() as conn:
+        rows=conn.execute("""SELECT p.*,i.initiative_no,i.title initiative_title
+                             FROM projects p LEFT JOIN initiatives i ON i.id=p.initiative_id
+                             ORDER BY p.updated_at DESC""")
+        return {'code':0,'data':[dict(x) for x in rows]}
 
 @router.get('/projects/{project_id}')
 def project_detail(project_id:int):
@@ -596,6 +604,7 @@ def project_detail(project_id:int):
         if not row: raise BusinessError(404,'REQ-4040','项目不存在')
         d=dict(row); d['tasks']=[dict(x) for x in conn.execute('SELECT * FROM project_tasks WHERE project_id=? ORDER BY id',(project_id,))]; d['milestones']=[dict(x) for x in conn.execute('SELECT * FROM milestones WHERE project_id=? ORDER BY planned_date,id',(project_id,))]
         d['contracts']=[dict(x) for x in conn.execute('SELECT * FROM contracts WHERE project_id=? ORDER BY id DESC',(project_id,))]; d['settlements']=[dict(x) for x in conn.execute('SELECT * FROM settlements WHERE project_id=? ORDER BY id DESC',(project_id,))]; d['values']=[dict(x) for x in conn.execute('SELECT * FROM business_values WHERE project_id=? ORDER BY id',(project_id,))]
+        d['initiative']=row_to_dict(conn.execute('SELECT id,initiative_no,title,status,current_node FROM initiatives WHERE id=?',(row['initiative_id'],)).fetchone()) if row['initiative_id'] else None
         budget=row_to_dict(conn.execute('SELECT * FROM budgets WHERE id=?',(row['budget_id'],)).fetchone()) if row['budget_id'] else None; d['budget']=budget
         demand_rows=[dict(x) for x in conn.execute('SELECT * FROM demands ORDER BY id DESC')]
         if budget:
@@ -617,6 +626,48 @@ def update_project(project_id:int,payload:ProjectPayload,request:Request,x_user:
     with connect() as conn:
         if not conn.execute('SELECT id FROM projects WHERE id=?',(project_id,)).fetchone(): raise BusinessError(404,'REQ-4040','项目不存在')
         conn.execute("""UPDATE projects SET name=?,manager=?,department=?,budget_id=?,total_budget=?,status=?,progress=?,start_date=?,end_date=?,description=?,updated_at=? WHERE id=?""",(payload.name,payload.manager,payload.department,payload.budget_id,payload.total_budget,payload.status,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.description,now_iso(),project_id)); _audit(conn,request,actor,role,'更新项目','project',project_id); return {'code':0,'message':'项目已更新'}
+
+@router.put('/projects/{project_id}/relations')
+def update_project_relations(project_id:int,payload:ProjectRelationsPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
+    actor,role=_actor(x_user,x_role)
+    user=getattr(request.state,'auth_user',None) or {}
+    permissions=user.get('permissions') or []
+    if user and payload.contract_ids is not None and not has_permission(permissions,'contract'):
+        raise BusinessError(403,'AUTH-4030','当前账号无合同管理权限')
+    if user and payload.settlement_ids is not None and not has_permission(permissions,'settlement'):
+        raise BusinessError(403,'AUTH-4030','当前账号无结算管理权限')
+    with connect() as conn:
+        if not conn.execute('SELECT id FROM projects WHERE id=?',(project_id,)).fetchone():
+            raise BusinessError(404,'REQ-4040','项目不存在')
+        linked_contracts=linked_settlements=None
+        if payload.contract_ids is not None:
+            contract_ids=sorted(set(payload.contract_ids))
+            if contract_ids:
+                placeholders=','.join('?' for _ in contract_ids)
+                rows=conn.execute(f'SELECT id,project_id FROM contracts WHERE id IN ({placeholders})',contract_ids).fetchall()
+                if len(rows)!=len(contract_ids): raise BusinessError(404,'REQ-4040','包含不存在的合同')
+                occupied=[row['id'] for row in rows if row['project_id'] not in (None,project_id)]
+                if occupied: raise BusinessError(409,'REQ-4091','所选合同已关联其他项目，请先在原项目解除关联')
+            conn.execute('UPDATE contracts SET project_id=NULL,updated_at=? WHERE project_id=?',(now_iso(),project_id))
+            if contract_ids:
+                placeholders=','.join('?' for _ in contract_ids)
+                conn.execute(f'UPDATE contracts SET project_id=?,updated_at=? WHERE id IN ({placeholders})',(project_id,now_iso(),*contract_ids))
+            linked_contracts=len(contract_ids)
+        if payload.settlement_ids is not None:
+            settlement_ids=sorted(set(payload.settlement_ids))
+            if settlement_ids:
+                placeholders=','.join('?' for _ in settlement_ids)
+                rows=conn.execute(f'SELECT id,project_id FROM settlements WHERE id IN ({placeholders})',settlement_ids).fetchall()
+                if len(rows)!=len(settlement_ids): raise BusinessError(404,'REQ-4040','包含不存在的结算单')
+                occupied=[row['id'] for row in rows if row['project_id'] not in (None,project_id)]
+                if occupied: raise BusinessError(409,'REQ-4091','所选结算单已关联其他项目，请先在原项目解除关联')
+            conn.execute('UPDATE settlements SET project_id=NULL,updated_at=? WHERE project_id=?',(now_iso(),project_id))
+            if settlement_ids:
+                placeholders=','.join('?' for _ in settlement_ids)
+                conn.execute(f'UPDATE settlements SET project_id=?,updated_at=? WHERE id IN ({placeholders})',(project_id,now_iso(),*settlement_ids))
+            linked_settlements=len(settlement_ids)
+        _audit(conn,request,actor,role,'维护项目合同与结算关联','project',project_id,details={'contract_count':linked_contracts,'settlement_count':linked_settlements})
+        return {'code':0,'message':'项目关联信息已同步','data':{'contract_count':linked_contracts,'settlement_count':linked_settlements}}
 
 @router.post('/projects/{project_id}/tasks')
 def create_task(project_id:int,payload:TaskPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
