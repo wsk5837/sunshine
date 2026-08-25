@@ -171,6 +171,7 @@ function showModal(html, wide = false) {
   box.className = `modal${wide ? ' wide' : ''}`;
   box.innerHTML = html;
   $('#modalBackdrop').classList.remove('hidden');
+  enhanceFormHelpers(box);
 }
 
 function closeModal() {
@@ -181,6 +182,133 @@ function closeModal() {
 function closeDrawer() {
   $('#drawerBackdrop').classList.add('hidden');
   $('#notificationDrawer').classList.add('hidden');
+}
+
+const AI_ASSIST_EXCLUDED_IDS = new Set(['aiInput', 'aiAssistantInput', 'p360Q']);
+
+function formFieldLabel(field) {
+  const explicit = field.id ? document.querySelector(`label[for="${field.id}"]`) : null;
+  if (explicit?.textContent.trim()) return explicit.textContent.replace(/\s*\*\s*/g, '').trim();
+  const container = field.closest('.form-row, .grid-2 > div, .grid-3 > div, .grid-4 > div, .section > div, .modal > div');
+  const nearby = container?.querySelector(':scope > .label, :scope > label');
+  return (nearby?.textContent || field.placeholder || field.getAttribute('aria-label') || field.id || '说明')
+    .replace(/\s*\*\s*/g, '').trim().slice(0, 100);
+}
+
+function collectFormAssistContext(field) {
+  const scope = field.closest('.modal, .section, .view-root') || appView;
+  const rows = [];
+  scope.querySelectorAll('input, select, textarea').forEach((control) => {
+    if (control === field || control.disabled || ['password', 'hidden', 'file'].includes(control.type)) return;
+    if (AI_ASSIST_EXCLUDED_IDS.has(control.id) || control.closest('.ai-assist-preview')) return;
+    const value = control.type === 'checkbox'
+      ? (control.checked ? '是' : '')
+      : (control.tagName === 'SELECT' ? control.options[control.selectedIndex]?.text : control.value);
+    if (!String(value || '').trim()) return;
+    rows.push(`${formFieldLabel(control)}：${String(value).trim().slice(0, 240)}`);
+  });
+  return rows.slice(0, 14).join('\n').slice(0, 3000);
+}
+
+function enhanceDateInput(field) {
+  if (field.dataset.dateAssisted === 'true') return;
+  field.dataset.dateAssisted = 'true';
+  field.classList.add('date-assisted-input');
+  const wrapper = document.createElement('div');
+  wrapper.className = 'date-assist-wrap';
+  if (field.style.marginTop) {
+    wrapper.style.marginTop = field.style.marginTop;
+    field.style.marginTop = '0';
+  }
+  field.parentNode.insertBefore(wrapper, field);
+  wrapper.appendChild(field);
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'date-assist-trigger';
+  trigger.setAttribute('aria-label', field.type === 'date' ? '打开日期选择器' : '打开时间选择器');
+  trigger.title = field.type === 'date' ? '点击从日历选择日期' : '点击选择时间';
+  trigger.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2"></rect><path d="M8 3v4M16 3v4M3 10h18"></path></svg>';
+  trigger.addEventListener('click', () => {
+    try { if (typeof field.showPicker === 'function') field.showPicker(); else field.focus(); }
+    catch { field.focus(); }
+  });
+  wrapper.appendChild(trigger);
+}
+
+function renderAiAssistPreview(wrapper, field, result) {
+  wrapper.querySelector('.ai-assist-preview')?.remove();
+  const preview = document.createElement('div');
+  preview.className = 'ai-assist-preview';
+  preview.innerHTML = `<div class="ai-assist-preview-head"><strong>AI建议</strong><span>${esc(result.provider || 'TRM AI助手')}</span></div><textarea class="textarea" maxlength="5000">${esc(result.text || '')}</textarea><div class="ai-assist-preview-actions"><button type="button" class="btn small ai-assist-cancel">取消</button><button type="button" class="btn primary small ai-assist-apply">使用此内容</button></div>`;
+  wrapper.appendChild(preview);
+  preview.querySelector('.ai-assist-cancel').addEventListener('click', () => preview.remove());
+  preview.querySelector('.ai-assist-apply').addEventListener('click', () => {
+    const limit = field.maxLength > 0 ? field.maxLength : 5000;
+    field.value = preview.querySelector('textarea').value.slice(0, limit);
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    preview.remove();
+    field.focus();
+    toast('AI建议已回填，请确认后再保存', 'success');
+  });
+}
+
+function enhanceAiTextField(field) {
+  if (field.dataset.aiAssisted === 'true' || AI_ASSIST_EXCLUDED_IDS.has(field.id)) return;
+  if (field.disabled || field.readOnly || field.closest('.chat-input, .ai-assist-preview')) return;
+  field.dataset.aiAssisted = 'true';
+  const base = field.closest('.field-with-counter') || field;
+  const wrapper = document.createElement('div');
+  wrapper.className = 'ai-field-wrap';
+  if (base.style.marginTop) {
+    wrapper.style.marginTop = base.style.marginTop;
+    base.style.marginTop = '0';
+  }
+  base.parentNode.insertBefore(wrapper, base);
+  wrapper.appendChild(base);
+  const toolbar = document.createElement('div');
+  toolbar.className = 'ai-field-toolbar';
+  const assistButton = document.createElement('button');
+  assistButton.type = 'button';
+  assistButton.className = 'ai-field-button';
+  const refreshLabel = () => { assistButton.innerHTML = `${icon('ai')} ${field.value.trim() ? 'AI润色' : 'AI草拟'}`; };
+  refreshLabel();
+  field.addEventListener('input', refreshLabel);
+  assistButton.addEventListener('click', async () => {
+    const content = field.value.trim();
+    const mode = content ? 'polish' : 'draft';
+    assistButton.disabled = true;
+    assistButton.innerHTML = `${icon('ai')} AI生成中…`;
+    try {
+      const response = await api('/api/ai/form-assist', {
+        method: 'POST',
+        body: JSON.stringify({ field_label: formFieldLabel(field), content, context: collectFormAssistContext(field), mode })
+      });
+      renderAiAssistPreview(wrapper, field, response.data);
+    } catch (error) {
+      toast(error.message || 'AI填写助手暂时不可用', 'error');
+    } finally {
+      assistButton.disabled = false;
+      refreshLabel();
+    }
+  });
+  toolbar.appendChild(assistButton);
+  wrapper.appendChild(toolbar);
+}
+
+function enhanceFormHelpers(root = document) {
+  const element = root.nodeType === Node.ELEMENT_NODE ? root : document;
+  const dateFields = [...(element.matches?.('input[type="date"],input[type="datetime-local"],input[type="time"]') ? [element] : []), ...element.querySelectorAll?.('input[type="date"],input[type="datetime-local"],input[type="time"]') || []];
+  dateFields.forEach(enhanceDateInput);
+  if (!hasPermission('ai')) return;
+  const textFields = [...(element.matches?.('textarea') ? [element] : []), ...element.querySelectorAll?.('textarea') || []];
+  textFields.forEach(enhanceAiTextField);
+}
+
+function initFormHelperObserver() {
+  const observer = new MutationObserver((records) => records.forEach((record) => record.addedNodes.forEach((node) => {
+    if (node.nodeType === Node.ELEMENT_NODE) enhanceFormHelpers(node);
+  })));
+  [appView, $('#modalBox')].forEach((root) => observer.observe(root, { childList: true, subtree: true }));
 }
 
 function currentUser() {
@@ -936,7 +1064,7 @@ async function bootstrapAuthenticatedApp() {
 }
 
 async function init() {
-  bindLogin(); bindShell(); bindAiAssistant();
+  bindLogin(); bindShell(); bindAiAssistant(); initFormHelperObserver();
   if (location.protocol === 'file:') {
     showLogin('当前是直接文件打开方式，后端接口尚未启动。请返回项目根目录，双击“启动系统.command”，系统会自动打开正确地址。');
     $('#loginSubmit').disabled = true;
@@ -1429,7 +1557,7 @@ async function renderDemandDetail(id, query) {
 
 function renderDemandDetailTab(demand, tab) {
   if (tab === 'approval') return `<div class="grid-2"><div><div class="section flat"><div class="section-title">审批记录</div>${approvalRecords(demand.approvals)}</div></div><aside><div class="section flat"><div class="section-title">审批节点</div>${approvalFlow(demand)}</div></aside></div>`;
-  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
+  if (tab === 'fp') return `<div class="section flat"><div class="section-title">功能点评估</div>${functionPointTable(demand.function_points, false)}<div class="grid-3" style="margin-top:12px"><div class="metric soft"><div class="k">功能点记录</div><div class="v">${demand.function_points.length}</div></div><div class="metric soft"><div class="k">功能点合计</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div></div></div>`;
   if (tab === 'budget') return `<div class="section flat"><div class="section-title">预算校验</div>${budgetSnapshot(demand.budget_snapshot)}<div class="section-title" style="margin-top:18px">费用分摊</div>${allocationTable(demand.allocations)}</div>`;
   if (tab === 'tapd') {
     const reqs = demand.tapd_requirements || [];
@@ -1589,7 +1717,7 @@ async function renderProductEval(query) {
   appView.innerHTML = `${workflow(2)}<div class="fp-layout">
     <aside class="section"><div class="section-title">待评估需求</div><div class="demand-selector-list">${demands.map((d) => `<button class="demand-selector-card ${d.id===demand.id?'active':''}" type="button" data-id="${d.id}"><strong>${esc(d.demand_no || '草稿')} · ${esc(d.title)}</strong><span class="status ${statusClass(d.status)}">${esc(d.status)}</span><div class="help">预估 ¥${money(d.estimated_amount || d.budget_amount)}</div></button>`).join('')}</div></aside>
     <div>
-      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint"></span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
+      <div class="section"><div class="detail-head"><div><div class="detail-no">${esc(demand.demand_no)}</div><h2 class="detail-title">${esc(demand.title)}</h2></div><span class="status ${statusClass(demand.status)}">${esc(demand.status)}</span></div><div class="grid-3"><div class="metric soft"><div class="k">功能点总数</div><div class="v">${functionPointTotal(demand.function_points).toFixed(2)}</div></div><div class="metric soft"><div class="k">预估金额 <span class="hover-hint">悬停查看计算</span></div><div class="v calc-metric-value">${amountCalculationTooltip(demand.function_points, demand.estimated_amount)}</div></div><div class="metric soft"><div class="k">分摊比例</div><div class="v">${demand.allocations.reduce((s,x)=>s+Number(x.ratio||0),0).toFixed(2)}%</div></div></div></div>
       <div class="section"><div class="toolbar"><div class="section-title" style="margin:0">功能点评估明细</div>${editable ? btn('添加功能点','btn small primary','addFunctionPointInline') : ''}</div>${functionPointTable(demand.function_points, editable)}</div>
       <div class="section"><div class="section-title">费用分摊</div>${editable ? allocationEditor(demand) : allocationTable(demand.allocations)}</div>
       <div class="section"><div class="section-title">预算校验与执行率</div>${budgetSnapshot(demand.budget_snapshot)}</div>
