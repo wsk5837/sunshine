@@ -206,6 +206,15 @@ def init_auth_db():
                 name TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS notification_reads (
+                notification_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                read_at TEXT NOT NULL,
+                PRIMARY KEY(notification_id,user_id),
+                FOREIGN KEY(notification_id) REFERENCES notifications(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES system_users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_notification_reads_user ON notification_reads(user_id,read_at DESC);
             CREATE INDEX IF NOT EXISTS idx_ai_delegations_session ON ai_delegations(auth_session_token);
             CREATE INDEX IF NOT EXISTS idx_ai_delegations_expires ON ai_delegations(expires_at);
             """
@@ -341,7 +350,7 @@ def permissions_for_api(method: str, path: str) -> tuple[str, ...]:
     authenticated user may call the route.
     """
     method = method.upper()
-    if path.startswith("/api/auth/") or path in {"/api/meta", "/api/v4/meta", "/api/notifications"}:
+    if path.startswith("/api/auth/") or path in {"/api/meta", "/api/v4/meta", "/api/notifications", "/api/notifications/read-all"}:
         return ()
     if re.fullmatch(r"/api/notifications/\d+/read", path):
         return ()

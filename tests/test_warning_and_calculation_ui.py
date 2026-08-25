@@ -47,6 +47,44 @@ def test_historical_work_deviation_creates_real_deduped_role_notifications(monke
         )
 
 
+def test_multirole_notifications_are_grouped_and_read_state_is_per_user(monkeypatch, tmp_path):
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "notification-grouping.db")
+    with TestClient(app) as client:
+        with db.connect() as conn:
+            demand_id = conn.execute("SELECT id FROM demands ORDER BY id LIMIT 1").fetchone()["id"]
+            product_user = conn.execute("SELECT id FROM system_users WHERE username='zhaomin'").fetchone()["id"]
+            conn.execute(
+                "INSERT OR IGNORE INTO system_user_roles(user_id,role_code,is_primary,created_at) VALUES (?,?,0,datetime('now'))",
+                (product_user, "project_manager"),
+            )
+            conn.execute("UPDATE demands SET estimated_hours=20,actual_hours=32 WHERE id=?", (demand_id,))
+            conn.execute("DELETE FROM notifications WHERE demand_id=? AND title='工时偏差预警'", (demand_id,))
+
+        product_login = client.post("/api/auth/login", json={"username": "zhaomin", "password": "Demo@123"}).json()["data"]
+        product_headers = {"X-Session": product_login["token"]}
+        notices = client.get("/api/notifications", headers=product_headers).json()["data"]
+        warning = [n for n in notices if n["demand_id"] == demand_id and n["title"] == "工时偏差预警"]
+        assert len(warning) == 1
+        assert set(warning[0]["recipient_roles"]) == {"product_manager", "project_manager"}
+        assert warning[0]["is_read"] == 0
+
+        marked = client.post(f"/api/notifications/{warning[0]['id']}/read", headers=product_headers)
+        assert marked.status_code == 200
+        refreshed = client.get("/api/notifications", headers=product_headers).json()["data"]
+        refreshed_warning = next(n for n in refreshed if n["demand_id"] == demand_id and n["title"] == "工时偏差预警")
+        assert refreshed_warning["is_read"] == 1
+        with db.connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) c FROM notification_reads WHERE user_id=?", (product_user,)
+            ).fetchone()["c"] == 2
+
+        # 另一个项目经理仍应看到自己的消息未读，不能被赵敏的点击连带标记。
+        manager_login = client.post("/api/auth/login", json={"username": "wangwj", "password": "Demo@123"}).json()["data"]
+        manager_notices = client.get("/api/notifications", headers={"X-Session": manager_login["token"]}).json()["data"]
+        manager_warning = next(n for n in manager_notices if n["demand_id"] == demand_id and n["title"] == "工时偏差预警")
+        assert manager_warning["is_read"] == 0
+
+
 def test_function_point_amount_uses_hover_breakdown_and_clickable_detail():
     with TestClient(app) as client:
         javascript = client.get("/app.js").text
@@ -58,6 +96,19 @@ def test_function_point_amount_uses_hover_breakdown_and_clickable_detail():
     assert "已向产品经理和项目经理发送工时偏差预警" in javascript
     assert ".calc-tooltip:hover .calc-tooltip-panel" in stylesheet
     assert ".calc-tooltip:focus .calc-tooltip-panel" in stylesheet
+
+
+def test_tapd_detail_hides_unmaintainable_task_and_cost_ledger_sections():
+    with TestClient(app) as client:
+        javascript = client.get("/app.js").text
+
+    assert "需求关联任务信息" not in javascript
+    assert "任务关联花费信息" not in javascript
+    assert "暂无任务回读数据" not in javascript
+    assert "暂无花费回读数据" not in javascript
+    assert "TAPD同步状态" in javascript
+    assert "TAPD状态回读" in javascript
+    assert "hasTapdReadback" in javascript
 
 
 def test_dashboard_skips_and_hides_modules_without_permission(monkeypatch, tmp_path):

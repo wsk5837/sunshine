@@ -234,7 +234,7 @@ def demand_dict(conn, row):
     d["tapd_retry_job"] = row_to_dict(conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? ORDER BY id DESC LIMIT 1", (d["id"],)).fetchone())
     d["tapd_events"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_events WHERE demand_id=? ORDER BY id DESC LIMIT 20", (d["id"],))]
     d["deviation_notification_count"] = conn.execute(
-        "SELECT COUNT(*) c FROM notifications WHERE demand_id=? AND title='工时偏差预警'",
+        "SELECT COUNT(*) c FROM notifications WHERE demand_id=? AND title='工时偏差预警' AND resolved_at IS NULL",
         (d["id"],),
     ).fetchone()["c"]
     return d
@@ -1162,27 +1162,125 @@ def pending_approvals(request: Request, x_role: Optional[str] = Header(None)):
 @app.get("/api/notifications")
 def notifications(request: Request, x_role: Optional[str] = Header(None)):
     roles = request_role_codes(request) or {x_role or "applicant"}
+    auth_user = getattr(request.state, "auth_user", None) or {}
+    user_id = auth_user.get("id")
     with connect() as conn:
         reconcile_work_deviation_notifications(conn)
         if "admin" in roles:
-            rows = conn.execute("SELECT * FROM notifications ORDER BY id DESC LIMIT 50").fetchall()
+            rows = conn.execute(
+                """SELECT n.*,d.demand_no,d.title AS demand_title FROM notifications n
+                   LEFT JOIN demands d ON d.id=n.demand_id ORDER BY n.id DESC LIMIT 120"""
+            ).fetchall()
         else:
             placeholders = ",".join("?" for _ in roles)
             rows = conn.execute(
-                f"SELECT * FROM notifications WHERE target_role IS NULL OR target_role IN ({placeholders}) ORDER BY id DESC LIMIT 50",
+                f"""SELECT n.*,d.demand_no,d.title AS demand_title FROM notifications n
+                    LEFT JOIN demands d ON d.id=n.demand_id
+                    WHERE n.target_role IS NULL OR n.target_role IN ({placeholders})
+                    ORDER BY n.id DESC LIMIT 120""",
                 tuple(roles),
             ).fetchall()
-    return {"code":0,"data":[dict(r) for r in rows]}
+        raw = [dict(r) for r in rows]
+        per_user_reads = set()
+        if user_id and raw:
+            placeholders = ",".join("?" for _ in raw)
+            per_user_reads = {
+                int(row["notification_id"])
+                for row in conn.execute(
+                    f"SELECT notification_id FROM notification_reads WHERE user_id=? AND notification_id IN ({placeholders})",
+                    (user_id, *(item["id"] for item in raw)),
+                )
+            }
+
+    # 同一业务事件会分别投递给不同角色；多角色用户和管理员在消息中心只看一条，
+    # 但保留 recipient_roles 供前端说明真实接收范围。
+    grouped: dict[str, dict[str, Any]] = {}
+    for item in raw:
+        event_key = (item.get("event_key") or "").strip()
+        group_key = event_key or "legacy:" + "|".join(str(item.get(k) or "") for k in (
+            "demand_id", "level", "title", "content", "created_at"
+        ))
+        read = bool(item.get("resolved_at")) or (int(item["id"]) in per_user_reads if user_id else bool(item.get("is_read")))
+        if group_key not in grouped:
+            grouped[group_key] = {
+                **item,
+                "event_key": event_key,
+                "notification_ids": [int(item["id"])],
+                "recipient_roles": [],
+                "recipient_labels": [],
+                "is_read": 1 if read else 0,
+            }
+        else:
+            current = grouped[group_key]
+            current["notification_ids"].append(int(item["id"]))
+            current["is_read"] = 1 if current["is_read"] and read else 0
+            if not current.get("resolved_at") and item.get("resolved_at"):
+                current["resolved_at"] = item["resolved_at"]
+        role = item.get("target_role")
+        role_label = ROLE_LABELS.get(role, "全体用户") if role else "全体用户"
+        if role not in grouped[group_key]["recipient_roles"]:
+            grouped[group_key]["recipient_roles"].append(role)
+            grouped[group_key]["recipient_labels"].append(role_label)
+    return {"code": 0, "data": list(grouped.values())[:50]}
 
 
 @app.post("/api/notifications/{notification_id}/read")
-def mark_notification_read(notification_id: int):
+def mark_notification_read(notification_id: int, request: Request):
+    roles = request_role_codes(request)
+    auth_user = getattr(request.state, "auth_user", None) or {}
+    user_id = auth_user.get("id")
     with connect() as conn:
-        row = conn.execute("SELECT id FROM notifications WHERE id=?", (notification_id,)).fetchone()
+        row = conn.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
         if not row:
             raise BusinessError(404, "REQ-4040", "消息不存在")
-        conn.execute("UPDATE notifications SET is_read=1 WHERE id=?", (notification_id,))
+        if roles and "admin" not in roles and row["target_role"] and row["target_role"] not in roles:
+            raise BusinessError(404, "REQ-4040", "消息不存在")
+        if row["event_key"]:
+            scope_rows = conn.execute("SELECT id,target_role FROM notifications WHERE event_key=?", (row["event_key"],)).fetchall()
+        else:
+            scope_rows = conn.execute(
+                """SELECT id,target_role FROM notifications WHERE demand_id IS ? AND level=? AND title=?
+                   AND content=? AND created_at=?""",
+                (row["demand_id"], row["level"], row["title"], row["content"], row["created_at"]),
+            ).fetchall()
+        visible_ids = [
+            int(item["id"]) for item in scope_rows
+            if not roles or "admin" in roles or not item["target_role"] or item["target_role"] in roles
+        ]
+        if user_id:
+            conn.executemany(
+                "INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at) VALUES (?,?,?)",
+                [(item_id, user_id, now_iso()) for item_id in visible_ids],
+            )
+        else:
+            placeholders = ",".join("?" for _ in visible_ids)
+            conn.execute(f"UPDATE notifications SET is_read=1 WHERE id IN ({placeholders})", visible_ids)
     return {"code": 0, "message": "消息已读"}
+
+
+@app.post("/api/notifications/read-all")
+def mark_all_notifications_read(request: Request, x_role: Optional[str] = Header(None)):
+    roles = request_role_codes(request) or {x_role or "applicant"}
+    auth_user = getattr(request.state, "auth_user", None) or {}
+    user_id = auth_user.get("id")
+    with connect() as conn:
+        if "admin" in roles:
+            rows = conn.execute("SELECT id FROM notifications").fetchall()
+        else:
+            placeholders = ",".join("?" for _ in roles)
+            rows = conn.execute(
+                f"SELECT id FROM notifications WHERE target_role IS NULL OR target_role IN ({placeholders})", tuple(roles)
+            ).fetchall()
+        ids = [int(row["id"]) for row in rows]
+        if user_id:
+            conn.executemany(
+                "INSERT OR IGNORE INTO notification_reads(notification_id,user_id,read_at) VALUES (?,?,?)",
+                [(notification_id, user_id, now_iso()) for notification_id in ids],
+            )
+        elif ids:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(f"UPDATE notifications SET is_read=1 WHERE id IN ({placeholders})", ids)
+    return {"code": 0, "message": "全部消息已标记为已读", "data": {"count": len(ids)}}
 
 
 @app.get("/api/audit")

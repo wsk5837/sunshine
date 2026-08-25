@@ -66,10 +66,10 @@ def _integration_log(conn, code, direction, business_type, business_id, success,
     )
 
 
-def _notification(conn, demand_id, level, title, content, target_role):
+def _notification(conn, demand_id, level, title, content, target_role, event_key=""):
     conn.execute(
-        "INSERT INTO notifications(demand_id,level,title,content,target_role,created_at) VALUES (?,?,?,?,?,?)",
-        (demand_id, level, title, content, target_role, now_iso()),
+        "INSERT INTO notifications(demand_id,level,title,content,target_role,event_key,created_at) VALUES (?,?,?,?,?,?,?)",
+        (demand_id, level, title, content, target_role, event_key, now_iso()),
     )
 
 
@@ -725,31 +725,40 @@ class TapdWebhookPayload(BaseModel):
 def _notify_deviation(conn, demand_id: int, estimated_hours: float, actual_hours: float):
     if estimated_hours <= 0:
         conn.execute(
-            "DELETE FROM notifications WHERE demand_id=? AND title='工时偏差预警' AND is_read=0",
-            (demand_id,),
+            "UPDATE notifications SET resolved_at=COALESCE(resolved_at,?) WHERE demand_id=? AND title IN ('工时偏差预警','工时超支预警') AND resolved_at IS NULL",
+            (now_iso(), demand_id),
         )
         return None
     # “超支”只在实际工时超过预估时成立；实际工时较少不应误报为超时。
     deviation = max(0.0, (actual_hours - estimated_hours) / estimated_hours * 100)
     if deviation > 30:
         content = f"实际工时 {actual_hours:.1f}h，预估工时 {estimated_hours:.1f}h，超支率 {deviation:.1f}% > 30%，请及时处理。"
+        event_key = f"work_deviation:{demand_id}:{estimated_hours:.2f}:{actual_hours:.2f}"
+        # 旧版本的两条角色消息没有事件编号，升级时自动归并到同一业务事件。
         conn.execute(
-            "DELETE FROM notifications WHERE demand_id=? AND title IN ('工时偏差预警','工时超支预警') AND is_read=0 AND content<>?",
-            (demand_id, content),
+            """UPDATE notifications SET event_key=? WHERE demand_id=?
+               AND title IN ('工时偏差预警','工时超支预警') AND content=? AND COALESCE(event_key,'')=''""",
+            (event_key, demand_id, content),
+        )
+        conn.execute(
+            """UPDATE notifications SET resolved_at=COALESCE(resolved_at,?) WHERE demand_id=?
+               AND title IN ('工时偏差预警','工时超支预警') AND COALESCE(event_key,'')<>? AND resolved_at IS NULL""",
+            (now_iso(), demand_id, event_key),
         )
         for role in ("product_manager", "project_manager"):
             exists = conn.execute(
                 """SELECT 1 FROM notifications
-                   WHERE demand_id=? AND title='工时偏差预警' AND target_role=? AND content=?
+                   WHERE event_key=? AND target_role=? AND resolved_at IS NULL
                    LIMIT 1""",
-                (demand_id, role, content),
+                (event_key, role),
             ).fetchone()
             if not exists:
-                _notification(conn, demand_id, "warning", "工时偏差预警", content, role)
+                _notification(conn, demand_id, "warning", "工时偏差预警", content, role, event_key)
     else:
         conn.execute(
-            "DELETE FROM notifications WHERE demand_id=? AND title IN ('工时偏差预警','工时超支预警') AND is_read=0",
-            (demand_id,),
+            """UPDATE notifications SET resolved_at=COALESCE(resolved_at,?) WHERE demand_id=?
+               AND title IN ('工时偏差预警','工时超支预警') AND resolved_at IS NULL""",
+            (now_iso(), demand_id),
         )
     return deviation
 
@@ -760,23 +769,29 @@ def _notify_work_overdue(conn, demand_id: int, due_date: Optional[str], status: 
     overdue = bool(due and not closed and due.date() < _now_dt().date())
     if not overdue:
         conn.execute(
-            "DELETE FROM notifications WHERE demand_id=? AND title='工时计划逾期预警' AND is_read=0",
-            (demand_id,),
+            "UPDATE notifications SET resolved_at=COALESCE(resolved_at,?) WHERE demand_id=? AND title='工时计划逾期预警' AND resolved_at IS NULL",
+            (now_iso(), demand_id),
         )
         return False
     content = f"计划完成日期 {due.date().isoformat()} 已超期，需要更新计划或推动任务闭环。"
+    event_key = f"work_overdue:{demand_id}:{due.date().isoformat()}"
     conn.execute(
-        "DELETE FROM notifications WHERE demand_id=? AND title='工时计划逾期预警' AND is_read=0 AND content<>?",
-        (demand_id, content),
+        """UPDATE notifications SET event_key=? WHERE demand_id=? AND title='工时计划逾期预警'
+           AND content=? AND COALESCE(event_key,'')=''""",
+        (event_key, demand_id, content),
+    )
+    conn.execute(
+        """UPDATE notifications SET resolved_at=COALESCE(resolved_at,?) WHERE demand_id=?
+           AND title='工时计划逾期预警' AND COALESCE(event_key,'')<>? AND resolved_at IS NULL""",
+        (now_iso(), demand_id, event_key),
     )
     for role in ("product_manager", "project_manager"):
         exists = conn.execute(
-            """SELECT 1 FROM notifications WHERE demand_id=? AND title='工时计划逾期预警'
-               AND target_role=? AND content=? LIMIT 1""",
-            (demand_id, role, content),
+            """SELECT 1 FROM notifications WHERE event_key=? AND target_role=? AND resolved_at IS NULL LIMIT 1""",
+            (event_key, role),
         ).fetchone()
         if not exists:
-            _notification(conn, demand_id, "warning", "工时计划逾期预警", content, role)
+            _notification(conn, demand_id, "warning", "工时计划逾期预警", content, role, event_key)
     return True
 
 

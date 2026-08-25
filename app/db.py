@@ -158,6 +158,8 @@ def init_db():
                 content TEXT NOT NULL,
                 target_role TEXT,
                 is_read INTEGER NOT NULL DEFAULT 0,
+                event_key TEXT DEFAULT '',
+                resolved_at TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(demand_id) REFERENCES demands(id) ON DELETE CASCADE
             );
@@ -212,6 +214,15 @@ def init_db():
         alloc_cols = {r[1] for r in conn.execute("PRAGMA table_info(allocations)")}
         if "system_name" not in alloc_cols:
             conn.execute("ALTER TABLE allocations ADD COLUMN system_name TEXT DEFAULT ''")
+
+        notification_cols = {r[1] for r in conn.execute("PRAGMA table_info(notifications)")}
+        if "event_key" not in notification_cols:
+            conn.execute("ALTER TABLE notifications ADD COLUMN event_key TEXT DEFAULT ''")
+        if "resolved_at" not in notification_cols:
+            conn.execute("ALTER TABLE notifications ADD COLUMN resolved_at TEXT")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notifications_event_role ON notifications(event_key,target_role,resolved_at)"
+        )
 
         if conn.execute("SELECT COUNT(*) c FROM function_point_catalog").fetchone()["c"] == 0:
             created = now_iso()
