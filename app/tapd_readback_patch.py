@@ -6,13 +6,7 @@ from .rules import BusinessError, TAPD_STATUS_MAP
 
 
 def tapd_status_to_poc_v5(story: dict, fallback: str = "新") -> str:
-    """Map TAPD status using both display label (v_status) and raw status code.
-
-    TAPD project statuses are dynamic. With ``with_v_status=1`` the API may return
-    e.g. v_status='已实现' and status='resolved'. The old code only inspected
-    v_status, so common states such as '已实现' silently fell back to the previous
-    TRM status even though the raw code was perfectly mappable.
-    """
+    """Map TAPD status using both display label (v_status) and raw status code."""
     values = []
     for key in ("v_status", "status", "step"):
         value = story.get(key)
@@ -22,18 +16,15 @@ def tapd_status_to_poc_v5(story: dict, fallback: str = "新") -> str:
 
     groups = [
         (("已拒绝", "需求终止", "已终止", "rejected", "reject", "cancelled", "canceled", "aborted"), "已拒绝"),
-        (("已关闭", "已完成", "已实现", "已发布", "发布完成", "closed", "done", "resolved", "completed", "released"), "已关闭"),
-        (("已验收", "待发布", "发布中", "待验收", "accepted", "verified", "release", "releasing"), "已验收"),
-        (("测试中", "待测试", "测试", "验证中", "testing", "test", "qa"), "测试中"),
+        (("已关闭", "已完成", "已发布", "发布完成", "closed", "done", "completed", "released"), "已关闭"),
+        (("已验收", "已验证", "待发布", "发布中", "待验收", "accepted", "verified", "release", "releasing"), "已验收"),
+        (("已实现", "测试中", "待测试", "测试", "验证中", "resolved", "testing", "test", "qa"), "测试中"),
         (("开发中", "实现中", "进行中", "处理中", "研发中", "待开发", "developing", "progressing", "in progress", "processing"), "开发中"),
         (("新", "规划中", "待规划", "待排期", "已排期", "已评审", "未开始", "planning", "open", "new", "backlog"), "新"),
     ]
     for keys, mapped in groups:
         if any(str(key).lower() in text for key in keys):
             return mapped
-
-    # Keep a valid previous mapped status for truly custom states that have no
-    # lifecycle semantics we can infer safely.
     return fallback if fallback in TAPD_STATUS_MAP else "新"
 
 
