@@ -20,7 +20,7 @@ SERVER_PORT="${PORT:-8000}"
 SYSTEM_URL="http://127.0.0.1:${SERVER_PORT}"
 
 echo "正在启动 TRM 科技资源管理系统……"
-"$PYTHON_BIN" -m uvicorn app.entry:app --host 127.0.0.1 --port "$SERVER_PORT" &
+"$PYTHON_BIN" -m uvicorn app.runtime:app --host 127.0.0.1 --port "$SERVER_PORT" &
 SERVER_PID=$!
 
 cleanup() {
