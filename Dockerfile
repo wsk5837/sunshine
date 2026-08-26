@@ -7,4 +7,4 @@ COPY app ./app
 COPY data ./data
 COPY uploads ./uploads
 EXPOSE 8000
-CMD ["uvicorn", "app.entry:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.runtime:app", "--host", "0.0.0.0", "--port", "8000"]
