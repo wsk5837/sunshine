@@ -8,10 +8,15 @@ def h(role="project_manager"):
     return {"X-Role": role, "X-User": role}
 
 
-def test_manual_work_plan_logs_recalculate_alerts_and_support_delete(monkeypatch, tmp_path):
+def test_manual_work_plan_logs_require_function_point_and_approval(monkeypatch, tmp_path):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "manual-work-hours.db")
     with TestClient(app) as client:
         demand_id = client.get("/api/demands?page_size=1").json()["data"]["items"][0]["id"]
+        detail = client.get(f"/api/demands/{demand_id}").json()["data"]
+        function_point_id = detail["function_points"][0]["id"]
+        with db.connect() as conn:
+            conn.execute("DELETE FROM demand_work_logs WHERE demand_id=?", (demand_id,))
+            conn.execute("UPDATE demands SET actual_hours=0 WHERE id=?", (demand_id,))
 
         plan = client.put(
             f"/api/demands/{demand_id}/work-plan",
@@ -28,6 +33,7 @@ def test_manual_work_plan_logs_recalculate_alerts_and_support_delete(monkeypatch
                 f"/api/demands/{demand_id}/work-logs",
                 headers=h(),
                 json={
+                    "function_point_id": function_point_id,
                     "work_date": "2026-08-20",
                     "hours": 24,
                     "worker": f"工程师{index + 1}",
@@ -39,17 +45,28 @@ def test_manual_work_plan_logs_recalculate_alerts_and_support_delete(monkeypatch
             log_ids.append(response.json()["data"]["work_logs"][0]["id"])
 
         detail = client.get(f"/api/demands/{demand_id}").json()["data"]
+        assert detail["actual_hours"] == 0
+        assert all(item["approval_status"] == "待审批" for item in detail["work_logs"])
+
+        for work_log_id in log_ids:
+            approved = client.post(
+                f"/api/work-logs/{work_log_id}/approve",
+                headers=h("product_manager"),
+                json={"action": "通过", "comment": "工时与功能点投入匹配"},
+            )
+            assert approved.status_code == 200, approved.text
+
+        detail = client.get(f"/api/demands/{demand_id}").json()["data"]
         assert detail["actual_hours"] == 144
-        assert detail["actual_hours_source"] == "人工登记"
+        assert detail["actual_hours_source"] == "审批工时"
         assert len(detail["work_logs"]) == 6
         assert detail["deviation_notification_count"] == 2
 
-        for work_log_id in log_ids[:2]:
-            deleted = client.delete(f"/api/work-logs/{work_log_id}", headers=h())
-            assert deleted.status_code == 200, deleted.text
+        deleted = client.delete(f"/api/work-logs/{log_ids[0]}", headers=h())
+        assert deleted.status_code == 409
         detail = client.get(f"/api/demands/{demand_id}").json()["data"]
-        assert detail["actual_hours"] == 96
-        assert detail["deviation_notification_count"] == 0
+        assert detail["actual_hours"] == 144
+        assert detail["deviation_notification_count"] == 2
 
 
 def test_tapd_timesheets_are_authoritative_for_actual_hours(monkeypatch, tmp_path):

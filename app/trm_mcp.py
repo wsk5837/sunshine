@@ -28,6 +28,7 @@ from pydantic import Field
 from starlette.responses import JSONResponse, Response
 
 from .auth import AI_CAPABILITY_RULES, AIPrincipal, has_ai_capability, validate_ai_delegation
+from .budget_service import init_budget_and_workflow_db
 from .db import connect, now_iso
 from .poc import reconcile_work_deviation_notifications
 from .rules import BusinessError, DEMAND_TYPES, PRIORITIES, validate_common, validate_description, validate_title
@@ -226,6 +227,8 @@ def _audit_business(
 def init_trm_mcp_db() -> None:
     """Create MCP-specific audit/idempotency tables without duplicating business data."""
     with connect() as conn:
+        # MCP可以独立启动，也必须先具备与页面API相同的工时审批/预算台账字段。
+        init_budget_and_workflow_db(conn)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS mcp_tool_calls (
@@ -391,6 +394,7 @@ def _work_plan_payload(identifier: str, estimated_hours: float, expected_complet
 
 def _work_log_payload(
     identifier: str,
+    function_point_id: int,
     work_date: str,
     hours: float,
     worker: str,
@@ -412,6 +416,12 @@ def _work_log_payload(
         demand = _resolve_demand(conn, identifier)
         if demand["status"] == "已终止":
             raise ValueError("已终止需求不能登记工时")
+        function_point = conn.execute(
+            "SELECT id,fp_no,name,system_name FROM function_points WHERE id=? AND demand_id=?",
+            (function_point_id, demand["id"]),
+        ).fetchone()
+        if not function_point:
+            raise ValueError("所选功能点不属于当前需求")
         manual_count = conn.execute(
             "SELECT COUNT(*) c FROM demand_work_logs WHERE demand_id=?", (demand["id"],)
         ).fetchone()["c"]
@@ -422,6 +432,9 @@ def _work_log_payload(
             "demand_id": int(demand["id"]),
             "demand_no": demand["demand_no"],
             "title": demand["title"],
+            "function_point_id": int(function_point["id"]),
+            "fp_no": function_point["fp_no"],
+            "function_point_name": function_point["name"],
             "work_date": date_value,
             "hours": round(float(hours), 2),
             "worker": worker,
@@ -674,6 +687,7 @@ def trm_update_work_plan(
 def trm_prepare_log_work_hours(
     delegation_token: DelegationToken,
     identifier: Annotated[str, Field(min_length=1, max_length=40, description="需求编号或草稿数字ID")],
+    function_point_id: Annotated[int, Field(gt=0, description="需求下的功能点数字ID，必填")],
     work_date: Annotated[str, Field(description="工时日期 YYYY-MM-DD，不能晚于今天")],
     hours: Annotated[float, Field(gt=0, le=24, description="本次工时，0~24小时")],
     worker: Annotated[str, Field(min_length=1, max_length=100, description="工时登记人")],
@@ -683,7 +697,7 @@ def trm_prepare_log_work_hours(
 ) -> dict[str, Any]:
     principal = _authorize(delegation_token, "manage.work_hours")
     request_id = str(uuid.uuid4())
-    payload = _work_log_payload(identifier, work_date, hours, worker, task_name, description, replace_external)
+    payload = _work_log_payload(identifier, function_point_id, work_date, hours, worker, task_name, description, replace_external)
     warnings = ["确认后将以人工登记汇总替代TAPD实际工时"] if replace_external else []
     result = {
         "operation": "log_work_hours",
@@ -708,6 +722,7 @@ def trm_prepare_log_work_hours(
 def trm_log_work_hours(
     delegation_token: DelegationToken,
     identifier: Annotated[str, Field(min_length=1, max_length=40, description="与预览相同的需求编号或ID")],
+    function_point_id: Annotated[int, Field(gt=0, description="与预览相同的功能点ID")],
     work_date: Annotated[str, Field(description="与预览相同的工时日期")],
     hours: Annotated[float, Field(gt=0, le=24, description="与预览相同的工时")],
     worker: Annotated[str, Field(min_length=1, max_length=100, description="与预览相同的登记人")],
@@ -719,7 +734,7 @@ def trm_log_work_hours(
 ) -> dict[str, Any]:
     principal = _authorize(delegation_token, "manage.work_hours")
     _ensure_write_enabled()
-    payload = _work_log_payload(identifier, work_date, hours, worker, task_name, description, replace_external)
+    payload = _work_log_payload(identifier, function_point_id, work_date, hours, worker, task_name, description, replace_external)
     _verify_confirmation(confirmation_token, "log_work_hours", payload, principal)
     request_hash = _payload_hash("log_work_hours", payload)
     request_id = str(uuid.uuid4())
@@ -743,19 +758,23 @@ def trm_log_work_hours(
         actor = f"{principal.display_name} {principal.username}".strip()
         now = now_iso()
         cur = conn.execute(
-            """INSERT INTO demand_work_logs(demand_id,work_date,hours,worker,task_name,description,source,created_by,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (payload["demand_id"], payload["work_date"], payload["hours"], payload["worker"], payload["task_name"],
-             payload["description"], "AI人工登记", actor, now),
+            """INSERT INTO demand_work_logs
+               (demand_id,function_point_id,work_date,hours,worker,task_name,description,source,created_by,
+                approval_status,submitted_by,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (payload["demand_id"], payload["function_point_id"], payload["work_date"], payload["hours"],
+             payload["worker"], payload["task_name"], payload["description"], "AI人工登记", actor,
+             "待审批", actor, now),
         )
-        actual = float(conn.execute(
-            "SELECT COALESCE(SUM(hours),0) v FROM demand_work_logs WHERE demand_id=?", (payload["demand_id"],)
-        ).fetchone()["v"] or 0)
-        conn.execute(
-            "UPDATE demands SET actual_hours=?,work_hour_source='人工登记',actual_hours_source='人工登记',updated_at=? WHERE id=?",
-            (round(actual, 2), now, payload["demand_id"]),
-        )
-        reconcile_work_deviation_notifications(conn, payload["demand_id"])
+        for target_role in ("product_manager", "project_manager"):
+            conn.execute(
+                """INSERT INTO notifications(demand_id,level,title,content,target_role,event_key,created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (payload["demand_id"], "info", "工时审批待办",
+                 f"{actor}提交了{payload['hours']:.2f}小时工时，功能点{payload['fp_no']}，请审批。",
+                 target_role, f"work_log_pending:{cur.lastrowid}:{target_role}", now),
+            )
+        actual = float(conn.execute("SELECT actual_hours FROM demands WHERE id=?", (payload["demand_id"],)).fetchone()["actual_hours"] or 0)
         result = {
             "created": True,
             "work_log_id": int(cur.lastrowid),
@@ -763,8 +782,11 @@ def trm_log_work_hours(
             "demand_no": payload["demand_no"],
             "hours": payload["hours"],
             "actual_hours_total": round(actual, 2),
-            "actual_hours_source": "人工登记",
-            "message": "实际工时已登记并重新计算预警",
+            "function_point_id": payload["function_point_id"],
+            "fp_no": payload["fp_no"],
+            "approval_status": "待审批",
+            "actual_hours_source": "审批工时",
+            "message": "工时已提交，审批通过后才计入实际工时",
             "idempotent_replay": False,
         }
         conn.execute(
@@ -774,7 +796,9 @@ def trm_log_work_hours(
         _audit_business(conn, action="MCP登记实际工时", object_type="demand_work_log",
                         object_id=cur.lastrowid, demand_id=payload["demand_id"], request_id=request_id,
                         principal=principal, required_permission="manage.work_hours",
-                        details={"hours": payload["hours"], "work_date": payload["work_date"], "worker": payload["worker"], "task_name": payload["task_name"]})
+                        details={"hours": payload["hours"], "work_date": payload["work_date"], "worker": payload["worker"],
+                                 "function_point_id": payload["function_point_id"], "task_name": payload["task_name"],
+                                 "approval_status": "待审批"})
         _audit_tool(conn, tool_name="trm_log_work_hours", operation="create", success=True,
                     request_id=request_id, principal=principal, required_permission="manage.work_hours",
                     idempotency_key=idempotency_key, object_type="demand_work_log", object_id=str(cur.lastrowid),

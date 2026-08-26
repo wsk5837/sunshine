@@ -569,6 +569,12 @@ def budget_detail(budget_id: int):
         d["remaining"] = d["total_budget"] - d["used_budget"]
         d["execution_rate"] = round(d["used_budget"] / d["total_budget"] * 100, 2) if d["total_budget"] else 0
         d["transactions"] = [dict(x) for x in conn.execute("SELECT * FROM budget_transactions WHERE budget_id=? ORDER BY id DESC", (budget_id,))]
+        d["allocations"] = [dict(x) for x in conn.execute(
+            """SELECT a.*,d.demand_no,d.title demand_title,fp.fp_no,fp.name function_point_name
+               FROM allocations a JOIN demands d ON d.id=a.demand_id
+               LEFT JOIN function_points fp ON fp.id=a.function_point_id
+               WHERE a.budget_id=? ORDER BY a.id DESC""", (budget_id,)
+        )]
         d["demands"] = [dict(x) for x in conn.execute("SELECT id,demand_no,title,estimated_amount,status,budget_sources FROM demands ORDER BY id DESC") if d["budget_name"] in (x["budget_sources"] or "")]
         d["projects"] = [dict(x) for x in conn.execute("SELECT id,project_no,name,status,total_budget,progress FROM projects WHERE budget_id=? ORDER BY id DESC", (budget_id,))]
         d["contracts"] = [dict(x) for x in conn.execute("SELECT id,contract_no,name,status,total_amount FROM contracts WHERE budget_id=? ORDER BY id DESC", (budget_id,))]

@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import os
 import uuid
@@ -369,11 +370,13 @@ def tapd_runtime_config(conn):
     base_url = get_setting(conn, "tapd_base_url", os.getenv("TRM_TAPD_BASE_URL", "https://api.tapd.cn")).strip().rstrip("/")
     api_user = os.getenv("TRM_TAPD_API_USER", "").strip()
     api_password = os.getenv("TRM_TAPD_API_PASSWORD", "").strip()
+    webhook_secret = os.getenv("TRM_TAPD_WEBHOOK_SECRET", "").strip()
     return {
         "mode": mode if mode in ("mock", "live") else "mock",
         "workspace_id": workspace_id,
         "base_url": base_url or "https://api.tapd.cn",
         "credentials_ready": bool(api_user and api_password),
+        "webhook_secret_ready": bool(webhook_secret),
         "api_user_masked": (api_user[:2] + "***" + api_user[-2:]) if len(api_user) >= 5 else ("已配置" if api_user else "未配置"),
     }
 
@@ -605,7 +608,7 @@ def create_tapd_requirements(conn, demand_id: int, request_id: str = ""):
             tapd_id = str(story.get("id") or "")
             if not tapd_id:
                 raise BusinessError(502, "TAPD-5020", "TAPD创建需求成功响应中缺少需求ID")
-            tapd_url = ""
+            tapd_url = f"https://www.tapd.cn/{cfg['workspace_id']}/prong/stories/view/{tapd_id}"
             tapd_status = _tapd_status_to_poc(story, "新")
         else:
             tapd_id = f"TAPD-{datetime.now().strftime('%Y%m%d')}-{demand_id:05d}-{idx:02d}"
@@ -626,6 +629,57 @@ def create_tapd_requirements(conn, demand_id: int, request_id: str = ""):
         (first["tapd_id"], first["tapd_url"], first["tapd_status"], now_iso(), now_iso(), demand_id),
     )
     return created
+
+
+def push_demand_update_to_tapd(conn, demand_id: int, request_id: str = ""):
+    """把TRM中已维护的需求和工时计划回写到已建立的TAPD需求。"""
+    cfg = _tapd_live_ready(conn)
+    demand = conn.execute("SELECT * FROM demands WHERE id=?", (demand_id,)).fetchone()
+    if not demand:
+        raise BusinessError(404, "REQ-4040", "需求不存在")
+    requirements = list(conn.execute(
+        "SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id", (demand_id,)
+    ))
+    if not requirements:
+        raise BusinessError(409, "REQ-4091", "尚未创建TAPD需求，无法回写")
+    updated = []
+    for requirement in requirements:
+        system_name = requirement["system_name"] or "默认系统"
+        payload = _tapd_payload(conn, demand_id, system_name, requirement["allocation_id"])
+        post_data = {
+            "id": requirement["tapd_id"],
+            "workspace_id": cfg["workspace_id"],
+            "name": payload["标题"],
+            "description": f"{payload['描述']}\n\n[TRM外部ID] {payload['外部ID']}\n[归属系统] {system_name}",
+            "priority_label": payload["优先级"],
+        }
+        if demand["expected_completion_date"]:
+            post_data["due"] = demand["expected_completion_date"]
+        if float(demand["estimated_hours"] or 0) > 0:
+            post_data["effort"] = round(float(demand["estimated_hours"]), 2)
+        body = _tapd_request(conn, "POST", "/stories", data=post_data)
+        response_data = body.get("data", {}) if isinstance(body, dict) else {}
+        story = response_data.get("Story", response_data) if isinstance(response_data, dict) else {}
+        tapd_status = _tapd_status_to_poc(story, requirement["tapd_status"] or "新")
+        url = requirement["tapd_url"] or f"https://www.tapd.cn/{cfg['workspace_id']}/prong/stories/view/{requirement['tapd_id']}"
+        conn.execute(
+            """UPDATE tapd_requirements SET tapd_url=?,tapd_status=?,sync_status='成功',payload_json=?,last_sync_at=?
+               WHERE id=?""",
+            (url, tapd_status, json.dumps(post_data, ensure_ascii=False), now_iso(), requirement["id"]),
+        )
+        _integration_log(conn, "tapd", "out", "update_requirement", requirement["tapd_id"], True,
+                         "TRM需求和工时计划已回写TAPD", request_id)
+        updated.append({"tapd_id": requirement["tapd_id"], "tapd_status": tapd_status, "tapd_url": url})
+    conn.execute(
+        """UPDATE demands SET tapd_sync_status='成功',tapd_last_sync_at=?,last_sync_source='TRM回写',
+           tapd_url=COALESCE(NULLIF(tapd_url,''),?),updated_at=? WHERE id=?""",
+        (now_iso(), updated[0]["tapd_url"], now_iso(), demand_id),
+    )
+    conn.execute(
+        "INSERT INTO tapd_sync_runs(demand_id,source,changed_count,success,message,created_at) VALUES (?,?,?,?,?,?)",
+        (demand_id, "TRM回写", len(updated), 1, f"已更新TAPD需求{len(updated)}条", now_iso()),
+    )
+    return updated
 
 def schedule_tapd_retry(conn, demand_id: int, request_id: str = ""):
     existing = conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? AND status='等待重试' ORDER BY id DESC LIMIT 1", (demand_id,)).fetchone()
@@ -1098,8 +1152,17 @@ def run_poc_jobs(force: bool = Query(False), x_role: Optional[str] = Header(None
 
 
 @router.post("/tapd/webhook")
-def tapd_webhook(payload: TapdWebhookPayload, request: Request):
+def tapd_webhook(payload: TapdWebhookPayload, request: Request, token: str = Query(""),
+                 x_tapd_webhook_secret: Optional[str] = Header(None, alias="X-TAPD-Webhook-Secret")):
     with connect() as conn:
+        cfg = tapd_runtime_config(conn)
+        if cfg["mode"] == "live":
+            expected = os.getenv("TRM_TAPD_WEBHOOK_SECRET", "").strip()
+            supplied = (x_tapd_webhook_secret or token or "").strip()
+            if not expected:
+                raise BusinessError(503, "TAPD-5030", "Live模式未配置TRM_TAPD_WEBHOOK_SECRET，已拒绝无校验Webhook")
+            if not supplied or not hmac.compare_digest(supplied, expected):
+                raise BusinessError(401, "AUTH-4010", "TAPD Webhook校验失败")
         demand = None
         if payload.tapd_id:
             demand = conn.execute(
@@ -1112,6 +1175,23 @@ def tapd_webhook(payload: TapdWebhookPayload, request: Request):
             raise BusinessError(404, "REQ-4040", "Webhook未找到对应需求")
         result = apply_tapd_payload(conn, demand["id"], payload, "Webhook", getattr(request.state, "request_id", ""))
         return {"code": 0, "message": "Webhook回读成功", "data": result}
+
+
+@router.post("/demands/{demand_id}/tapd/push-update")
+def tapd_push_update(demand_id: int, request: Request,
+                     x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
+    actor, role = _actor(x_user, x_role)
+    with connect() as conn:
+        records = push_demand_update_to_tapd(
+            conn, demand_id, getattr(request.state, "request_id", "")
+        )
+        conn.execute(
+            """INSERT INTO audit_logs(actor,role,action,object_type,object_id,result,request_id,details,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (actor, role, "回写TAPD需求", "demand", str(demand_id), "成功",
+             getattr(request.state, "request_id", ""), json.dumps({"count": len(records)}, ensure_ascii=False), now_iso()),
+        )
+        return {"code": 0, "message": f"已将TRM最新信息回写到TAPD（{len(records)}条）", "data": records}
 
 
 @router.get("/budget-execution-trend")

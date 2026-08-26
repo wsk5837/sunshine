@@ -15,6 +15,18 @@ services:
         value: /tmp/trm_system.db
       - key: TRM_UPLOAD_DIR
         value: /tmp/trm_uploads
+      - key: TRM_TAPD_MODE
+        value: live
+      - key: TRM_TAPD_WORKSPACE_ID
+        sync: false
+      - key: TRM_TAPD_BASE_URL
+        value: https://api.tapd.cn
+      - key: TRM_TAPD_API_USER
+        sync: false
+      - key: TRM_TAPD_API_PASSWORD
+        sync: false
+      - key: TRM_TAPD_WEBHOOK_SECRET
+        sync: false
       - key: TRM_MCP_API_TOKEN
         sync: false
       - key: TRM_MCP_WRITE_ENABLED

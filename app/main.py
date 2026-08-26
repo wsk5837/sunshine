@@ -37,12 +37,19 @@ from .auth import (
     request_role_codes,
 )
 from .ai_gateway import AIServiceError, public_ai_config, run_agent_message
+from .budget_service import (
+    init_budget_and_workflow_db,
+    recalculate_demand_allocation_amounts,
+    recalculate_approved_work_hours,
+    release_demand_allocations,
+    reserve_demand_allocations,
+)
 from .trm_mcp import init_trm_mcp_db, mcp_asgi_app, public_mcp_status
 from .poc import (
     router as poc_router, init_poc_db, background_worker, create_oa_task, complete_oa_task,
     previous_nodes_for, create_tapd_requirements, schedule_tapd_retry, apply_tapd_payload,
     build_mock_sync_payload, build_live_sync_payload, tapd_runtime_config, get_setting,
-    reconcile_work_deviation_notifications,
+    reconcile_work_deviation_notifications, push_demand_update_to_tapd,
 )
 from .rules import (
     APPROVAL_FLOW,
@@ -76,6 +83,8 @@ async def lifespan(_app: FastAPI):
     init_v4_db()
     init_auth_db()
     init_poc_db()
+    with connect() as conn:
+        init_budget_and_workflow_db(conn)
     init_trm_mcp_db()
     # 启动时为旧版已有工时数据补齐真实的定向预警消息。
     with connect() as conn:
@@ -104,7 +113,9 @@ app.mount("/mcp", mcp_asgi_app, name="trm-mcp")
 @app.middleware("http")
 async def auth_session_middleware(request: Request, call_next):
     path = request.url.path
-    public = path == "/" or path.startswith("/static/") or path in {"/api/health", "/api/auth/login"}
+    public = path == "/" or path.startswith("/static/") or path in {
+        "/api/health", "/api/auth/login", "/api/tapd/webhook"
+    }
     if not public and path.startswith("/api/"):
         token = request.headers.get("X-Session", "")
         session_user = resolve_session(token) if token else None
@@ -228,7 +239,9 @@ def demand_dict(conn, row):
     d["tapd_tasks"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_tasks WHERE demand_id=? ORDER BY id", (d["id"],))]
     d["tapd_costs"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_costs WHERE demand_id=? ORDER BY id", (d["id"],))]
     d["work_logs"] = [dict(r) for r in conn.execute(
-        "SELECT * FROM demand_work_logs WHERE demand_id=? ORDER BY work_date DESC,id DESC", (d["id"],)
+        """SELECT wl.*,fp.fp_no,fp.name function_point_name,fp.system_name function_point_system
+           FROM demand_work_logs wl LEFT JOIN function_points fp ON fp.id=wl.function_point_id
+           WHERE wl.demand_id=? ORDER BY wl.work_date DESC,wl.id DESC""", (d["id"],)
     )]
     d["tapd_sync_runs"] = [dict(r) for r in conn.execute("SELECT * FROM tapd_sync_runs WHERE demand_id=? ORDER BY id DESC LIMIT 20", (d["id"],))]
     d["tapd_retry_job"] = row_to_dict(conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? ORDER BY id DESC LIMIT 1", (d["id"],)).fetchone())
@@ -337,6 +350,7 @@ class WorkPlanPayload(BaseModel):
 
 
 class WorkLogPayload(BaseModel):
+    function_point_id: int = Field(gt=0)
     work_date: str
     hours: float = Field(gt=0, le=24)
     worker: str = Field(min_length=1, max_length=100)
@@ -680,7 +694,17 @@ def save_work_plan(demand_id: int, payload: WorkPlanPayload, request: Request,
               details={"estimated_hours": payload.estimated_hours, "expected_completion_date": due_date, "note": payload.note})
         reconcile_work_deviation_notifications(conn, demand_id)
         data = demand_dict(conn, get_demand_or_404(conn, demand_id))
-    return {"code": 0, "message": "工时计划已更新", "data": data}
+    sync_message = ""
+    if data.get("tapd_id"):
+        try:
+            with connect() as conn:
+                if tapd_runtime_config(conn)["mode"] == "live":
+                    push_demand_update_to_tapd(conn, demand_id, getattr(request.state, "request_id", ""))
+                    sync_message = "，已同步回写TAPD"
+        except BusinessError as exc:
+            # 本地计划已保存，上游短暂失败不回滚用户的有效输入；同步中心可手动重试。
+            sync_message = f"；TAPD回写未完成：{exc.message}"
+    return {"code": 0, "message": "工时计划已更新" + sync_message, "data": data}
 
 
 @app.post("/api/demands/{demand_id}/work-logs")
@@ -695,6 +719,12 @@ def create_work_log(demand_id: int, payload: WorkLogPayload, request: Request,
         demand = get_demand_or_404(conn, demand_id)
         if demand["status"] in ("已终止",):
             raise BusinessError(409, "REQ-4091", "已终止需求不能登记工时")
+        function_point = conn.execute(
+            "SELECT id,fp_no,name,system_name FROM function_points WHERE id=? AND demand_id=?",
+            (payload.function_point_id, demand_id),
+        ).fetchone()
+        if not function_point:
+            raise BusinessError(422, "REQ-4001", "所选功能点不属于当前需求")
         manual_count = conn.execute(
             "SELECT COUNT(*) c FROM demand_work_logs WHERE demand_id=?", (demand_id,)
         ).fetchone()["c"]
@@ -705,23 +735,69 @@ def create_work_log(demand_id: int, payload: WorkLogPayload, request: Request,
                 {"requires_replace_external": True},
             )
         cur = conn.execute(
-            """INSERT INTO demand_work_logs(demand_id,work_date,hours,worker,task_name,description,source,created_by,created_at)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (demand_id, work_date, round(payload.hours, 2), worker, payload.task_name.strip(),
-             payload.description.strip(), "人工登记", actor, now_iso()),
-        )
-        actual = conn.execute(
-            "SELECT COALESCE(SUM(hours),0) v FROM demand_work_logs WHERE demand_id=?", (demand_id,)
-        ).fetchone()["v"]
-        conn.execute(
-            "UPDATE demands SET actual_hours=?,work_hour_source='人工登记',actual_hours_source='人工登记',updated_at=? WHERE id=?",
-            (round(float(actual or 0), 2), now_iso(), demand_id),
+            """INSERT INTO demand_work_logs
+               (demand_id,function_point_id,work_date,hours,worker,task_name,description,source,created_by,
+                approval_status,submitted_by,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (demand_id, payload.function_point_id, work_date, round(payload.hours, 2), worker,
+             payload.task_name.strip(), payload.description.strip(), "人工登记", actor,
+             "待审批", actor, now_iso()),
         )
         audit(conn, request, actor, role, "登记实际工时", "demand_work_log", cur.lastrowid, demand_id=demand_id,
-              details={"work_date": work_date, "hours": payload.hours, "worker": worker, "task_name": payload.task_name})
-        reconcile_work_deviation_notifications(conn, demand_id)
+              details={"work_date": work_date, "hours": payload.hours, "worker": worker,
+                       "task_name": payload.task_name, "function_point_id": payload.function_point_id,
+                       "approval_status": "待审批"})
+        for target_role in ("product_manager", "project_manager"):
+            create_notification(
+                conn, demand_id, "info", "工时审批待办",
+                f"{worker}提交{payload.hours:.2f}小时，关联功能点{function_point['fp_no']}，请审批。",
+                target_role,
+            )
         data = demand_dict(conn, get_demand_or_404(conn, demand_id))
-    return {"code": 0, "message": "实际工时已登记并重新计算预警", "data": data}
+    return {"code": 0, "message": "工时已提交审批，审批通过后计入实际工时", "data": data}
+
+
+@app.get("/api/work-hours/pending")
+def pending_work_hours(request: Request):
+    if not request_has_role(request, "product_manager", "project_manager"):
+        raise BusinessError(403, "AUTH-4030", "仅产品经理或项目经理可审批工时")
+    with connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            """SELECT wl.*,d.demand_no,d.title demand_title,fp.fp_no,fp.name function_point_name,
+                      fp.system_name function_point_system
+               FROM demand_work_logs wl JOIN demands d ON d.id=wl.demand_id
+               LEFT JOIN function_points fp ON fp.id=wl.function_point_id
+               WHERE wl.approval_status='待审批' ORDER BY wl.created_at"""
+        )]
+    return {"code": 0, "data": rows}
+
+
+@app.post("/api/work-logs/{work_log_id}/approve")
+def approve_work_log(work_log_id: int, payload: ApprovalPayload, request: Request,
+                     x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None)):
+    if not request_has_role(request, "product_manager", "project_manager"):
+        raise BusinessError(403, "AUTH-4030", "仅产品经理或项目经理可审批工时")
+    action = payload.action.strip()
+    if action not in ("通过", "驳回"):
+        raise BusinessError(400, "REQ-4001", "审批动作仅支持通过或驳回")
+    actor, role = actor_context(x_user, x_role)
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM demand_work_logs WHERE id=?", (work_log_id,)).fetchone()
+        if not row:
+            raise BusinessError(404, "REQ-4040", "工时记录不存在")
+        if row["approval_status"] != "待审批":
+            raise BusinessError(409, "REQ-4091", "该工时已处理，请勿重复审批")
+        status = "已通过" if action == "通过" else "已驳回"
+        conn.execute(
+            "UPDATE demand_work_logs SET approval_status=?,approver=?,approval_comment=?,approved_at=? WHERE id=?",
+            (status, actor, payload.comment.strip(), now_iso(), work_log_id),
+        )
+        actual = recalculate_approved_work_hours(conn, int(row["demand_id"]))
+        audit(conn, request, actor, role, f"工时审批{action}", "demand_work_log", work_log_id,
+              demand_id=row["demand_id"], details={"status": status, "comment": payload.comment, "actual_hours": actual})
+        reconcile_work_deviation_notifications(conn, int(row["demand_id"]))
+        data = demand_dict(conn, get_demand_or_404(conn, int(row["demand_id"])))
+    return {"code": 0, "message": f"工时已{action}", "data": data}
 
 
 @app.delete("/api/work-logs/{work_log_id}")
@@ -732,20 +808,16 @@ def delete_work_log(work_log_id: int, request: Request,
         row = conn.execute("SELECT * FROM demand_work_logs WHERE id=?", (work_log_id,)).fetchone()
         if not row:
             raise BusinessError(404, "REQ-4040", "工时记录不存在")
+        if row["approval_status"] == "已通过":
+            raise BusinessError(409, "REQ-4091", "已审批通过的工时不能直接删除，请通过冲销流程更正")
         demand_id = int(row["demand_id"])
         conn.execute("DELETE FROM demand_work_logs WHERE id=?", (work_log_id,))
-        actual = conn.execute(
-            "SELECT COALESCE(SUM(hours),0) v FROM demand_work_logs WHERE demand_id=?", (demand_id,)
-        ).fetchone()["v"]
-        conn.execute(
-            "UPDATE demands SET actual_hours=?,work_hour_source='人工登记',actual_hours_source='人工登记',updated_at=? WHERE id=?",
-            (round(float(actual or 0), 2), now_iso(), demand_id),
-        )
+        actual = recalculate_approved_work_hours(conn, demand_id)
         audit(conn, request, actor, role, "删除工时记录", "demand_work_log", work_log_id, demand_id=demand_id,
               details={"hours": row["hours"], "worker": row["worker"]})
         reconcile_work_deviation_notifications(conn, demand_id)
         data = demand_dict(conn, get_demand_or_404(conn, demand_id))
-    return {"code": 0, "message": "工时记录已删除并重新汇总", "data": data}
+    return {"code": 0, "message": "未生效工时记录已删除", "data": data}
 
 
 @app.post("/api/demands/{demand_id}/attachments")
@@ -1025,7 +1097,12 @@ def save_allocations(demand_id: int, payload: AllocationPayload, request: Reques
         raise BusinessError(422, "BUD-4221", "分摊比例必须为0~100%，且所有行合计不超过100%", {"sum": total_ratio})
     with connect() as conn:
         d = demand_dict(conn, get_demand_or_404(conn, demand_id))
-        valid_budgets = {r["budget_name"] for r in conn.execute("SELECT budget_name FROM budgets")}
+        occupied = conn.execute(
+            "SELECT COUNT(*) c FROM allocations WHERE demand_id=? AND ledger_status='已占用'", (demand_id,)
+        ).fetchone()["c"]
+        if occupied:
+            raise BusinessError(409, "BUD-4090", "费用分摊已经财务审批并占用预算，需退回释放后才能调整")
+        valid_budgets = {r["budget_name"]: int(r["id"]) for r in conn.execute("SELECT id,budget_name FROM budgets")}
         for i, r in enumerate(payload.rows, start=1):
             if not r.expense_subject.strip() or not r.expense_source.strip() or not r.department.strip():
                 raise BusinessError(422, "BUD-4221", f"第{i}行费用主体、费用出处、费用归属部门均为必填项")
@@ -1036,10 +1113,14 @@ def save_allocations(demand_id: int, payload: AllocationPayload, request: Reques
         for r in payload.rows:
             amount = round(amount_base * r.ratio / 100, 2)
             conn.execute(
-                """INSERT INTO allocations(demand_id,function_point_id,system_name,expense_subject,expense_source,ratio,amount,department,created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                (demand_id, r.function_point_id, r.system_name, r.expense_subject, r.expense_source, round(r.ratio,2), amount, r.department, now_iso()),
+                """INSERT INTO allocations
+                   (demand_id,function_point_id,system_name,expense_subject,expense_source,ratio,amount,department,
+                    budget_id,ledger_status,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (demand_id, r.function_point_id, r.system_name, r.expense_subject, r.expense_source,
+                 round(r.ratio,2), amount, r.department, valid_budgets[r.expense_source], "待占用", now_iso()),
             )
+        recalculate_demand_allocation_amounts(conn, demand_id)
         audit(conn, request, actor, role, "保存费用分摊", "allocation", demand_id, demand_id=demand_id, details={"total_ratio": total_ratio})
         data = demand_dict(conn, get_demand_or_404(conn, demand_id))
     return {"code": 0, "message": "费用分摊已保存", "data": data}
@@ -1079,17 +1160,29 @@ def approve(demand_id: int, payload: ApprovalPayload, request: Request, x_user: 
             if fp_count == 0:
                 raise BusinessError(400, "REQ-4002", "产品经理审批通过前至少需完成一个功能点评估")
             ratio = conn.execute("SELECT COALESCE(SUM(ratio),0) s FROM allocations WHERE demand_id=?", (demand_id,)).fetchone()["s"]
-            if ratio > 100.00001:
-                raise BusinessError(422, "BUD-4221", "费用分摊比例合计不能超过100%")
+            if abs(float(ratio or 0) - 100) > 0.01:
+                raise BusinessError(422, "BUD-4221", f"产品经理审批通过前，费用分摊必须合计100%，当前为{float(ratio or 0):.2f}%")
+            recalculate_demand_allocation_amounts(conn, demand_id)
 
         if node == "财务审批" and action == "通过":
-            snap = budget_snapshot(conn, d)
-            if not snap or not snap["sufficient"]:
-                raise BusinessError(422, "BUD-4220", "预算不足，无法通过财务审批", snap)
-            if snap["warning"] and not payload.comment.strip():
+            allocation_budgets = list(conn.execute(
+                """SELECT b.id,b.budget_name,b.total_budget,b.used_budget,SUM(a.amount) allocation_amount
+                   FROM allocations a JOIN budgets b ON b.id=COALESCE(a.budget_id,
+                     (SELECT id FROM budgets WHERE budget_name=a.expense_source LIMIT 1))
+                   WHERE a.demand_id=? AND a.ledger_status<>'已占用'
+                   GROUP BY b.id,b.budget_name,b.total_budget,b.used_budget""", (demand_id,)
+            ))
+            projected_warning = any(
+                float(row["total_budget"] or 0) > 0 and
+                (float(row["used_budget"] or 0) + float(row["allocation_amount"] or 0)) /
+                float(row["total_budget"] or 1) >= 0.95
+                for row in allocation_budgets
+            )
+            if projected_warning and not payload.comment.strip():
                 raise BusinessError(400, "REQ-4002", "当前预算执行率已达到或超过95%，财务审批意见必须填写")
-            if snap["warning"]:
-                create_notification(conn, demand_id, "warning", "预算执行率预警", f"当前预算执行率为 {snap['execution_rate']}%，已达到95%预警阈值。", "finance")
+            reservation = reserve_demand_allocations(conn, demand_id, actor)
+            if projected_warning:
+                create_notification(conn, demand_id, "warning", "预算执行率预警", "该需求分摊占用后，关联预算执行率已达到或超过95%。", "finance")
             next_node = "分管总审批" if float(d["estimated_amount"] or d["budget_amount"] or 0) > 50_000 else "终审"
 
         request_id = getattr(request.state, "request_id", "")
@@ -1109,6 +1202,7 @@ def approve(demand_id: int, payload: ApprovalPayload, request: Request, x_user: 
         complete_oa_task(conn, demand_id, node, action, request_id)
 
         if action == "驳回":
+            release_result = release_demand_allocations(conn, demand_id, actor, f"{node}驳回释放需求预算占用")
             if return_to == "需求申请":
                 conn.execute("UPDATE demands SET status='已驳回',current_node='已驳回',oa_sync_status='已回退',updated_at=? WHERE id=?", (now_iso(), demand_id))
             else:
@@ -1120,7 +1214,10 @@ def approve(demand_id: int, payload: ApprovalPayload, request: Request, x_user: 
             conn.execute("UPDATE demands SET status=?,current_node=?,oa_sync_status='已推送',updated_at=? WHERE id=?", (next_node, next_node, now_iso(), demand_id))
             create_oa_task(conn, demand_id, next_node, request_id)
         audit(conn, request, actor, role, f"审批{action}", "demand", demand_id, demand_id=demand_id,
-              details={"node": node, "comment": payload.comment, "return_to": return_to or None, "oaTodo": action == "通过" and node != "终审"})
+              details={"node": node, "comment": payload.comment, "return_to": return_to or None,
+                       "oaTodo": action == "通过" and node != "终审",
+                       "budgetReservation": reservation if node == "财务审批" and action == "通过" else None,
+                       "budgetRelease": release_result if action == "驳回" else None})
 
     # 终审通过后自动推送 TAPD。
     if node == "终审" and action == "通过":

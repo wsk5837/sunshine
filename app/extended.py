@@ -781,15 +781,18 @@ def create_budget(payload:BudgetPayload,request:Request,x_user:Optional[str]=Hea
     actor,role=_actor(x_user,x_role)
     _validate_budget_payload(payload)
     with connect() as conn:
-        no=payload.budget_no or _next_no(conn,'budgets','budget_no',f'BUD-{payload.year}-'); cur=conn.execute("""INSERT INTO budgets(budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year) VALUES (?,?,?,?,?,?,?,?,?)""",(no,payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year)); bid=cur.lastrowid; _audit(conn,request,actor,role,'创建预算','budget',bid); return {'code':0,'message':'预算已创建','data':{'id':bid,'budget_no':no}}
+        no=payload.budget_no or _next_no(conn,'budgets','budget_no',f'BUD-{payload.year}-'); cur=conn.execute("""INSERT INTO budgets(budget_no,budget_name,total_budget,used_budget,internal_total,internal_used,digital_total,digital_used,year) VALUES (?,?,?,?,?,?,?,?,?)""",(no,payload.budget_name,payload.total_budget,0,payload.internal_total,0,payload.digital_total,0,payload.year)); bid=cur.lastrowid; _audit(conn,request,actor,role,'创建预算','budget',bid); return {'code':0,'message':'预算已创建','data':{'id':bid,'budget_no':no}}
 
 @router.put('/budgets/{budget_id}')
 def update_budget(budget_id:int,payload:BudgetPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)
     _validate_budget_payload(payload)
     with connect() as conn:
-        if not conn.execute('SELECT id FROM budgets WHERE id=?',(budget_id,)).fetchone(): raise BusinessError(404,'REQ-4040','预算不存在')
-        conn.execute("""UPDATE budgets SET budget_name=?,total_budget=?,used_budget=?,internal_total=?,internal_used=?,digital_total=?,digital_used=?,year=? WHERE id=?""",(payload.budget_name,payload.total_budget,payload.used_budget,payload.internal_total,payload.internal_used,payload.digital_total,payload.digital_used,payload.year,budget_id)); _audit(conn,request,actor,role,'更新预算','budget',budget_id); return {'code':0,'message':'预算已更新'}
+        current=conn.execute('SELECT * FROM budgets WHERE id=?',(budget_id,)).fetchone()
+        if not current: raise BusinessError(404,'REQ-4040','预算不存在')
+        if payload.total_budget < float(current['used_budget'] or 0):
+            raise BusinessError(422,'BUD-4221','总预算不能低于已有占用/支出金额')
+        conn.execute("""UPDATE budgets SET budget_name=?,total_budget=?,internal_total=?,digital_total=?,year=? WHERE id=?""",(payload.budget_name,payload.total_budget,payload.internal_total,payload.digital_total,payload.year,budget_id)); _audit(conn,request,actor,role,'更新预算','budget',budget_id); return {'code':0,'message':'预算已更新；已使用金额仅由预算流水和费用分摊更新'}
 
 @router.post('/budgets/{budget_id}/transactions')
 def budget_transaction(budget_id:int,payload:BudgetTxnPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
@@ -819,6 +822,85 @@ def budget_transaction(budget_id:int,payload:BudgetTxnPayload,request:Request,x_
                             DO UPDATE SET used_amount=excluded.used_amount,total_budget=excluded.total_budget,recorded_at=excluded.recorded_at''',(budget_id,dep,pt,period,used,total,now_iso()))
         _audit(conn,request,actor,role,'登记预算流水','budget_transaction',cur.lastrowid)
         return {'code':0,'message':'预算流水已登记','data':{'used_budget':used,'total_budget':total}}
+
+
+@router.get('/budget-allocations')
+def budget_allocations():
+    """预算中心的费用分摊台账。
+
+    返回的 ledger_status 来自真实预算占用流程，不是前端推算状态。
+    """
+    with connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            """SELECT a.id,a.demand_id,a.function_point_id,a.system_name,a.expense_subject,
+                      a.expense_source,a.ratio,a.amount,a.department,a.budget_id,a.ledger_status,
+                      a.occupied_at,a.released_at,a.created_at,d.demand_no,d.title demand_title,
+                      d.status demand_status,fp.fp_no,fp.name function_point_name,b.budget_no,b.budget_name
+               FROM allocations a
+               JOIN demands d ON d.id=a.demand_id
+               LEFT JOIN function_points fp ON fp.id=a.function_point_id
+               LEFT JOIN budgets b ON b.id=a.budget_id
+               ORDER BY a.id DESC"""
+        )]
+        return {'code': 0, 'data': rows}
+
+
+@router.get('/budget-project-overview')
+def budget_project_overview():
+    """将项目的人力和财务口径统一到预算中心。"""
+    with connect() as conn:
+        projects = []
+        for row in conn.execute(
+            """SELECT p.*,b.budget_no,b.budget_name,b.total_budget budget_total,
+                      b.used_budget budget_used
+               FROM projects p LEFT JOIN budgets b ON b.id=p.budget_id
+               ORDER BY p.updated_at DESC"""
+        ):
+            item = dict(row)
+            budget_id = item.get('budget_id')
+            demand_ids = []
+            if budget_id:
+                demand_ids = [int(r['demand_id']) for r in conn.execute(
+                    "SELECT DISTINCT demand_id FROM allocations WHERE budget_id=?", (budget_id,)
+                )]
+            if demand_ids:
+                placeholders = ','.join('?' for _ in demand_ids)
+                hours = conn.execute(
+                    f"""SELECT COALESCE(SUM(estimated_hours),0) estimated,
+                                COALESCE(SUM(actual_hours),0) actual
+                         FROM demands WHERE id IN ({placeholders})""", demand_ids
+                ).fetchone()
+                pending_hours = conn.execute(
+                    f"""SELECT COALESCE(SUM(hours),0) value FROM demand_work_logs
+                         WHERE demand_id IN ({placeholders}) AND approval_status='待审批'""", demand_ids
+                ).fetchone()['value']
+            else:
+                hours = {'estimated': 0, 'actual': 0}
+                pending_hours = 0
+            contracts = conn.execute(
+                "SELECT COUNT(*) count,COALESCE(SUM(total_amount),0) amount FROM contracts WHERE project_id=?",
+                (item['id'],),
+            ).fetchone()
+            settlements = conn.execute(
+                "SELECT COUNT(*) count,COALESCE(SUM(amount),0) amount FROM settlements WHERE project_id=?",
+                (item['id'],),
+            ).fetchone()
+            total = float(item.get('budget_total') or 0)
+            used = float(item.get('budget_used') or 0)
+            item.update({
+                'demand_count': len(demand_ids),
+                'estimated_hours': round(float(hours['estimated'] or 0), 2),
+                'approved_hours': round(float(hours['actual'] or 0), 2),
+                'pending_hours': round(float(pending_hours or 0), 2),
+                'contract_count': int(contracts['count'] or 0),
+                'contract_amount': round(float(contracts['amount'] or 0), 2),
+                'settlement_count': int(settlements['count'] or 0),
+                'settlement_amount': round(float(settlements['amount'] or 0), 2),
+                'budget_remaining': round(total - used, 2),
+                'execution_rate': round(used / total * 100, 2) if total else 0,
+            })
+            projects.append(item)
+        return {'code': 0, 'data': projects}
 
 @router.get('/business-values')
 def list_values():
