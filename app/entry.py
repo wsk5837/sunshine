@@ -130,6 +130,48 @@ def multi_budget_snapshot(conn, demand):
 core.budget_snapshot = multi_budget_snapshot
 
 
+def _schedule_real_tapd_retry(conn, demand_id: int, request_id: str, error: str):
+    existing = conn.execute("SELECT * FROM tapd_retry_jobs WHERE demand_id=? AND status='等待重试' ORDER BY id DESC LIMIT 1", (demand_id,)).fetchone()
+    if existing:
+        conn.execute("UPDATE tapd_retry_jobs SET force_fail=0,last_error=?,updated_at=? WHERE id=?", (error[:1000], now_iso(), existing['id']))
+        return dict(existing)
+    job = poc.schedule_tapd_retry(conn, demand_id, request_id)
+    conn.execute("UPDATE tapd_retry_jobs SET force_fail=0,last_error=?,updated_at=? WHERE id=?", (error[:1000], now_iso(), job['id']))
+    return dict(conn.execute("SELECT * FROM tapd_retry_jobs WHERE id=?", (job['id'],)).fetchone())
+
+
+def push_tapd_v5(demand_id: int, request: Request, simulate_failure: bool = False, x_user: Optional[str] = Header(None), x_role: Optional[str] = Header(None), automatic: bool = False):
+    actor, role = core.actor_context(x_user, x_role)
+    with connect() as conn:
+        d = core.demand_dict(conn, core.get_demand_or_404(conn, demand_id))
+        if d['status'] not in ('审批通过','TAPD同步失败','TAPD同步重试中','已创建','开发中','测试中','待发布','已完成'):
+            raise BusinessError(409, 'REQ-4091', '当前状态不允许创建TAPD需求')
+        existing_count = conn.execute("SELECT COUNT(*) c FROM tapd_requirements WHERE demand_id=?", (demand_id,)).fetchone()['c']
+        if existing_count or d.get('tapd_id'):
+            raise BusinessError(409, 'REQ-4090', '该REQ编号已创建TAPD需求，请勿重复推送', {'tapdId': d.get('tapd_id')})
+        request_id = getattr(request.state, 'request_id', '')
+        if simulate_failure:
+            job = poc.schedule_tapd_retry(conn, demand_id, request_id)
+            core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '等待重试', demand_id, {'attempt':1,'next_retry_at':job.get('next_retry_at'),'automatic':automatic})
+            return {'code':0,'message':'第1次TAPD调用失败，已进入自动重试队列','data':core.demand_dict(conn, core.get_demand_or_404(conn,demand_id))}
+        try:
+            records = poc.create_tapd_requirements(conn, demand_id, request_id)
+        except BusinessError as exc:
+            job = _schedule_real_tapd_retry(conn, demand_id, request_id, exc.message)
+            core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '等待重试', demand_id, {'error':exc.message,'next_retry_at':job.get('next_retry_at'),'automatic':automatic})
+            return {'code':0,'message':f'终审已完成，但TAPD创建失败，已进入自动重试：{exc.message}','data':core.demand_dict(conn, core.get_demand_or_404(conn,demand_id))}
+        except Exception as exc:
+            message = str(exc) or 'TAPD调用失败'
+            job = _schedule_real_tapd_retry(conn, demand_id, request_id, message)
+            core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '等待重试', demand_id, {'error':message,'next_retry_at':job.get('next_retry_at'),'automatic':automatic})
+            return {'code':0,'message':f'终审已完成，但TAPD创建失败，已进入自动重试：{message}','data':core.demand_dict(conn, core.get_demand_or_404(conn,demand_id))}
+        core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '成功', demand_id, {'automatic':automatic,'count':len(records),'strategy':poc.get_setting(conn,'tapd_split_strategy','system')})
+        data = core.demand_dict(conn, core.get_demand_or_404(conn,demand_id))
+    return {'code':0,'message':('终审通过，已自动创建TAPD需求' if automatic else 'TAPD需求创建成功')+f'（共{len(records)}条）','data':data}
+
+core.push_tapd = push_tapd_v5
+
+
 def _remove_route(path, method=None):
     keep = []
     for route in app.router.routes:
@@ -139,6 +181,9 @@ def _remove_route(path, method=None):
             keep.append(route)
     app.router.routes[:] = keep
 
+
+_remove_route("/api/demands/{demand_id}/tapd/push", "POST")
+app.post("/api/demands/{demand_id}/tapd/push")(push_tapd_v5)
 
 _remove_route("/", "GET")
 @app.get("/", response_class=HTMLResponse)
