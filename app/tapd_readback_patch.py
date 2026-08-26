@@ -6,7 +6,19 @@ from .rules import BusinessError, TAPD_STATUS_MAP
 
 
 def tapd_status_to_poc_v5(story: dict, fallback: str = "新") -> str:
-    """Map TAPD status using both display label (v_status) and raw status code."""
+    """Map TAPD status using project display status first, then generic status codes."""
+    # The current TAPD project uses the workflow: 待处理 -> 进行中 -> 完成.
+    # Match the display value exactly first so a custom TAPD workflow does not
+    # silently fall back to the previous TRM status.
+    display_status = str(story.get("v_status") or "").strip()
+    exact_display_map = {
+        "待处理": "新",
+        "进行中": "开发中",
+        "完成": "已关闭",
+    }
+    if display_status in exact_display_map:
+        return exact_display_map[display_status]
+
     values = []
     for key in ("v_status", "status", "step"):
         value = story.get(key)
@@ -19,8 +31,8 @@ def tapd_status_to_poc_v5(story: dict, fallback: str = "新") -> str:
         (("已关闭", "已完成", "已发布", "发布完成", "closed", "done", "completed", "released"), "已关闭"),
         (("已验收", "已验证", "待发布", "发布中", "待验收", "accepted", "verified", "release", "releasing"), "已验收"),
         (("已实现", "测试中", "待测试", "测试", "验证中", "resolved", "testing", "test", "qa"), "测试中"),
-        (("开发中", "实现中", "进行中", "处理中", "研发中", "待开发", "developing", "progressing", "in progress", "processing"), "开发中"),
-        (("新", "规划中", "待规划", "待排期", "已排期", "已评审", "未开始", "planning", "open", "new", "backlog"), "新"),
+        (("开发中", "实现中", "进行中", "处理中", "研发中", "待开发", "developing", "progressing", "in progress", "processing", "doing"), "开发中"),
+        (("待处理", "新", "规划中", "待规划", "待排期", "已排期", "已评审", "未开始", "planning", "open", "new", "backlog", "pending", "todo"), "新"),
     ]
     for keys, mapped in groups:
         if any(str(key).lower() in text for key in keys):
