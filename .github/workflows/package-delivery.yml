@@ -1,0 +1,40 @@
+name: Validate and package delivery
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m compileall -q app
+      - name: Check JavaScript
+        run: node --check app/static/app.js && node --check app/static/v5_fixes.js
+      - name: Run tests
+        run: pytest -q
+      - name: Package repository
+        if: always()
+        run: |
+          rm -rf delivery
+          mkdir -p delivery/sunshine
+          rsync -a --exclude='.git' --exclude='.github/workflows/package-delivery.yml' --exclude='__pycache__' --exclude='*.pyc' ./ delivery/sunshine/
+          cd delivery
+          zip -r ../sunshine-final.zip sunshine >/dev/null
+      - name: Upload delivery
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunshine-final
+          path: sunshine-final.zip
+          if-no-files-found: error
