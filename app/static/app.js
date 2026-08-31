@@ -1177,6 +1177,7 @@ async function renderRoute() {
   const route = parseRoute();
   const [base, id] = route.path.split('/');
   document.body.classList.toggle('indicator-board-mode', base === 'indicator-board');
+  document.body.classList.toggle('investment-mode', base.startsWith('investment-'));
   if (!canAccessRoute(base)) {
     const fallback = defaultAccessibleRoute(base);
     heroActions.innerHTML = '';

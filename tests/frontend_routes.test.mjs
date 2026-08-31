@@ -77,3 +77,60 @@ test('loaded classic script defines all investment page functions and dispatches
     assert.deepEqual(errors, []);
   }
 });
+
+test('workbench filters combine keyword, year, department and status', () => {
+  const context = vm.createContext({});
+  vm.runInContext(moduleSource, context);
+  const rows = [
+    {id:1,plan_year:2026,department:'数字化部',status:'已生效',plan_name:'AI服务'},
+    {id:2,plan_year:2027,department:'数字化部',status:'草稿',plan_name:'AI规划'},
+    {id:3,plan_year:2026,department:'财务部',status:'已生效',plan_name:'AI核算'},
+  ];
+  assert.deepEqual(context.invFilterRows(rows,'ai',{plan_year:'2026',department:'数字化部',status:'已生效'}).map(r=>r.id),[1]);
+  assert.equal(context.invFilterRows(rows,'不存在',{}).length,0);
+  assert.equal(context.invFilterRows(rows,'',{plan_year:'',department:''}).length,3);
+});
+
+test('CSV export escapes formulas and quotes while retaining numeric values', () => {
+  const context = vm.createContext({});
+  vm.runInContext(moduleSource, context);
+  assert.equal(context.invCsvCell('=HYPERLINK("example")'), '"\'=HYPERLINK(""example"")"');
+  assert.equal(context.invCsvCell('+SUM(1,2)'), '"\'+SUM(1,2)"');
+  assert.equal(context.invCsvCell(-100), '"-100"');
+  assert.equal(context.invCsvCell('投入,名称'), '"投入,名称"');
+});
+
+test('investment markup consistently opts into the shared table layout', () => {
+  assert.doesNotMatch(moduleSource, /<table>/);
+  assert.match(moduleSource, /class="table inv-table"/);
+  const css = readFileSync(new URL('../app/static/investment.css', import.meta.url),'utf8');
+  assert.match(css, /\.inv-table\s*\{[^}]*width:\s*100%/);
+  assert.match(css, /\.inv-rule-save\s*\{[^}]*grid-column:\s*1\/-1/);
+  assert.match(css, /\.investment-mode \.btn[^}]*white-space:\s*nowrap/);
+  assert.match(appSource, /classList.toggle\('investment-mode', base.startsWith\('investment-'\)\)/);
+});
+
+test('KPI cards appear only on the analysis board, never on workflows or dialogs', () => {
+  const context = vm.createContext({});
+  vm.runInContext(moduleSource, context);
+  assert.equal((moduleSource.match(/invKpis\(/g) || []).length, 2, 'one definition plus one board call');
+  assert.match(context.renderInvestmentBoard.toString(), /invKpis\(/);
+  for (const name of ['renderInvestmentPlans','renderInvestmentPlanDetail','renderInvestmentApprovals',
+    'renderInvestmentAdjustments','renderInvestmentExecution','renderInvestmentWarnings',
+    'renderInvestmentSettings','openInvestmentAdjustmentDetail','openInvestmentPaymentHistory']) {
+    assert.doesNotMatch(context[name].toString(), /invKpis\(/, name);
+  }
+  assert.match(context.renderInvestmentApprovals.toString(), /role="tablist"/);
+  assert.match(context.renderInvestmentExecution.toString(), /summary:list/);
+  assert.match(context.invTable.toString(), /summary\(filtered\)/);
+});
+
+test('compact detail facts escape both labels and values', () => {
+  const context = vm.createContext({esc:value=>String(value).replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;')});
+  vm.runInContext(moduleSource, context);
+  const html = context.invFacts([['<label>','<script>'],['金额','¥1,000.00']]);
+  assert.match(html, /<dl class="inv-facts">/);
+  assert.match(html, /&lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>|investment-kpi/);
+  assert.match(html, /¥1,000.00/);
+});

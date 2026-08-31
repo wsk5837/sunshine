@@ -398,7 +398,11 @@ def permissions_for_api(method: str, path: str) -> tuple[str, ...]:
     if path.startswith("/api/investments/payments"):
         return ("investment.finance", "investment.execute")
     if path.startswith("/api/investments/adjustments"):
-        return ("investment.adjust", "investment.approve")
+        if method == "GET":
+            return ("investment.view",)
+        return ("investment.approve",) if path.endswith("/approve") else ("investment.adjust",)
+    if path.startswith("/api/investments/warnings") and method != "GET":
+        return ("investment.execute", "investment.finance", "investment.config")
     if path.startswith("/api/investments/items"):
         return ("investment.execute", "investment.create") if method != "GET" else ("investment.view",)
     if path.startswith("/api/investments/plans"):

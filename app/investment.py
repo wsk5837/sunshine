@@ -71,6 +71,7 @@ class ItemPayload(BaseModel):
 class ApprovalPayload(BaseModel):
     action: str = "通过"
     comment: str = Field(default="", max_length=1000)
+    reviewed_amounts: dict[int, float] = Field(default_factory=dict)
 
 
 class BatchApprovalPayload(ApprovalPayload):
@@ -426,8 +427,12 @@ def _plan_dict(conn, row, detail=False) -> dict:
 
 def _insert_warning(conn, event_key, plan_id, item_id, rule_code, level, title, content, active_keys):
     active_keys.add(event_key)
-    existing = conn.execute("SELECT id,status FROM investment_warnings WHERE event_key=?", (event_key,)).fetchone()
+    existing = conn.execute("SELECT * FROM investment_warnings WHERE event_key=?", (event_key,)).fetchone()
     if existing:
+        # An acknowledgement remains acknowledged while the same risk persists.
+        # Reopen only on a changed risk or a recurrence after recovery.
+        if existing["status"] == "已处理" and existing["content"] == content and existing["level"] == level:
+            return
         conn.execute(
             "UPDATE investment_warnings SET level=?,title=?,content=?,status='待处理',resolved_at=NULL WHERE id=?",
             (level, title, content, existing["id"]),
@@ -445,7 +450,7 @@ def refresh_investment_warnings(conn):
     active_keys = set()
     today = date.today()
     rows = conn.execute(
-        """SELECT i.*,p.plan_no,p.plan_year,p.status plan_status FROM investment_items i
+        """SELECT i.*,p.plan_no,p.plan_year,p.finance_confirmed_at,p.status plan_status FROM investment_items i
            JOIN investment_plans p ON p.id=i.plan_id WHERE p.status='已生效' AND i.status!='已取消'"""
     ).fetchall()
     for row in rows:
@@ -468,7 +473,7 @@ def refresh_investment_warnings(conn):
                 pass
         if "long_unexecuted" in rules and not used:
             try:
-                created_days = (today - date.fromisoformat(str(row["created_at"])[:10])).days
+                created_days = (today - date.fromisoformat(str(row["finance_confirmed_at"] or row["created_at"])[:10])).days
                 r = rules["long_unexecuted"]
                 if created_days >= r["days_value"]:
                     _insert_warning(conn, f"long_unexecuted:{row['id']}", row["plan_id"], row["id"], r["code"], r["level"], "投入项长期未执行", f"{row['item_no']} {row['item_name']}生效后{created_days}天仍无核销。", active_keys)
@@ -480,7 +485,7 @@ def refresh_investment_warnings(conn):
             r = rules["payment_deviation"]
             if deviation > r["threshold_value"]:
                 _insert_warning(conn, f"payment_deviation:{row['id']}", row["plan_id"], row["id"], r["code"], r["level"], "付款进度偏离计划", f"{row['item_no']}计划付款占比{planned:.1f}%，实际核销{rate:.1f}%，偏差{deviation:.1f}%。", active_keys)
-    open_rows = conn.execute("SELECT id,event_key FROM investment_warnings WHERE status='待处理'").fetchall()
+    open_rows = conn.execute("SELECT id,event_key FROM investment_warnings WHERE status IN ('待处理','已处理')").fetchall()
     for warning in open_rows:
         if warning["event_key"] not in active_keys:
             conn.execute("UPDATE investment_warnings SET status='已恢复',resolved_at=? WHERE id=?", (now_iso(), warning["id"]))
@@ -534,6 +539,20 @@ def list_plans(year: Optional[int] = None, status: str = "", keyword: str = ""):
         rows = conn.execute(f"SELECT * FROM investment_plans WHERE {' AND '.join(where)} ORDER BY plan_year DESC,id DESC", params).fetchall()
         data = [_plan_dict(conn, row) for row in rows]
     return {"code": 0, "data": data}
+
+
+@router.get("/reference")
+def investment_reference(plan_year: int, department: str):
+    """Historical investment ledgers only; never manufacture a reference value."""
+    result = {}
+    with connect() as conn:
+        for key, year in (("prior", plan_year - 2), ("current", plan_year - 1)):
+            row = conn.execute("""SELECT COUNT(DISTINCT p.id) plan_count,
+                COALESCE(SUM(i.approved_amount),0) budget,COALESCE(SUM(i.written_off_amount),0) actual
+                FROM investment_plans p LEFT JOIN investment_items i ON i.plan_id=p.id
+                WHERE p.status='已生效' AND p.plan_year=? AND p.department=?""", (year, department)).fetchone()
+            result[key] = {"year": year, **dict(row)}
+    return {"code": 0, "data": result}
 
 
 @router.post("/plans")
@@ -677,12 +696,30 @@ def submit_plan(plan_id: int):
     return {"code": 0, "message": "投入计划已提交审批"}
 
 
+def _review_amounts(conn, plan_id: int, amounts: dict[int, float]):
+    import math
+    updates = []
+    for item_id, amount in amounts.items():
+        item = conn.execute("SELECT application_amount,written_off_amount FROM investment_items WHERE id=? AND plan_id=?", (item_id, plan_id)).fetchone()
+        if not item or not math.isfinite(amount) or amount < 0 or amount > float(item["application_amount"]):
+            raise BusinessError(422, "INV-4220", "核定金额须介于0和申请金额之间，且明细必须属于当前计划")
+        if amount < float(item["written_off_amount"] or 0):
+            raise BusinessError(422, "INV-4220", "核定金额不能小于已核销金额")
+        updates.append((round(amount, 2), now_iso(), item_id))
+    for values in updates:
+        conn.execute("UPDATE investment_items SET approved_amount=?,updated_at=? WHERE id=?", values)
+    if updates:
+        _sync_plan_totals(conn, plan_id)
+
+
 def _approve_plan(conn, plan_id: int, payload: ApprovalPayload, request: Request):
     plan = conn.execute("SELECT * FROM investment_plans WHERE id=?", (plan_id,)).fetchone()
     if not plan: raise BusinessError(404, "INV-4040", "投入计划不存在")
     if plan["status"] != "审批中" or plan["current_node"] not in PLAN_NODES: raise BusinessError(409, "INV-4091", "投入计划不在可审批节点")
     if payload.action not in ("通过", "驳回"): raise BusinessError(400, "INV-4001", "审批动作仅支持通过或驳回")
     _require_role(request, *PLAN_ROLES[plan["current_node"]])
+    if payload.action == "通过":
+        _review_amounts(conn, plan_id, payload.reviewed_amounts)
     actor, role = _actor(request); ts = now_iso(); node = plan["current_node"]
     conn.execute("INSERT INTO investment_approvals(plan_id,node,role,approver,action,comment,created_at) VALUES(?,?,?,?,?,?,?)", (plan_id, node, role, actor, payload.action, payload.comment, ts))
     if payload.action == "驳回":
@@ -715,9 +752,11 @@ def approve_plan(plan_id: int, payload: ApprovalPayload, request: Request):
 
 @router.post("/approvals/batch")
 def batch_approve(payload: BatchApprovalPayload, request: Request):
+    if payload.reviewed_amounts and len(payload.ids) != 1:
+        raise BusinessError(422, "INV-4220", "逐项核定金额时请单独处理一条计划")
     succeeded, failed = [], []
     with connect() as conn:
-        for plan_id in payload.ids:
+        for plan_id in dict.fromkeys(payload.ids):
             try: _approve_plan(conn, plan_id, payload, request); succeeded.append(plan_id)
             except BusinessError as exc: failed.append({"id": plan_id, "message": exc.message})
     return {"code": 0, "message": f"批量处理完成：成功{len(succeeded)}条，失败{len(failed)}条", "data": {"succeeded": succeeded, "failed": failed}}
@@ -727,12 +766,16 @@ def batch_approve(payload: BatchApprovalPayload, request: Request):
 def finance_confirm_batch(payload: BatchApprovalPayload, request: Request):
     _require_role(request, "finance", "admin")
     if payload.action not in ("通过", "驳回"): raise BusinessError(400, "INV-4001", "财务确认仅支持通过或驳回")
+    if payload.reviewed_amounts and len(payload.ids) != 1:
+        raise BusinessError(422, "INV-4220", "逐项核定金额时请单独处理一条计划")
     succeeded, failed, ts = [], [], now_iso()
     with connect() as conn:
         actor, role = _actor(request)
-        for plan_id in payload.ids:
+        for plan_id in dict.fromkeys(payload.ids):
             plan = conn.execute("SELECT * FROM investment_plans WHERE id=?", (plan_id,)).fetchone()
             if not plan or plan["status"] != "待财务确认": failed.append({"id": plan_id, "message": "非待财务确认状态"}); continue
+            if payload.action == "通过":
+                _review_amounts(conn, plan_id, payload.reviewed_amounts)
             status = "已生效" if payload.action == "通过" else "已驳回"
             node = "已生效" if payload.action == "通过" else "申请人修改"
             conn.execute("UPDATE investment_plans SET status=?,current_node=?,finance_confirmed_at=?,updated_at=? WHERE id=?", (status, node, ts if status == "已生效" else None, ts, plan_id))
@@ -792,6 +835,35 @@ def create_adjustment(payload: AdjustmentPayload, request: Request):
     return {"code": 0, "message": "调整申请已创建", "data": {"id": cur.lastrowid, "adjustment_no": no}}
 
 
+@router.get("/adjustments/{adjustment_id}")
+def get_adjustment(adjustment_id: int):
+    with connect() as conn:
+        row = conn.execute("""SELECT a.*,p.plan_no,p.plan_name,i.item_no,i.item_name
+            FROM investment_adjustments a JOIN investment_plans p ON p.id=a.plan_id
+            JOIN investment_items i ON i.id=a.item_id WHERE a.id=?""", (adjustment_id,)).fetchone()
+        if not row: raise BusinessError(404, "INV-4040", "调整申请不存在")
+        data = dict(row)
+        data["approvals"] = [dict(r) for r in conn.execute("SELECT * FROM investment_adjustment_approvals WHERE adjustment_id=? ORDER BY id", (adjustment_id,))]
+    return {"code": 0, "data": data}
+
+
+@router.put("/adjustments/{adjustment_id}")
+def update_adjustment(adjustment_id: int, payload: AdjustmentPayload):
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM investment_adjustments WHERE id=?", (adjustment_id,)).fetchone()
+        if not row: raise BusinessError(404, "INV-4040", "调整申请不存在")
+        if row["status"] not in ("草稿", "已驳回"): raise BusinessError(409, "INV-4091", "只能编辑草稿或被驳回的调整申请")
+        if payload.plan_id != row["plan_id"] or payload.item_id != row["item_id"]:
+            raise BusinessError(422, "INV-4220", "调整申请不能更换关联投入项")
+        item = conn.execute("SELECT * FROM investment_items WHERE id=?", (row["item_id"],)).fetchone()
+        if payload.requested_amount < float(item["written_off_amount"] or 0): raise BusinessError(422, "INV-4220", "调整后金额不能小于已核销金额")
+        conn.execute("""UPDATE investment_adjustments SET adjustment_type=?,original_amount=?,requested_amount=?,amount_delta=?,
+            scope_before=?,scope_after=?,reason=?,updated_at=? WHERE id=?""",
+            (payload.adjustment_type, item["approved_amount"], payload.requested_amount, payload.requested_amount-float(item["approved_amount"]),
+             item["business_purpose"], payload.scope_after, payload.reason, now_iso(), adjustment_id))
+    return {"code": 0, "message": "调整申请已保存", "data": {"id": adjustment_id}}
+
+
 @router.post("/adjustments/{adjustment_id}/submit")
 def submit_adjustment(adjustment_id: int):
     with connect() as conn:
@@ -816,6 +888,12 @@ def approve_adjustment(adjustment_id: int, payload: ApprovalPayload, request: Re
         elif node == "部门负责人审批": status, next_node = "审批中", "财务审批"
         elif node == "财务审批" and abs(float(row["amount_delta"])) > 50000: status, next_node = "审批中", "分管领导审批"
         else: status, next_node = "已生效", "已生效"
+        if status == "已生效":
+            item = conn.execute("SELECT approved_amount,written_off_amount,business_purpose FROM investment_items WHERE id=?", (row["item_id"],)).fetchone()
+            if float(item["approved_amount"]) != float(row["original_amount"]) or item["business_purpose"] != row["scope_before"]:
+                raise BusinessError(409, "INV-4091", "投入基线已变化，请驳回后重新核对并提交调整")
+            if float(row["requested_amount"]) < float(item["written_off_amount"] or 0):
+                raise BusinessError(422, "INV-4220", "调整后金额低于最新已核销金额，请重新核对")
         conn.execute("UPDATE investment_adjustments SET status=?,current_node=?,approved_at=?,updated_at=? WHERE id=?", (status, next_node, ts if status == "已生效" else None, ts, adjustment_id))
         if status == "已生效":
             conn.execute("""UPDATE investment_items SET approved_amount=?,business_purpose=CASE WHEN ?='' THEN business_purpose ELSE ? END,
