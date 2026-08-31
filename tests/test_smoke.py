@@ -11,12 +11,15 @@ def test_health_and_meta():
 def test_root_page_assets_load():
     with TestClient(app) as client:
         page = client.get('/')
-        css = client.get('/app.css')
-        js = client.get('/app.js')
+        css = client.get('/static/app.css')
+        js = client.get('/static/app.js')
         assert page.status_code == 200
-        assert './app.css' in page.text and './app.js' in page.text
+        assert './static/app.css' in page.text and './static/app.js' in page.text
         assert css.status_code == 200 and css.headers['content-type'].startswith('text/css')
-        assert js.status_code == 200 and 'application/javascript' in js.headers['content-type']
+        assert js.status_code == 200 and js.headers['content-type'].split(';')[0] in {'application/javascript', 'text/javascript'}
+        # Preserve the aliases for clients that still have the previous HTML.
+        assert client.get('/app.css').content == css.content
+        assert client.get('/app.js').content == js.content
 
 
 def test_list_demands():
@@ -24,4 +27,3 @@ def test_list_demands():
         result = client.get('/api/demands').json()
         assert result['code'] == 0
         assert result['data']['total'] >= 1
-

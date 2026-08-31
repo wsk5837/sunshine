@@ -1162,6 +1162,17 @@ async function init() {
 }
 
 
+// Resolve optional-module functions only after selecting their route. A failed
+// module download must not break the route table for the rest of the system.
+async function renderInvestmentRoute(rendererName, ...args) {
+  const renderer = window[rendererName];
+  if (typeof renderer === 'function') return await renderer(...args);
+
+  setPage({title: '投入管理', iconName: 'grid', crumbs: ['投入管理']});
+  appView.innerHTML = `<div class="empty"><p>投入管理暂未加载，请重新加载后再试。</p><button class="btn primary" id="investmentReload">重新加载</button></div>`;
+  $('#investmentReload').addEventListener('click', () => window.location.reload());
+}
+
 async function renderRoute() {
   const route = parseRoute();
   const [base, id] = route.path.split('/');
@@ -1190,14 +1201,14 @@ async function renderRoute() {
       'budget-allocation': renderBudgetAllocation,
       'budget-manpower': renderBudgetManpower,
       'budget-finance': renderBudgetFinance,
-      'investment-board': renderInvestmentBoard,
-      'investment-plans': renderInvestmentPlans,
-      'investment-plan-detail': () => renderInvestmentPlanDetail(Number(id)),
-      'investment-approvals': renderInvestmentApprovals,
-      'investment-adjustments': renderInvestmentAdjustments,
-      'investment-execution': renderInvestmentExecution,
-      'investment-warnings': renderInvestmentWarnings,
-      'investment-settings': renderInvestmentSettings,
+      'investment-board': () => renderInvestmentRoute('renderInvestmentBoard'),
+      'investment-plans': () => renderInvestmentRoute('renderInvestmentPlans'),
+      'investment-plan-detail': () => renderInvestmentRoute('renderInvestmentPlanDetail', Number(id)),
+      'investment-approvals': () => renderInvestmentRoute('renderInvestmentApprovals'),
+      'investment-adjustments': () => renderInvestmentRoute('renderInvestmentAdjustments'),
+      'investment-execution': () => renderInvestmentRoute('renderInvestmentExecution'),
+      'investment-warnings': () => renderInvestmentRoute('renderInvestmentWarnings'),
+      'investment-settings': () => renderInvestmentRoute('renderInvestmentSettings'),
       'initiative-form': renderInitiativeForm,
       'initiative-list': renderInitiativeList,
       'initiative-detail': () => renderInitiativeDetail(Number(id)),

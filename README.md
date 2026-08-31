@@ -1,4 +1,6 @@
-# TRM 科技资源管理系统 V5.1（数字化投入管理版）
+# TRM 科技资源管理系统 V5.1.1（数字化投入管理修正版）
+
+已有 V5.1 部署的更新步骤见 [V5.1.1_修复与更新说明.md](V5.1.1_修复与更新说明.md)。本次修复首页与投入模块资源加载问题，无需调整数据库或环境变量。
 
 > 本试点版支持 SQLite 本地运行与 Neon PostgreSQL 云端持久化。Render + Neon 的部署步骤见 [NEON_RENDER_DEPLOY.md](NEON_RENDER_DEPLOY.md)。
 

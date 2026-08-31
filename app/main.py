@@ -104,7 +104,7 @@ async def lifespan(_app: FastAPI):
                 pass
 
 
-app = FastAPI(title="TRM 科技资源管理系统", version="5.1.0", description="科技资源、需求全生命周期与数字化投入一体化管理系统", lifespan=lifespan)
+app = FastAPI(title="TRM 科技资源管理系统", version="5.1.1", description="科技资源、需求全生命周期与数字化投入一体化管理系统", lifespan=lifespan)
 app.include_router(extended_router)
 app.include_router(v4_router)
 app.include_router(auth_router)
