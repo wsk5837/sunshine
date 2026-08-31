@@ -4,8 +4,9 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="light" />
-  <title>TRM 科技资源管理系统 - 需求全生命周期管理</title>
-  <link rel="stylesheet" href="./app.css?v=4.9.1" />
+  <title>TRM 科技资源管理系统 - 数字化投入与需求全生命周期管理</title>
+  <link rel="stylesheet" href="./app.css?v=5.1.0" />
+  <link rel="stylesheet" href="./investment.css?v=5.1.0" />
 </head>
 <body>
   <svg class="svg-sprite" aria-hidden="true">
@@ -44,7 +45,7 @@
     <div class="login-panel">
       <div class="login-brand"><span class="brand-chip">TRM</span><div><strong>科技资源管理系统</strong><small>Technology Resource Management</small></div></div>
       <div class="login-card">
-        <h1>欢迎登录</h1><p>统一管理立项、需求、预算、项目、合同、结算与研发协同</p>
+        <h1>欢迎登录</h1><p>统一管理数字化投入、立项、需求、预算、项目、合同、结算与研发协同</p>
         <label>账号</label><div class="login-field"><svg><use href="#i-user"></use></svg><input id="loginUsername" autocomplete="username" placeholder="请输入账号"></div>
         <label>密码</label><div class="login-field"><svg><use href="#i-settings"></use></svg><input id="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码"></div>
         <div class="login-error hidden" id="loginError"></div>
@@ -88,6 +89,8 @@
         <button class="nav-item" type="button" data-route="project360" data-permission="project360"><svg class="nav-icon"><use href="#i-360"></use></svg><span>项目360视图–机器人</span></button>
         <button class="nav-item" type="button" data-route="value" data-permission="value"><svg class="nav-icon"><use href="#i-grid"></use></svg><span>业务价值总览</span></button>
         <div class="nav-group" data-group="budget"><button class="nav-item group-title" type="button" data-group-toggle="budget"><svg class="nav-icon"><use href="#i-budget"></use></svg><span>预算管理</span><svg class="nav-end-icon group-chevron"><use href="#i-chevron"></use></svg></button><div class="nav-submenu"><div><button class="nav-sub" data-route="budget" data-permission="budget"><span class="sub-dot"></span><span>预算总览</span></button><button class="nav-sub" data-route="budget-allocation" data-permission="budget"><span class="sub-dot"></span><span>费用分摊台账</span></button><button class="nav-sub" data-route="budget-manpower" data-permission="budget"><span class="sub-dot"></span><span>项目概览（人力）</span></button><button class="nav-sub" data-route="budget-finance" data-permission="budget"><span class="sub-dot"></span><span>项目概览（财务）</span></button></div></div></div>
+
+        <div class="nav-group" data-group="investment"><button class="nav-item group-title" type="button" data-group-toggle="investment"><svg class="nav-icon"><use href="#i-grid"></use></svg><span>投入管理</span><svg class="nav-end-icon group-chevron"><use href="#i-chevron"></use></svg></button><div class="nav-submenu"><div><button class="nav-sub" data-route="investment-board" data-permission="investment.view"><span class="sub-dot"></span><span>投入分析驾驶舱</span></button><button class="nav-sub" data-route="investment-plans" data-permission="investment.view"><span class="sub-dot"></span><span>投入计划编制</span></button><button class="nav-sub" data-route="investment-approvals" data-permission="investment.approve"><span class="sub-dot"></span><span>投入审批与财务确认</span></button><button class="nav-sub" data-route="investment-adjustments" data-permission="investment.view"><span class="sub-dot"></span><span>投入调整</span></button><button class="nav-sub" data-route="investment-execution" data-permission="investment.view"><span class="sub-dot"></span><span>执行跟踪与核销</span></button><button class="nav-sub" data-route="investment-warnings" data-permission="investment.view"><span class="sub-dot"></span><span>投入预警中心</span></button><button class="nav-sub" data-route="investment-settings" data-permission="investment.config"><span class="sub-dot"></span><span>分类与预警配置</span></button></div></div></div>
 
         <div class="nav-group" data-group="initiative"><button class="nav-item group-title" type="button" data-group-toggle="initiative"><svg class="nav-icon"><use href="#i-send"></use></svg><span>立项管理</span><svg class="nav-end-icon group-chevron"><use href="#i-chevron"></use></svg></button><div class="nav-submenu"><div><button class="nav-sub" data-route="initiative-list" data-permission="initiative.list"><span class="sub-dot"></span><span>立项列表</span></button><button class="nav-sub" data-route="initiative-approvals" data-permission="initiative.approve"><span class="sub-dot"></span><span>立项审批</span></button></div></div></div>
 
@@ -148,6 +151,22 @@
     <div class="modal" id="modalBox" role="dialog" aria-modal="true" aria-labelledby="modalTitle"></div>
   </div>
   <div class="toast-wrap" id="toastWrap" aria-live="polite"></div>
-  <script src="./app.js?v=4.9.1"></script>
+  <script>
+    (() => {
+      const basePath = window.location.pathname.startsWith('/TRM/') ? '/TRM' : '';
+      window.__TRM_BASE_PATH__ = basePath;
+      if (!basePath) return;
+
+      const nativeFetch = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        if (typeof input === 'string' && input.startsWith('/') && !input.startsWith('//')) {
+          input = basePath + input;
+        }
+        return nativeFetch(input, init);
+      };
+    })();
+  </script>
+  <script src="./investment.js?v=5.1.0"></script>
+  <script src="./app.js?v=5.1.0"></script>
 </body>
 </html>

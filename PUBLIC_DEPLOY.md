@@ -1,4 +1,4 @@
-# 科技资源管理系统 V4.4 公网部署说明
+# 科技资源管理系统 V4.9 公网部署说明
 
 本版本在 V4.3 功能基础上增加了公网部署配置。部署完成后，访问者无需安装 Python、PyCharm 或数据库，只需在浏览器输入公网地址即可打开系统。
 
@@ -6,11 +6,11 @@
 
 项目根目录已经提供：
 
-- `render.yaml`：免费演示配置
-- `render-persistent.yaml`：带持久化磁盘的长期运行配置
-- `.python-version`：固定使用 Python 3.12 系列
+- `render.yaml`：免费 Render + Neon PostgreSQL 持久化配置（推荐）
+- `render-persistent.yaml`：Render 付费磁盘 + SQLite 的备选配置
+- `NEON_RENDER_DEPLOY.md`：当前试点的完整操作步骤
 
-### A. 免费演示版
+### A. 免费 Render + Neon 持久化版（推荐）
 
 适合讲标、POC 演示和短期分享。
 
@@ -19,16 +19,17 @@
 3. 点击 **New → Blueprint**。
 4. 连接刚才的代码仓库。
 5. Render 会自动读取根目录的 `render.yaml`。
-6. 点击 **Apply** 开始构建。
-7. 构建成功后会得到类似：
+6. 按 `NEON_RENDER_DEPLOY.md` 填写 `DATABASE_URL` 等环境变量。
+7. 点击 **Apply** 开始构建。
+8. 构建成功后会得到类似：
 
    `https://trm-tech-resource-poc.onrender.com`
 
 以后任何联网电脑只要打开这个地址即可访问。
 
-> 免费 Web Service 在长时间无人访问后会休眠，下一次打开时可能需要等待服务唤醒。免费服务的文件系统是临时的，因此在线修改的数据、上传附件不适合作为长期正式数据保存。
+> 免费 Web Service 在长时间无人访问后会休眠，下一次打开时可能需要等待服务唤醒。业务数据库保存在 Neon，不会因 Render 休眠丢失；上传附件的文件本体仍需对象存储才能完全持久化。
 
-### B. 长期运行 / 数据持久化版
+### B. Render 付费磁盘备选版
 
 如果需要在线录入的数据、审批记录、附件在重新部署或服务重启后仍然保留，建议使用 Render 付费 Web Service + Persistent Disk。
 

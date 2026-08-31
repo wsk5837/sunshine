@@ -279,3 +279,4 @@ def test_mcp_prepare_create_and_idempotency(monkeypatch, tmp_path):
         assert audit_row["user_id"]
         assert audit_row["service_actor"] == "gaios-mcp-agent"
         assert audit_row["required_permission"] == "initiative.create|project"
+

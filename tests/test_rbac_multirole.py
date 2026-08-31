@@ -109,3 +109,4 @@ def test_multi_role_permissions_are_real_and_ai_mcp_stay_in_sync(monkeypatch, tm
         second_context = captured_contexts[-1]
         assert "query.demand" not in second_context["effective_ai_capabilities"]
         assert "query.budget" in second_context["effective_ai_capabilities"]
+

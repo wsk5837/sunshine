@@ -1233,3 +1233,4 @@ def public_mcp_status() -> dict[str, Any]:
         "tool_count": 13,
         "service_actor": _service_actor(),
     }
+

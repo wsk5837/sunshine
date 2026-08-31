@@ -99,3 +99,4 @@ def test_project_ui_distinguishes_initiation_from_legacy_entry_and_manages_relat
     assert "pCreateSettlement" in script
     assert "/relations" in script
     assert ".project-relation-workbench" in stylesheet
+

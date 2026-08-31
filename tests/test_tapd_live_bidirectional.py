@@ -53,3 +53,4 @@ def test_live_tapd_push_update_and_protected_webhook(monkeypatch, tmp_path):
         detail = client.get(f"/api/demands/{demand['id']}", headers=ADMIN).json()["data"]
         assert detail["tapd_status"] == "开发中"
         assert detail["status"] == "开发中"
+

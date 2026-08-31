@@ -79,3 +79,4 @@ def test_dashboard_header_has_no_business_action_buttons():
     assert "'dashNew'" not in javascript
     assert "'dashExport'" not in javascript
     assert "title: '首页', iconName: 'home', crumbs: ['驾驶舱'], actions: ''" in javascript
+

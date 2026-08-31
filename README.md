@@ -1,6 +1,21 @@
-# TRM 科技资源管理系统 V4.9（AI智能体对接版）
+# TRM 科技资源管理系统 V5.1（数字化投入管理版）
 
-本版本保持 V4.8 标准项目目录和部署结构，在原有登录权限、需求全生命周期、项目、预算与TAPD能力上，接入 Gazellio G.AIOS 企业智能体。
+> 本试点版支持 SQLite 本地运行与 Neon PostgreSQL 云端持久化。Render + Neon 的部署步骤见 [NEON_RENDER_DEPLOY.md](NEON_RENDER_DEPLOY.md)。
+
+本版本保留 V4.9 的登录权限、需求、项目、预算、合同、结算、TAPD 双向同步、AI 助手与 MCP 能力，新增数字化投入全生命周期管理。项目同时支持 SQLite 本地试用与 Render + Neon PostgreSQL 持久化部署。
+
+## V5.1 数字化投入管理
+
+- **投入计划编制**：线上创建年度计划，维护投入明细、自定义分类/子类别标签、新增投入标识、计划外候补标识、数量、金额、支付方、业务用途和计划周期；编制时展示上年预算与当年执行率参考。
+- **投入审批与财务确认**：按部门负责人→财务→分管领导流转，待办支持批量通过/驳回；审批完成后导出 Excel 财务复核资料，财务可批量确认生效。
+- **投入调整**：已生效投入可发起金额/范围调整；金额变动超过 5 万元时增加分管领导节点，审批通过后自动更新投入基线及版本号。
+- **执行跟踪与核销**：投入项可关联项目成本和已有合同，登记付款单据后即时更新已支付、已核销、剩余金额和执行进度。
+- **跨年校验**：普通费用必须匹配投入年度；合同付款可跨年，但必须关联合同且付款年份不早于投入年度；单据号唯一防止重复核销。
+- **投入预警**：预算接近上限、超预算、长期未执行、临近到期、付款进度偏离五类规则，支持阈值、等级和启停配置，并自动去重/恢复。
+- **统计分析驾驶舱**：汇总计划数、明细数、申请金额、审核金额、已核销、未核销和执行率，支持按年度、部门、分类、状态聚合。
+- **真实 RBAC**：新增查看、编制、审批、财务、调整、执行、配置 7 类权限，与现有多角色权限合并模型和后端 API 校验一致。
+
+投入管理主表为 `investment_plans`，明细、审批、调整、付款核销、预警规则与预警事件均为独立持久化表，不是前端缓存或写死数据。
 
 ## 本次关键调整
 
@@ -49,10 +64,11 @@
 ## 标准目录
 
 ```text
-科技资源管理系统_V4.9_AI智能体对接版/
+科技资源管理系统_V5.1_数字化投入管理_Render版/
 ├── app/
 │   ├── __init__.py
 │   ├── ai_gateway.py
+│   ├── investment.py
 │   ├── trm_mcp.py
 │   ├── auth.py
 │   ├── main.py
@@ -64,7 +80,9 @@
 │   └── static/
 │       ├── index.html
 │       ├── app.js
-│       └── app.css
+│       ├── app.css
+│       ├── investment.js
+│       └── investment.css
 ├── config/
 │   └── gaios-mcp-config.example.json
 ├── scripts/
@@ -105,7 +123,7 @@
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --reload
+python -m uvicorn app.runtime:app --reload
 ```
 
 浏览器访问：`http://127.0.0.1:8000`
@@ -259,7 +277,7 @@ pip install -r requirements.txt
 Start Command：
 
 ```bash
-python -m uvicorn app.main:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
+python -m uvicorn app.runtime:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"
 ```
 
 Python：3.13.5。

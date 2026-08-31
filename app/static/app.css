@@ -315,6 +315,8 @@ footer { text-align: center; color: #8092b4; padding: 15px; }
 .btn.secondary { background: #f4f6ff; }
 .btn.ghost { border-color: var(--line); color: var(--ink); }
 .btn.danger { border-color: #ef6570; color: #ef6570; }
+.link.danger-text { color: var(--danger); }
+.link.danger-text:hover { color: #c93845; }
 .btn.success { border-color: #21a86f; color: #168a5c; }
 .btn.small { padding: 5px 10px; min-height: 28px; font-size: 12px; }
 .btn .icon { width: 14px; height: 14px; vertical-align: -2px; margin-right: 4px; }
@@ -585,6 +587,17 @@ footer { text-align: center; color: #8092b4; padding: 15px; }
 .calc-tooltip:hover .calc-tooltip-panel,
 .calc-tooltip:focus .calc-tooltip-panel,
 .calc-tooltip:focus-within .calc-tooltip-panel { visibility: visible; opacity: 1; transform: translateY(0); }
+.calc-tooltip.is-floating > .calc-tooltip-panel { visibility: hidden !important; opacity: 0 !important; }
+.calc-tooltip-panel.calc-tooltip-floating {
+  position: fixed;
+  inset: auto;
+  z-index: 10050;
+  visibility: visible;
+  opacity: 1;
+  transform: none;
+  pointer-events: none;
+  max-width: calc(100vw - 24px);
+}
 .calc-title { display: block; margin-bottom: 7px; color: #25375c; font-weight: 650; }
 .calc-breakdown-list { display: block; max-height: 210px; overflow: auto; }
 .calc-line { display: grid; grid-template-columns: minmax(100px, 1fr) auto; gap: 12px; padding: 6px 0; border-bottom: 1px solid #edf0f7; }

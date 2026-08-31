@@ -96,6 +96,10 @@ def test_function_point_amount_uses_hover_breakdown_and_clickable_detail():
     assert "已向产品经理和项目经理发送工时偏差预警" in javascript
     assert ".calc-tooltip:hover .calc-tooltip-panel" in stylesheet
     assert ".calc-tooltip:focus .calc-tooltip-panel" in stylesheet
+    assert "calc-tooltip-floating" in stylesheet
+    assert "position: fixed" in stylesheet
+    assert "initCalculationTooltips()" in javascript
+    assert "document.body.appendChild(panel)" in javascript
 
 
 def test_tapd_detail_hides_unmaintainable_task_and_cost_ledger_sections():

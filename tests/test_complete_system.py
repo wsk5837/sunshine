@@ -111,7 +111,7 @@ def test_demand_poc_end_to_end():
             'demand_summary':'自动化测试','name':'查询与处理','system_name':'科技资源管理系统','evaluator':'测试产品经理',
             'department':'产品研发部','team':'平台团队','evaluation_date':'2026-08-19','fp_count':10,'unit_price':1200
         }); assert rr.status_code == 200, rr.text
-        fp=rr.json()['data']
+        fp=rr.json()['data']['function_points'][-1]
         rr=c.put(f'/api/demands/{did}/allocations',headers=h('product_manager'),json={'rows':[
             {'function_point_id':fp['id'],'system_name':'科技资源管理系统','expense_subject':'集团','expense_source':budget['budget_name'],'ratio':100,'department':'数字化管理部'}
         ]}); assert rr.status_code == 200, rr.text

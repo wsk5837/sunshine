@@ -49,7 +49,7 @@ def test_poc_oa_flexible_return_multi_system_tapd_webhook_ai():
         assert d['oa_tasks'][-1]['status'] == '待处理'
         assert c.post(f'/api/demands/{did}/approve', headers=h('department_head'), json={'action':'通过','comment':'已补充确认'}).status_code == 200
 
-        # 两个归属系统，终审后应按系统拆分为两条TAPD需求。
+        # 两个功能点，终审后应一对一生成两条TAPD需求。
         fp_ids = []
         for system, name, count in [('费用预算管理服务平台','预算单据查询',10), ('AIP稽核智能平台','风险指标回传',8)]:
             r = c.post(f'/api/demands/{did}/function-points', headers=h('product_manager'), json={
@@ -58,10 +58,10 @@ def test_poc_oa_flexible_return_multi_system_tapd_webhook_ai():
                 'fp_count':count,'unit_price':1200,
             })
             assert r.status_code == 200, r.text
-            fp_ids.append(r.json()['data']['id'])
+            fp_ids.append(r.json()['data']['function_points'][-1]['id'])
         r = c.put(f'/api/demands/{did}/allocations', headers=h('product_manager'), json={'rows':[
-            {'function_point_id':fp_ids[0], 'system_name':'费用预算管理服务平台', 'expense_subject':'集团', 'expense_source':budget['budget_name'], 'ratio':60, 'department':'数字化管理部'},
-            {'function_point_id':fp_ids[1], 'system_name':'AIP稽核智能平台', 'expense_subject':'集团', 'expense_source':budget['budget_name'], 'ratio':40, 'department':'数字化管理部'},
+            {'function_point_id':fp_ids[0], 'system_name':'费用预算管理服务平台', 'expense_subject':'集团', 'expense_source':budget['budget_name'], 'ratio':100, 'department':'数字化管理部'},
+            {'function_point_id':fp_ids[1], 'system_name':'AIP稽核智能平台', 'expense_subject':'集团', 'expense_source':budget['budget_name'], 'ratio':100, 'department':'数字化管理部'},
         ]})
         assert r.status_code == 200, r.text
         assert c.post(f'/api/demands/{did}/approve', headers=h('product_manager'), json={'action':'通过','comment':'功能点评估及费用分摊完成'}).status_code == 200
@@ -70,6 +70,7 @@ def test_poc_oa_flexible_return_multi_system_tapd_webhook_ai():
         assert r.status_code == 200, r.text
         d = c.get(f'/api/demands/{did}').json()['data']
         assert len(d['tapd_requirements']) == 2
+        assert {x['function_point_id'] for x in d['tapd_requirements']} == set(fp_ids)
         systems = {x['system_name'] for x in d['tapd_requirements']}
         assert systems == {'费用预算管理服务平台','AIP稽核智能平台'}
         # 字段映射含申请人、预算、优先级和附件字段。
@@ -106,18 +107,31 @@ def test_poc_oa_flexible_return_multi_system_tapd_webhook_ai():
         r = c.post('/api/tapd/webhook', json=webhook)
         assert r.status_code == 200, r.text
         d = c.get(f'/api/demands/{did}').json()['data']
-        assert d['status'] == '已完成'
-        assert d['tapd_status'] == '已关闭'
+        statuses = {x['tapd_id']: x['tapd_status'] for x in d['tapd_requirements']}
+        assert statuses[tapd_id] == '已关闭'
+        assert statuses[d['tapd_requirements'][1]['tapd_id']] == '新'
+        assert d['status'] != '已完成'
+        assert d['tapd_status'].startswith('多状态')
         assert d['rd_owner'] == '研发主体A'
         assert d['planned_online_date'] == '2026-09-30'
         assert d['actual_online_date'] == '2026-09-28'
         assert d['user_test_date'] == '2026-09-20'
         assert len(d['tapd_tasks']) >= 1
         assert len(d['tapd_costs']) >= 1
-        assert d['closed_at']
+        assert not d['closed_at']
         for role in ('product_manager','project_manager'):
             notes = c.get('/api/notifications', headers=h(role)).json()['data']
             assert any(n['demand_id'] == did and n['title'] == '工时偏差预警' for n in notes)
+
+        # 第二条关闭后，主需求才汇总为已完成；第一条记录不会被第二条覆盖。
+        second_tapd_id = d['tapd_requirements'][1]['tapd_id']
+        r = c.post('/api/tapd/webhook', json={**webhook, 'tapd_id': second_tapd_id, 'tasks': [], 'costs': []})
+        assert r.status_code == 200, r.text
+        d = c.get(f'/api/demands/{did}').json()['data']
+        assert {x['tapd_status'] for x in d['tapd_requirements']} == {'已关闭'}
+        assert d['status'] == '已完成'
+        assert d['tapd_status'] == '已关闭'
+        assert d['closed_at']
 
         # AI问答五类POC场景均有事实型响应。
         questions = [
@@ -141,7 +155,7 @@ def test_poc_tapd_retry_queue_is_persistent_three_attempts():
             'department':'产品研发部','team':'研发效能组','evaluation_date':'2026-08-19','fp_count':5,'unit_price':1200,
         })
         assert r.status_code == 200
-        fp_id = r.json()['data']['id']
+        fp_id = r.json()['data']['function_points'][-1]['id']
         assert c.put(f'/api/demands/{did}/allocations',headers=h('product_manager'),json={'rows':[
             {'function_point_id':fp_id,'system_name':'TAPD测试系统','expense_subject':'集团','expense_source':budget['budget_name'],'ratio':100,'department':'数字化管理部'}
         ]}).status_code == 200

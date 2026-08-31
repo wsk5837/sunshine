@@ -57,32 +57,98 @@ def init_budget_and_workflow_db(conn) -> None:
     )
 
 
+def function_point_allocation_coverage(conn, demand_id: int, *, require_complete: bool = False) -> dict:
+    """校验并返回需求下每个功能点的预算分摊覆盖率。"""
+    points = list(conn.execute(
+        "SELECT id,fp_no,name,estimated_amount FROM function_points WHERE demand_id=? ORDER BY id",
+        (demand_id,),
+    ))
+    rows = list(conn.execute(
+        "SELECT function_point_id,ratio FROM allocations WHERE demand_id=? ORDER BY id", (demand_id,)
+    ))
+    point_by_id = {int(point["id"]): point for point in points}
+    ratios = defaultdict(float)
+    for row in rows:
+        point_id = row["function_point_id"]
+        if point_id is None or int(point_id) not in point_by_id:
+            raise BusinessError(422, "BUD-4221", "每条费用分摊必须关联当前需求中的有效功能点")
+        ratios[int(point_id)] += float(row["ratio"] or 0)
+    items = []
+    incomplete = []
+    for point in points:
+        point_id = int(point["id"])
+        ratio = round(ratios.get(point_id, 0.0), 4)
+        if ratio > 100.0001:
+            raise BusinessError(
+                422, "BUD-4221",
+                f"功能点{point['fp_no']}分摊比例超过100%，当前为{ratio:.2f}%",
+            )
+        item = {
+            "function_point_id": point_id,
+            "fp_no": point["fp_no"],
+            "name": point["name"],
+            "estimated_amount": round(float(point["estimated_amount"] or 0), 2),
+            "ratio": ratio,
+            "complete": abs(ratio - 100.0) <= 0.01,
+        }
+        items.append(item)
+        if not item["complete"]:
+            incomplete.append(item)
+    if require_complete:
+        if not points:
+            raise BusinessError(422, "BUD-4221", "尚未建立功能点，无法配置预算分摊")
+        if incomplete:
+            summary = "、".join(f"{item['fp_no']}({item['ratio']:.2f}%)" for item in incomplete[:5])
+            suffix = "等" if len(incomplete) > 5 else ""
+            raise BusinessError(
+                422, "BUD-4221",
+                f"每个功能点的预算分摊都必须合计100%，未完成：{summary}{suffix}",
+                {"incomplete": incomplete},
+            )
+    return {
+        "items": items,
+        "function_point_count": len(points),
+        "completed_count": len(points) - len(incomplete),
+        "complete": bool(points) and not incomplete,
+    }
+
+
 def recalculate_demand_allocation_amounts(conn, demand_id: int) -> dict:
-    """按需求最新评估金额重算分摊，最后一行吸收分币舍入差额。"""
-    demand = conn.execute(
-        "SELECT estimated_amount,budget_amount FROM demands WHERE id=?", (demand_id,)
-    ).fetchone()
-    if not demand:
+    """按每个功能点的评估金额重算其分摊金额，而不是按需求或项目总额计算。"""
+    if not conn.execute("SELECT 1 FROM demands WHERE id=?", (demand_id,)).fetchone():
         raise BusinessError(404, "REQ-4040", "需求不存在")
     rows = list(conn.execute(
-        "SELECT id,ratio,ledger_status FROM allocations WHERE demand_id=? ORDER BY id", (demand_id,)
+        """SELECT a.id,a.function_point_id,a.ratio,a.ledger_status,fp.estimated_amount
+             FROM allocations a
+             LEFT JOIN function_points fp ON fp.id=a.function_point_id AND fp.demand_id=a.demand_id
+            WHERE a.demand_id=? ORDER BY a.function_point_id,a.id""",
+        (demand_id,),
     ))
     if not rows:
         return {"amount": 0.0, "rows": 0}
     if any(row["ledger_status"] == "已占用" for row in rows):
         raise BusinessError(409, "BUD-4090", "费用分摊已经占用预算，不能重新计算")
-    base = round(float(demand["estimated_amount"] or demand["budget_amount"] or 0), 2)
-    ratio_sum = sum(float(row["ratio"] or 0) for row in rows)
-    absorb_rounding = abs(ratio_sum - 100.0) <= 0.01
-    allocated = 0.0
-    for index, row in enumerate(rows):
-        if absorb_rounding and index == len(rows) - 1:
-            amount = round(base - allocated, 2)
-        else:
-            amount = round(base * float(row["ratio"] or 0) / 100, 2)
+    function_point_allocation_coverage(conn, demand_id)
+    grouped = defaultdict(list)
+    for row in rows:
+        if row["function_point_id"] is None or row["estimated_amount"] is None:
+            raise BusinessError(422, "BUD-4221", "费用分摊关联的功能点不存在")
+        grouped[int(row["function_point_id"])].append(row)
+    total = 0.0
+    for point_rows in grouped.values():
+        base = round(float(point_rows[0]["estimated_amount"] or 0), 2)
+        ratio_sum = sum(float(row["ratio"] or 0) for row in point_rows)
+        absorb_rounding = abs(ratio_sum - 100.0) <= 0.01
+        allocated = 0.0
+        for index, row in enumerate(point_rows):
+            if absorb_rounding and index == len(point_rows) - 1:
+                amount = round(base - allocated, 2)
+            else:
+                amount = round(base * float(row["ratio"] or 0) / 100, 2)
             allocated = round(allocated + amount, 2)
-        conn.execute("UPDATE allocations SET amount=? WHERE id=?", (amount, row["id"]))
-    return {"amount": base, "rows": len(rows)}
+            total = round(total + amount, 2)
+            conn.execute("UPDATE allocations SET amount=? WHERE id=?", (amount, row["id"]))
+    return {"amount": total, "rows": len(rows)}
 
 
 def _refresh_budget_snapshots(conn, budget_id: int, department: str) -> None:
@@ -151,9 +217,7 @@ def reserve_demand_allocations(conn, demand_id: int, actor: str) -> dict:
     rows = list(conn.execute("SELECT * FROM allocations WHERE demand_id=? ORDER BY id", (demand_id,)))
     if not rows:
         raise BusinessError(422, "BUD-4221", "尚未配置费用分摊，财务无法通过")
-    ratio_sum = round(sum(float(row["ratio"] or 0) for row in rows), 4)
-    if abs(ratio_sum - 100.0) > 0.01:
-        raise BusinessError(422, "BUD-4221", f"财务审批前费用分摊比例必须合计100%，当前为{ratio_sum}%")
+    function_point_allocation_coverage(conn, demand_id, require_complete=True)
 
     pending = [row for row in rows if row["ledger_status"] != "已占用"]
     if not pending:

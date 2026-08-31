@@ -28,6 +28,13 @@ PERMISSION_CATALOG = {
     "project360": "项目360视图",
     "value": "业务价值总览",
     "budget": "预算管理",
+    "investment.view": "数字化投入查看",
+    "investment.create": "投入计划编制",
+    "investment.approve": "投入计划审批",
+    "investment.finance": "投入财务确认与核销",
+    "investment.adjust": "投入调整申请",
+    "investment.execute": "投入执行跟踪",
+    "investment.config": "投入分类与预警配置",
     "initiative.list": "立项列表",
     "initiative.create": "新建立项",
     "initiative.approve": "立项审批",
@@ -49,13 +56,13 @@ PERMISSION_CATALOG = {
 }
 
 DEFAULT_ROLE_PERMISSIONS = {
-    "applicant": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.create", "demand.list", "demand.create", "tapd", "ai"],
-    "department_head": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai"],
-    "product_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "demand.approve", "demand.evaluate", "function_points", "tapd", "ai", "project"],
-    "finance": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "settlement", "contract"],
-    "vp": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project"],
-    "business_owner": ["dashboard", "project360", "value", "budget", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project", "settlement", "contract", "indicator"],
-    "project_manager": ["dashboard", "project360", "value", "budget", "initiative.list", "demand.list", "tapd", "ai", "project", "settlement", "indicator", "contract"],
+    "applicant": ["dashboard", "project360", "value", "budget", "investment.view", "investment.create", "investment.adjust", "initiative.list", "initiative.create", "demand.list", "demand.create", "tapd", "ai"],
+    "department_head": ["dashboard", "project360", "value", "budget", "investment.view", "investment.approve", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai"],
+    "product_manager": ["dashboard", "project360", "value", "budget", "investment.view", "investment.create", "investment.execute", "initiative.list", "demand.list", "demand.approve", "demand.evaluate", "function_points", "tapd", "ai", "project"],
+    "finance": ["dashboard", "project360", "value", "budget", "investment.view", "investment.approve", "investment.finance", "investment.execute", "investment.config", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "settlement", "contract"],
+    "vp": ["dashboard", "project360", "value", "budget", "investment.view", "investment.approve", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project"],
+    "business_owner": ["dashboard", "project360", "value", "budget", "investment.view", "investment.approve", "investment.execute", "initiative.list", "initiative.approve", "demand.list", "demand.approve", "tapd", "ai", "project", "settlement", "contract", "indicator"],
+    "project_manager": ["dashboard", "project360", "value", "budget", "investment.view", "investment.create", "investment.adjust", "investment.execute", "initiative.list", "demand.list", "tapd", "ai", "project", "settlement", "indicator", "contract"],
     "admin": ["*"],
 }
 
@@ -269,6 +276,20 @@ def init_auth_db():
                 "INSERT INTO auth_permission_migrations(name,applied_at) VALUES(?,?)",
                 (migration_name, ts),
             )
+        # V5.1: seed the new digital-investment permission family into existing
+        # built-in roles. Custom roles remain fully controlled by administrators.
+        investment_migration = "investment_permissions_v1"
+        if not conn.execute("SELECT 1 FROM auth_permission_migrations WHERE name=?", (investment_migration,)).fetchone():
+            for role_code, defaults in DEFAULT_ROLE_PERMISSIONS.items():
+                if role_code == "admin":
+                    continue
+                row = conn.execute("SELECT permissions FROM system_roles WHERE code=? AND built_in=1", (role_code,)).fetchone()
+                if not row:
+                    continue
+                current = _parse_permissions(row["permissions"])
+                merged = current + [code for code in defaults if code.startswith("investment.") and code not in current]
+                conn.execute("UPDATE system_roles SET permissions=?,updated_at=? WHERE code=?", (json.dumps(merged, ensure_ascii=False), ts, role_code))
+            conn.execute("INSERT INTO auth_permission_migrations(name,applied_at) VALUES(?,?)", (investment_migration, ts))
         # remove expired sessions
         conn.execute("DELETE FROM auth_sessions WHERE expires_at < ?", (now_iso(),))
         conn.execute("DELETE FROM ai_delegations WHERE expires_at < ?", (now_iso(),))
@@ -298,7 +319,7 @@ def _load_user_roles(conn, user_id: int, fallback_role: str = "") -> dict:
            FROM system_user_roles ur
            JOIN system_roles r ON r.code=ur.role_code
            WHERE ur.user_id=? AND r.status='启用'
-           ORDER BY ur.is_primary DESC, ur.rowid""",
+           ORDER BY ur.is_primary DESC, ur.created_at, ur.role_code""",
         (user_id,),
     ).fetchall()
     if not rows and fallback_role:
@@ -368,6 +389,24 @@ def permissions_for_api(method: str, path: str) -> tuple[str, ...]:
         return ("system.audit",)
     if path.startswith("/api/ai/"):
         return ("ai",)
+    if path.startswith("/api/investments/categories") or path.startswith("/api/investments/warning-rules"):
+        return ("investment.config",) if method != "GET" else ("investment.view",)
+    if path.startswith("/api/investments/approvals"):
+        return ("investment.approve",)
+    if path.startswith("/api/investments/finance"):
+        return ("investment.finance",)
+    if path.startswith("/api/investments/payments"):
+        return ("investment.finance", "investment.execute")
+    if path.startswith("/api/investments/adjustments"):
+        return ("investment.adjust", "investment.approve")
+    if path.startswith("/api/investments/items"):
+        return ("investment.execute", "investment.create") if method != "GET" else ("investment.view",)
+    if path.startswith("/api/investments/plans"):
+        if path.endswith("/approve"):
+            return ("investment.approve",)
+        return ("investment.view",) if method == "GET" else ("investment.create",)
+    if path.startswith("/api/investments"):
+        return ("investment.view",)
     if path in {"/api/dashboard", "/api/platform-dashboard"} or path.startswith("/api/exports/"):
         return ("dashboard",)
     if path.startswith("/api/initiative-approvals"):

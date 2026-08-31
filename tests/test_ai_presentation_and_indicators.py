@@ -77,3 +77,4 @@ def test_indicator_board_uses_compact_command_center_layout():
     assert ".indicator-screen" in stylesheet
     assert ".indicator-board-mode footer" in stylesheet
     assert "grid-template-columns:repeat(5,minmax(0,1fr))" in stylesheet
+

@@ -83,3 +83,4 @@ def test_ai_chat_rejects_empty_question():
         response = client.post("/api/ai/chat", json={"question": "   "})
         assert response.status_code == 400
         assert response.json()["code"] == "REQ-4002"
+

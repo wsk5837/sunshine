@@ -1,13 +1,232 @@
 import json
 import os
+import re
 import sqlite3
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Iterable, Optional
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = Path(os.getenv("TRM_DB_PATH", DATA_DIR / "trm_system.db"))
+
+
+def database_backend() -> str:
+    """Return the selected database backend without exposing credentials."""
+    configured = os.getenv("TRM_DATABASE_BACKEND", "").strip().lower()
+    if configured in {"sqlite", "sqlite3"}:
+        return "sqlite"
+    if configured in {"postgres", "postgresql", "neon"}:
+        return "postgresql"
+    return "postgresql" if os.getenv("DATABASE_URL", "").strip() else "sqlite"
+
+
+def is_postgres_backend() -> bool:
+    return database_backend() == "postgresql"
+
+
+class CompatRow(Mapping):
+    """sqlite3.Row compatible mapping for PostgreSQL result rows."""
+
+    def __init__(self, columns: Iterable[str], values: Iterable[Any]):
+        self._columns = tuple(columns)
+        self._values = tuple(values)
+        self._data = dict(zip(self._columns, self._values))
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._columns)
+
+    def __len__(self):
+        return len(self._columns)
+
+
+class _MemoryCursor:
+    def __init__(self, rows=(), *, lastrowid=None, rowcount=-1):
+        self._rows = list(rows)
+        self._index = 0
+        self.lastrowid = lastrowid
+        self.rowcount = rowcount
+
+    def fetchone(self):
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._index :]
+        self._index = len(self._rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _PostgresCursor:
+    def __init__(self, cursor, *, lastrowid=None):
+        self._cursor = cursor
+        self.lastrowid = lastrowid
+        self.rowcount = cursor.rowcount
+
+    def _convert(self, row):
+        if row is None:
+            return None
+        columns = [item.name for item in self._cursor.description]
+        return CompatRow(columns, row)
+
+    def fetchone(self):
+        return self._convert(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._convert(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        while True:
+            row = self.fetchone()
+            if row is None:
+                break
+            yield row
+
+
+_INSERT_TABLE_RE = re.compile(r"^\s*INSERT\s+(?:OR\s+IGNORE\s+)?INTO\s+([A-Za-z_][A-Za-z0-9_]*)", re.I | re.S)
+
+
+def _translate_postgres_sql(sql: str) -> tuple[str, bool]:
+    """Translate the small SQLite SQL subset used by this application."""
+    translated = sql.strip()
+    ignored_insert = bool(re.match(r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b", translated, re.I))
+    translated = re.sub(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", "INSERT INTO", translated, flags=re.I)
+    translated = re.sub(
+        r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
+        "SERIAL PRIMARY KEY",
+        translated,
+        flags=re.I,
+    )
+    translated = re.sub(r"\bREAL\b", "DOUBLE PRECISION", translated, flags=re.I)
+    # psycopg uses percent-style binding; literal SQL percent signs must be escaped.
+    translated = translated.replace("%", "%%")
+    translated = translated.replace("?", "%s")
+    if ignored_insert and not re.search(r"\bON\s+CONFLICT\b", translated, re.I):
+        translated = translated.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    return translated, ignored_insert
+
+
+class PostgresConnection:
+    """Compatibility facade exposing the sqlite3 methods used by TRM."""
+
+    backend = "postgresql"
+
+    def __init__(self, raw_connection):
+        self._connection = raw_connection
+        self.total_changes = 0
+        self._id_column_cache: dict[str, bool] = {}
+
+    def _table_has_id(self, table: str) -> bool:
+        cached = self._id_column_cache.get(table)
+        if cached is not None:
+            return cached
+        cur = self._connection.cursor()
+        cur.execute(
+            """SELECT 1 FROM information_schema.columns
+               WHERE table_schema=current_schema() AND table_name=%s AND column_name='id'""",
+            (table,),
+        )
+        found = cur.fetchone() is not None
+        cur.close()
+        self._id_column_cache[table] = found
+        return found
+
+    def execute(self, sql: str, parameters: Optional[Iterable[Any]] = None):
+        stripped = sql.strip()
+        if re.match(r"^PRAGMA\s+foreign_keys\b", stripped, re.I) or re.match(r"^PRAGMA\s+optimize\b", stripped, re.I):
+            return _MemoryCursor()
+        table_info = re.match(r"^PRAGMA\s+table_info\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", stripped, re.I)
+        if table_info:
+            table = table_info.group(1)
+            cur = self._connection.cursor()
+            cur.execute(
+                """SELECT ordinal_position-1 AS cid,column_name AS name,data_type AS type,
+                          CASE WHEN is_nullable='NO' THEN 1 ELSE 0 END AS notnull,
+                          column_default AS dflt_value,
+                          CASE WHEN column_name IN (
+                              SELECT kcu.column_name
+                              FROM information_schema.table_constraints tc
+                              JOIN information_schema.key_column_usage kcu
+                                ON tc.constraint_name=kcu.constraint_name AND tc.table_schema=kcu.table_schema
+                              WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema=current_schema()
+                                AND tc.table_name=%s
+                          ) THEN 1 ELSE 0 END AS pk
+                   FROM information_schema.columns
+                   WHERE table_schema=current_schema() AND table_name=%s
+                   ORDER BY ordinal_position""",
+                (table, table),
+            )
+            rows = [CompatRow(("cid", "name", "type", "notnull", "dflt_value", "pk"), row) for row in cur.fetchall()]
+            cur.close()
+            return _MemoryCursor(rows)
+        if re.match(r"^BEGIN\s+IMMEDIATE\b", stripped, re.I):
+            # Preserve SQLite's serialized-write intent for MCP idempotency and
+            # number generation while using PostgreSQL transaction semantics.
+            cur = self._connection.cursor()
+            cur.execute("SELECT pg_advisory_xact_lock(846721904)")
+            cur.fetchone()
+            return _MemoryCursor()
+
+        translated, _ = _translate_postgres_sql(sql)
+        insert_match = _INSERT_TABLE_RE.match(sql)
+        return_id = False
+        if insert_match and not re.search(r"\bRETURNING\b", translated, re.I):
+            table = insert_match.group(1)
+            if self._table_has_id(table):
+                translated = translated.rstrip().rstrip(";") + " RETURNING id"
+                return_id = True
+
+        cursor = self._connection.cursor()
+        cursor.execute(translated, tuple(parameters or ()))
+        lastrowid = None
+        if return_id:
+            returned = cursor.fetchone()
+            lastrowid = returned[0] if returned else None
+        if cursor.rowcount and cursor.rowcount > 0 and re.match(r"^(INSERT|UPDATE|DELETE)\b", stripped, re.I):
+            self.total_changes += cursor.rowcount
+        return _PostgresCursor(cursor, lastrowid=lastrowid)
+
+    def executemany(self, sql: str, seq_of_parameters):
+        translated, _ = _translate_postgres_sql(sql)
+        cursor = self._connection.cursor()
+        cursor.executemany(translated, list(seq_of_parameters))
+        if cursor.rowcount and cursor.rowcount > 0:
+            self.total_changes += cursor.rowcount
+        return _PostgresCursor(cursor)
+
+    def executescript(self, script: str):
+        statement = ""
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                if statement.strip():
+                    self.execute(statement)
+                statement = ""
+        if statement.strip():
+            self.execute(statement)
+        return _MemoryCursor()
+
+    def commit(self):
+        self._connection.commit()
+
+    def rollback(self):
+        self._connection.rollback()
+
+    def close(self):
+        self._connection.close()
 
 
 def now_iso() -> str:
@@ -16,9 +235,30 @@ def now_iso() -> str:
 
 @contextmanager
 def connect():
+    if is_postgres_backend():
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if not database_url:
+            raise RuntimeError("已选择 PostgreSQL，但未设置 DATABASE_URL")
+        try:
+            import psycopg
+        except ImportError as exc:  # pragma: no cover - deployment dependency guard
+            raise RuntimeError("PostgreSQL 模式需要安装 psycopg[binary]") from exc
+        raw = psycopg.connect(database_url, autocommit=False)
+        conn = PostgresConnection(raw)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -36,6 +276,10 @@ def row_to_dict(row):
 
 def init_db():
     with connect() as conn:
+        if not is_postgres_backend():
+            # WAL允许页面读取和后台TAPD同步并发进行；busy_timeout负责短暂写锁等待。
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS demands (
@@ -252,7 +496,7 @@ def init_db():
 
         if conn.execute("SELECT COUNT(*) c FROM demands").fetchone()["c"] == 0:
             created = now_iso()
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO demands
                 (demand_no,title,description,demand_type,budget_sources,priority,applicant,applicant_dept,
                  budget_amount,estimated_amount,status,current_node,tapd_id,tapd_url,tapd_status,tapd_sync_status,
@@ -284,7 +528,7 @@ def init_db():
                     created,
                 ),
             )
-            did = conn.execute("SELECT last_insert_rowid() id").fetchone()["id"]
+            did = cur.lastrowid
             conn.execute(
                 """INSERT INTO approval_records(demand_id,node,role,approver,action,comment,created_at)
                    VALUES (?,?,?,?,?,?,?)""",
@@ -299,6 +543,38 @@ def init_db():
                     (did, "FP-2026-0002", "风险指标数据回传", "稽核风险指标回传", "AIP稽核智能平台", "赵敏", "产品研发部", "智能稽核组", "2026-08-17", 28, 1200, 33600, created),
                 ],
             )
+
+        # 旧版本把需求功能点和功能点库分开维护，导致新增功能点无法在“功能点管理”中看到。
+        # 启动时为历史功能点补齐可复用的目录记录，并建立稳定关联。
+        legacy_points = list(conn.execute(
+            "SELECT * FROM function_points WHERE catalog_id IS NULL ORDER BY id"
+        ))
+        for point in legacy_points:
+            catalog = conn.execute(
+                """SELECT id FROM function_point_catalog
+                    WHERE name=? AND system_name=? AND demand_summary=? LIMIT 1""",
+                (point["name"], point["system_name"], point["demand_summary"]),
+            ).fetchone()
+            if catalog:
+                catalog_id = int(catalog["id"])
+            else:
+                year = (point["fp_no"].split("-")[1] if point["fp_no"] and "-" in point["fp_no"] else datetime.now().strftime("%Y"))
+                prefix = f"FPC-{year}-"
+                last = conn.execute(
+                    "SELECT catalog_no FROM function_point_catalog WHERE catalog_no LIKE ? ORDER BY catalog_no DESC LIMIT 1",
+                    (f"{prefix}%",),
+                ).fetchone()
+                seq = int(last["catalog_no"].split("-")[-1]) + 1 if last else 1
+                cur = conn.execute(
+                    """INSERT INTO function_point_catalog
+                       (catalog_no,demand_summary,name,system_name,default_fp_count,unit_price,department,team,created_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (f"{prefix}{seq:04d}", point["demand_summary"], point["name"] or point["demand_summary"] or "未命名功能点",
+                     point["system_name"], point["fp_count"], point["unit_price"], point["department"], point["team"],
+                     point["created_at"], now_iso()),
+                )
+                catalog_id = int(cur.lastrowid)
+            conn.execute("UPDATE function_points SET catalog_id=? WHERE id=?", (catalog_id, point["id"]))
 
         conn.execute("UPDATE demands SET applicant_code='lili11-ghq' WHERE applicant_code IS NULL OR applicant_code=''")
         conn.execute("PRAGMA optimize")

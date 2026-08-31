@@ -2,6 +2,7 @@ import asyncio
 import hmac
 import json
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -15,6 +16,7 @@ from .rules import APPROVAL_FLOW, BusinessError, ROLE_LABELS, TAPD_STATUS_MAP
 from .auth import get_role_labels
 
 router = APIRouter(prefix="/api", tags=["POC完整能力"])
+_RECONCILE_LOCK = threading.RLock()
 
 NODE_TIMEOUT_HOURS = {
     "直属领导审批": 24,
@@ -230,10 +232,50 @@ def init_poc_db():
             """
         )
         _add_column(conn, "tapd_costs", "tapd_requirement_id", "INTEGER")
+        _add_column(conn, "tapd_requirements", "function_point_id", "INTEGER")
+        # 历史“按分摊行”记录可通过allocation_id无歧义恢复功能点关联。
+        conn.execute(
+            """UPDATE tapd_requirements SET function_point_id=(
+                   SELECT a.function_point_id FROM allocations a
+                    WHERE a.id=tapd_requirements.allocation_id
+               )
+               WHERE function_point_id IS NULL AND allocation_id IS NOT NULL
+                 AND (SELECT a.function_point_id FROM allocations a
+                       WHERE a.id=tapd_requirements.allocation_id) IS NOT NULL
+                 AND 1=(SELECT COUNT(*) FROM tapd_requirements tr
+                          JOIN allocations a ON a.id=tr.allocation_id
+                         WHERE tr.demand_id=tapd_requirements.demand_id
+                           AND a.function_point_id=(SELECT a2.function_point_id FROM allocations a2
+                                                    WHERE a2.id=tapd_requirements.allocation_id))"""
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tapd_requirements_function_point "
+            "ON tapd_requirements(demand_id,function_point_id) WHERE function_point_id IS NOT NULL"
+        )
+        # 旧版本按系统拆分。只有系统下恰好一个功能点时才安全补齐关联，
+        # 避免把历史上一条TAPD记录错误绑定到多个功能点。
+        conn.execute(
+            """UPDATE tapd_requirements SET function_point_id=(
+                   SELECT MIN(fp.id) FROM function_points fp
+                    WHERE fp.demand_id=tapd_requirements.demand_id
+                      AND fp.system_name=tapd_requirements.system_name
+               )
+               WHERE function_point_id IS NULL
+                 AND 1=(SELECT COUNT(*) FROM function_points fp
+                         WHERE fp.demand_id=tapd_requirements.demand_id
+                           AND fp.system_name=tapd_requirements.system_name)
+                 AND 1=(SELECT COUNT(*) FROM tapd_requirements tr
+                         WHERE tr.demand_id=tapd_requirements.demand_id
+                           AND tr.system_name=tapd_requirements.system_name)"""
+        )
         now = now_iso()
         conn.execute(
             "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
-            ("tapd_split_strategy", "system", "TAPD多系统拆分策略：system / system_allocation", now),
+            ("tapd_split_strategy", "function_point", "TAPD按功能点一对一生成需求", now),
+        )
+        conn.execute(
+            "UPDATE system_settings SET value='function_point',description='TAPD按功能点一对一生成需求',updated_at=? WHERE code='tapd_split_strategy'",
+            (now,),
         )
         conn.execute(
             "INSERT OR IGNORE INTO system_settings(code,value,description,updated_at) VALUES (?,?,?,?)",
@@ -544,16 +586,22 @@ def test_tapd_connection(conn):
     return {**cfg, "connected": True, "message": "TAPD连接成功", "story_count": story_count, "task_count": task_count}
 
 
-def _tapd_payload(conn, demand_id: int, system_name: str, allocation_id=None):
+def _tapd_payload(conn, demand_id: int, system_name: str, allocation_id=None, function_point=None):
     d = conn.execute("SELECT * FROM demands WHERE id=?", (demand_id,)).fetchone()
     attachments = [r["original_name"] for r in conn.execute("SELECT original_name FROM attachments WHERE demand_id=? ORDER BY id", (demand_id,))]
     try:
         budget_sources = json.loads(d["budget_sources"] or "[]")
     except Exception:
         budget_sources = []
+    fp = dict(function_point) if function_point else {}
+    fp_no = fp.get("fp_no") or ""
+    fp_name = fp.get("name") or ""
+    title = d["title"]
+    if fp_no or fp_name:
+        title = f"{d['title']} - {' '.join(v for v in (fp_no, fp_name) if v)}"
     return {
         "外部ID": d["demand_no"],
-        "标题": d["title"],
+        "标题": title,
         "描述": d["description"],
         "需求类型": d["demand_type"],
         "预算出处": budget_sources,
@@ -562,44 +610,46 @@ def _tapd_payload(conn, demand_id: int, system_name: str, allocation_id=None):
         "附件上传": attachments,
         "归属系统": system_name,
         "分摊记录ID": allocation_id,
+        "功能点ID": fp.get("id"),
+        "功能点编号": fp_no,
+        "功能点名称": fp_name,
     }
 
 
-def _tapd_splits(conn, demand_id: int, strategy: str):
-    systems = [r["system_name"] for r in conn.execute(
-        "SELECT DISTINCT system_name FROM function_points WHERE demand_id=? AND TRIM(system_name)<>'' ORDER BY system_name",
-        (demand_id,),
-    )]
-    if not systems:
-        systems = ["默认系统"]
-    if strategy == "system_allocation":
-        allocs = list(conn.execute("SELECT id,system_name FROM allocations WHERE demand_id=? ORDER BY id", (demand_id,)))
-        if allocs:
-            result = []
-            for a in allocs:
-                sys_name = a["system_name"] or systems[0]
-                result.append((f"{sys_name}|allocation:{a['id']}", sys_name, a["id"]))
-            return result
-    return [(f"system:{s}", s, None) for s in systems]
+def _tapd_splits(conn, demand_id: int, strategy: str = "function_point"):
+    """TAPD拆分的业务主键固定为功能点，保证状态和工时可以一对一回写。"""
+    points = list(conn.execute(
+        "SELECT * FROM function_points WHERE demand_id=? ORDER BY fp_no,id", (demand_id,)
+    ))
+    if not points:
+        return [("demand:default", "默认系统", None, None)]
+    result = []
+    for fp in points:
+        allocation = conn.execute(
+            "SELECT id FROM allocations WHERE demand_id=? AND function_point_id=? ORDER BY id LIMIT 1",
+            (demand_id, fp["id"]),
+        ).fetchone()
+        result.append((f"fp:{fp['id']}", fp["system_name"] or "默认系统", allocation["id"] if allocation else None, fp))
+    return result
 
 
 def create_tapd_requirements(conn, demand_id: int, request_id: str = ""):
     existing = conn.execute("SELECT COUNT(*) c FROM tapd_requirements WHERE demand_id=?", (demand_id,)).fetchone()["c"]
     if existing:
         raise BusinessError(409, "REQ-4090", "该REQ编号已创建TAPD需求，请勿重复推送")
-    strategy = get_setting(conn, "tapd_split_strategy", "system")
+    strategy = "function_point"
     mode = tapd_runtime_config(conn)["mode"]
     splits = _tapd_splits(conn, demand_id, strategy)
     created = []
-    for idx, (split_key, system_name, allocation_id) in enumerate(splits, start=1):
-        payload = _tapd_payload(conn, demand_id, system_name, allocation_id)
+    for idx, (split_key, system_name, allocation_id, function_point) in enumerate(splits, start=1):
+        payload = _tapd_payload(conn, demand_id, system_name, allocation_id, function_point)
         now = now_iso()
         if mode == "live":
             cfg = _tapd_live_ready(conn)
             post_data = {
                 "workspace_id": cfg["workspace_id"],
                 "name": payload["标题"],
-                "description": f"{payload['描述']}\n\n[TRM外部ID] {payload['外部ID']}\n[归属系统] {system_name}",
+                "description": f"{payload['描述']}\n\n[TRM外部ID] {payload['外部ID']}\n[功能点] {payload['功能点编号']} {payload['功能点名称']}\n[归属系统] {system_name}",
                 "priority_label": payload["优先级"],
             }
             body = _tapd_request(conn, "POST", "/stories", data=post_data)
@@ -616,11 +666,11 @@ def create_tapd_requirements(conn, demand_id: int, request_id: str = ""):
             tapd_status = "新"
         conn.execute(
             """INSERT INTO tapd_requirements
-            (demand_id,split_key,system_name,allocation_id,tapd_id,tapd_url,tapd_status,sync_status,payload_json,created_at,last_sync_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (demand_id, split_key, system_name, allocation_id, tapd_id, tapd_url, tapd_status, "成功", json.dumps(payload, ensure_ascii=False), now, now),
+            (demand_id,split_key,system_name,allocation_id,function_point_id,tapd_id,tapd_url,tapd_status,sync_status,payload_json,created_at,last_sync_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (demand_id, split_key, system_name, allocation_id, payload["功能点ID"], tapd_id, tapd_url, tapd_status, "成功", json.dumps(payload, ensure_ascii=False), now, now),
         )
-        _integration_log(conn, "tapd", "out", "create_requirement", tapd_id, True, f"{mode}模式按{strategy}策略创建TAPD需求：{system_name}", request_id)
+        _integration_log(conn, "tapd", "out", "create_requirement", tapd_id, True, f"{mode}模式按功能点创建TAPD需求：{payload['功能点编号'] or system_name}", request_id)
         created.append(dict(conn.execute("SELECT * FROM tapd_requirements WHERE tapd_id=?", (tapd_id,)).fetchone()))
     first = created[0]
     conn.execute(
@@ -645,12 +695,15 @@ def push_demand_update_to_tapd(conn, demand_id: int, request_id: str = ""):
     updated = []
     for requirement in requirements:
         system_name = requirement["system_name"] or "默认系统"
-        payload = _tapd_payload(conn, demand_id, system_name, requirement["allocation_id"])
+        function_point = None
+        if requirement["function_point_id"]:
+            function_point = conn.execute("SELECT * FROM function_points WHERE id=?", (requirement["function_point_id"],)).fetchone()
+        payload = _tapd_payload(conn, demand_id, system_name, requirement["allocation_id"], function_point)
         post_data = {
             "id": requirement["tapd_id"],
             "workspace_id": cfg["workspace_id"],
             "name": payload["标题"],
-            "description": f"{payload['描述']}\n\n[TRM外部ID] {payload['外部ID']}\n[归属系统] {system_name}",
+            "description": f"{payload['描述']}\n\n[TRM外部ID] {payload['外部ID']}\n[功能点] {payload['功能点编号']} {payload['功能点名称']}\n[归属系统] {system_name}",
             "priority_label": payload["优先级"],
         }
         if demand["expected_completion_date"]:
@@ -855,32 +908,62 @@ def reconcile_work_deviation_notifications(conn, demand_id: Optional[int] = None
     相同需求、相同偏差值、相同目标角色只写入一次，避免用户刷新详情或
     消息中心时重复刷屏。
     """
-    sql = "SELECT id,estimated_hours,actual_hours,expected_completion_date,status FROM demands"
-    params: tuple = ()
-    if demand_id is not None:
-        sql += " WHERE id=?"
-        params = (demand_id,)
-    before = conn.total_changes
-    for row in conn.execute(sql, params):
-        _notify_deviation(
-            conn,
-            int(row["id"]),
-            float(row["estimated_hours"] or 0),
-            float(row["actual_hours"] or 0),
-        )
-        _notify_work_overdue(conn, int(row["id"]), row["expected_completion_date"], row["status"])
-    return conn.total_changes - before
+    # 消息中心可能并行刷新；单进程内串行执行补偿扫描，避免两个读事务同时升级为写事务。
+    with _RECONCILE_LOCK:
+        sql = "SELECT id,estimated_hours,actual_hours,expected_completion_date,status FROM demands"
+        params: tuple = ()
+        if demand_id is not None:
+            sql += " WHERE id=?"
+            params = (demand_id,)
+        before = conn.total_changes
+        for row in conn.execute(sql, params):
+            _notify_deviation(
+                conn,
+                int(row["id"]),
+                float(row["estimated_hours"] or 0),
+                float(row["actual_hours"] or 0),
+            )
+            _notify_work_overdue(conn, int(row["id"]), row["expected_completion_date"], row["status"])
+        return conn.total_changes - before
+
+
+def _aggregate_tapd_state(conn, demand_id: int):
+    rows = list(conn.execute(
+        "SELECT tapd_status FROM tapd_requirements WHERE demand_id=? ORDER BY id", (demand_id,)
+    ))
+    statuses = [r["tapd_status"] or "新" for r in rows]
+    if not statuses:
+        return "新", "已创建"
+    if len(set(statuses)) == 1:
+        status = statuses[0]
+        return status, TAPD_STATUS_MAP.get(status, "已创建")
+    if all(s == "已关闭" for s in statuses):
+        return "已关闭", "已完成"
+    if all(s == "已拒绝" for s in statuses):
+        return "已拒绝", "已终止"
+    active = [s for s in statuses if s != "已拒绝"]
+    rank = {"新": 0, "开发中": 1, "测试中": 2, "已验收": 3, "已关闭": 4}
+    base = min(active, key=lambda s: rank.get(s, 0)) if active else "新"
+    system_status = TAPD_STATUS_MAP.get(base, "开发中")
+    closed = sum(1 for s in statuses if s == "已关闭")
+    rejected = sum(1 for s in statuses if s == "已拒绝")
+    suffix = f"，{rejected}条拒绝" if rejected else ""
+    return f"多状态（{closed}/{len(statuses)}已关闭{suffix}）", system_status
 
 
 def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source: str, request_id: str = ""):
     if payload.status not in TAPD_STATUS_MAP:
         raise BusinessError(400, "REQ-4001", "无效TAPD状态")
-    sys_status = TAPD_STATUS_MAP[payload.status]
     requirement = None
     if payload.tapd_id:
         requirement = conn.execute("SELECT * FROM tapd_requirements WHERE tapd_id=? AND demand_id=?", (payload.tapd_id, demand_id)).fetchone()
-    if not requirement:
-        requirement = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id LIMIT 1", (demand_id,)).fetchone()
+        if not requirement:
+            raise BusinessError(404, "REQ-4040", "TAPD需求ID未绑定到该需求，已拒绝回写", {"tapdId": payload.tapd_id})
+    else:
+        requirements = list(conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id", (demand_id,)))
+        if len(requirements) > 1:
+            raise BusinessError(400, "REQ-4001", "一对多需求回写必须携带TAPD需求ID")
+        requirement = requirements[0] if requirements else None
     req_id = requirement["id"] if requirement else None
 
     # 回读是该TAPD需求当前任务的完整快照，移除上次已存在、本次已删除的任务。
@@ -934,6 +1017,12 @@ def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source
     # TAPD工时填报是实际投入的权威来源；无填报时才回退到任务已完成工时。
     actual_hours = float(cost_sum["a"] or 0) if int(cost_sum["c"] or 0) else float(sums["a"] or 0)
     work_hour_source = "TAPD工时填报" if int(cost_sum["c"] or 0) else "TAPD任务进度"
+    if requirement:
+        conn.execute(
+            "UPDATE tapd_requirements SET tapd_status=?,sync_status='成功',last_sync_at=? WHERE id=?",
+            (payload.status, now_iso(), requirement["id"]),
+        )
+    aggregate_tapd_status, sys_status = _aggregate_tapd_state(conn, demand_id)
     closed_at = now_iso() if sys_status in ("已完成", "已终止") else None
     conn.execute(
         """UPDATE demands SET tapd_description=?,rd_owner=?,rd_department=?,internal_days=?,external_days=?,planned_online_date=?,actual_online_date=?,
@@ -941,38 +1030,41 @@ def apply_tapd_payload(conn, demand_id: int, payload: TapdWebhookPayload, source
            last_sync_source=?,estimated_hours=?,actual_hours=?,work_hour_source=?,work_plan_source='TAPD任务',actual_hours_source=?,work_plan_updated_at=?,closed_at=COALESCE(?,closed_at),updated_at=? WHERE id=?""",
         (payload.demand_description, payload.rd_owner, payload.rd_department, payload.internal_days, payload.external_days,
          payload.planned_online_date, payload.actual_online_date, payload.user_test_date, payload.test_complete_date, payload.demand_confirm_date,
-         payload.planned_online_date, payload.status, sys_status, sys_status, now_iso(), source, estimated_hours, actual_hours,
+         payload.planned_online_date, aggregate_tapd_status, sys_status, sys_status, now_iso(), source, estimated_hours, actual_hours,
          work_hour_source, work_hour_source, now_iso(), closed_at, now_iso(), demand_id),
     )
-    if requirement:
-        conn.execute("UPDATE tapd_requirements SET tapd_status=?,sync_status='成功',last_sync_at=? WHERE id=?", (payload.status, now_iso(), requirement["id"]))
     changed = len(payload.tasks) + len(payload.costs) + 1
     conn.execute(
         "INSERT INTO tapd_sync_runs(demand_id,source,changed_count,success,message,created_at) VALUES (?,?,?,?,?,?)",
-        (demand_id, source, changed, 1, f"状态 {payload.status} 已同步，任务{len(payload.tasks)}条、花费{len(payload.costs)}条", now_iso()),
+        (demand_id, source, changed, 1, f"TAPD {payload.tapd_id or '需求'} 状态 {payload.status} 已同步，任务{len(payload.tasks)}条、花费{len(payload.costs)}条", now_iso()),
     )
     _integration_log(conn, "tapd", "in", "readback", payload.tapd_id or demand_id, True, f"{source}回读完成", request_id)
     deviation = _notify_deviation(conn, demand_id, estimated_hours, actual_hours)
     _notify_work_overdue(conn, demand_id, payload.planned_online_date, sys_status)
-    return {"system_status": sys_status, "deviation": deviation, "changed_count": changed}
+    return {"system_status": sys_status, "tapd_status": aggregate_tapd_status, "deviation": deviation, "changed_count": changed}
 
 
-def build_mock_sync_payload(conn, demand_id: int, status: Optional[str] = None):
+def build_mock_sync_payload(conn, demand_id: int, status: Optional[str] = None, tapd_id: Optional[str] = None):
     d = conn.execute("SELECT * FROM demands WHERE id=?", (demand_id,)).fetchone()
     if not d:
         raise BusinessError(404, "REQ-4040", "需求不存在")
     current = status or d["tapd_status"] or "新"
     if current not in TAPD_STATUS_MAP:
         current = "新"
-    req = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id LIMIT 1", (demand_id,)).fetchone()
-    tapd_id = req["tapd_id"] if req else d["tapd_id"]
+    req = None
+    if tapd_id:
+        req = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? AND tapd_id=?", (demand_id, tapd_id)).fetchone()
+    if not req:
+        req = conn.execute("SELECT * FROM tapd_requirements WHERE demand_id=? ORDER BY id LIMIT 1", (demand_id,)).fetchone()
+    tapd_id = tapd_id or (req["tapd_id"] if req else d["tapd_id"])
     progress = {"新": 0.0, "开发中": 0.35, "测试中": 0.75, "已验收": 1.05, "已关闭": 1.12, "已拒绝": 0.0}[current]
     fp_sum = conn.execute("SELECT COALESCE(SUM(fp_count),0) s FROM function_points WHERE demand_id=?", (demand_id,)).fetchone()["s"]
     estimated = max(16.0, float(fp_sum or 0) * 2.5)
     completed = round(estimated * progress, 2)
     remaining = max(0, round(estimated - completed, 2))
     overrun = max(0, round(completed - estimated, 2))
-    task_id = f"TASK-{demand_id:05d}-01"
+    req_suffix = req["id"] if req else 1
+    task_id = f"TASK-{demand_id:05d}-{req_suffix:02d}"
     today = datetime.now().strftime("%Y-%m-%d")
     return TapdWebhookPayload(
         tapd_id=tapd_id,
@@ -1012,16 +1104,23 @@ def run_scheduled_tapd_sync(force: bool = False):
     synced = 0
     with connect() as conn:
         interval = int(float(get_setting(conn, "tapd_sync_interval_seconds", "1800")))
-        rows = list(conn.execute("SELECT * FROM demands WHERE tapd_id IS NOT NULL AND tapd_id<>'' AND status NOT IN ('已终止')"))
-        for d in rows:
-            last = _parse_iso(d["tapd_last_sync_at"])
+        rows = list(conn.execute(
+            """SELECT tr.*,d.status demand_status FROM tapd_requirements tr
+                 JOIN demands d ON d.id=tr.demand_id
+                WHERE tr.tapd_id IS NOT NULL AND tr.tapd_id<>'' AND d.status NOT IN ('已终止')
+                ORDER BY tr.id"""
+        ))
+        for requirement in rows:
+            last = _parse_iso(requirement["last_sync_at"])
             if not force and last and (now - last).total_seconds() < interval:
                 continue
             if tapd_runtime_config(conn)["mode"] == "live":
-                payload = build_live_sync_payload(conn, d["id"], d["tapd_id"])
+                payload = build_live_sync_payload(conn, requirement["demand_id"], requirement["tapd_id"])
             else:
-                payload = build_mock_sync_payload(conn, d["id"], d["tapd_status"] or "新")
-            apply_tapd_payload(conn, d["id"], payload, "定时任务", "background")
+                payload = build_mock_sync_payload(
+                    conn, requirement["demand_id"], requirement["tapd_status"] or "新", requirement["tapd_id"]
+                )
+            apply_tapd_payload(conn, requirement["demand_id"], payload, "定时任务", "background")
             synced += 1
     return synced
 
@@ -1061,8 +1160,8 @@ def update_poc_settings(payload: SettingsPayload, x_role: Optional[str] = Header
     with connect() as conn:
         now = now_iso()
         if payload.tapd_split_strategy is not None:
-            if payload.tapd_split_strategy not in ("system", "system_allocation"):
-                raise BusinessError(400, "REQ-4001", "TAPD拆分策略仅支持system/system_allocation")
+            if payload.tapd_split_strategy != "function_point":
+                raise BusinessError(400, "REQ-4001", "TAPD需求固定按功能点一对一生成")
             conn.execute("UPDATE system_settings SET value=?,updated_at=? WHERE code='tapd_split_strategy'", (payload.tapd_split_strategy, now))
         if payload.tapd_sync_interval_seconds is not None:
             if payload.tapd_sync_interval_seconds < 60:

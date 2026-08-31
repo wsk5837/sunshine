@@ -666,3 +666,4 @@ def export_platform_summary():
             w.writerow(["合同", r["contract_no"], r["name"], r["status"], r["total_amount"]])
         data = ("\ufeff" + buf.getvalue()).encode("utf-8")
         return StreamingResponse(io.BytesIO(data), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=trm-platform-summary.csv"})
+

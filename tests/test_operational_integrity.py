@@ -88,3 +88,4 @@ def test_payment_update_cannot_exceed_contract_total(monkeypatch, tmp_path):
         })
         assert update.status_code == 422
 
+

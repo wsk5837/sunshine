@@ -165,7 +165,7 @@ def push_tapd_v5(demand_id: int, request: Request, simulate_failure: bool = Fals
             job = _schedule_real_tapd_retry(conn, demand_id, request_id, message)
             core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '等待重试', demand_id, {'error':message,'next_retry_at':job.get('next_retry_at'),'automatic':automatic})
             return {'code':0,'message':f'终审已完成，但TAPD创建失败，已进入自动重试：{message}','data':core.demand_dict(conn, core.get_demand_or_404(conn,demand_id))}
-        core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '成功', demand_id, {'automatic':automatic,'count':len(records),'strategy':poc.get_setting(conn,'tapd_split_strategy','system')})
+        core.audit(conn, request, actor, role, '创建TAPD需求', 'tapd', demand_id, '成功', demand_id, {'automatic':automatic,'count':len(records),'strategy':'function_point'})
         data = core.demand_dict(conn, core.get_demand_or_404(conn,demand_id))
     return {'code':0,'message':('终审通过，已自动创建TAPD需求' if automatic else 'TAPD需求创建成功')+f'（共{len(records)}条）','data':data}
 
@@ -189,7 +189,7 @@ _remove_route("/", "GET")
 @app.get("/", response_class=HTMLResponse)
 def index_v5():
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-    return HTMLResponse(html.replace("</body>", '<script src="/static/v5_fixes.js?v=5.0.0"></script>\n</body>'))
+    return HTMLResponse(html.replace("</body>", '<script src="./static/v5_fixes.js?v=5.0.0"></script>\n</body>'))
 
 _remove_route("/api/meta", "GET")
 @app.get("/api/meta")

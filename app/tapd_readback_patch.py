@@ -85,3 +85,4 @@ def run_scheduled_tapd_sync_v5(force: bool = False):
                     (now_iso(), demand["id"]),
                 )
     return synced
+

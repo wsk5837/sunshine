@@ -87,3 +87,4 @@ def test_frontend_has_global_date_picker_and_permission_synced_ai_helper():
     assert "AI_ASSIST_EXCLUDED_IDS" in script
     assert ".date-assist-trigger" in stylesheet
     assert ".ai-assist-preview" in stylesheet
+

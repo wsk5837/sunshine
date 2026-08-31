@@ -661,6 +661,32 @@ def update_project(project_id:int,payload:ProjectPayload,request:Request,x_user:
         if not conn.execute('SELECT id FROM projects WHERE id=?',(project_id,)).fetchone(): raise BusinessError(404,'REQ-4040','项目不存在')
         conn.execute("""UPDATE projects SET name=?,manager=?,department=?,budget_id=?,total_budget=?,status=?,progress=?,start_date=?,end_date=?,description=?,updated_at=? WHERE id=?""",(payload.name,payload.manager,payload.department,payload.budget_id,payload.total_budget,payload.status,max(0,min(100,payload.progress)),payload.start_date,payload.end_date,payload.description,now_iso(),project_id)); _audit(conn,request,actor,role,'更新项目','project',project_id); return {'code':0,'message':'项目已更新'}
 
+
+@router.delete('/projects/{project_id}')
+def delete_project(project_id:int,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
+    """仅系统管理员可删除项目；合同、结算保留在各自台账并解除项目关联。"""
+    if not request_has_role(request, 'admin'):
+        raise BusinessError(403,'AUTH-4030','仅系统管理员可以删除项目')
+    actor,role=_actor(x_user,x_role)
+    with connect() as conn:
+        row=conn.execute('SELECT * FROM projects WHERE id=?',(project_id,)).fetchone()
+        if not row: raise BusinessError(404,'REQ-4040','项目不存在')
+        contract_count=conn.execute('SELECT COUNT(*) c FROM contracts WHERE project_id=?',(project_id,)).fetchone()['c']
+        settlement_count=conn.execute('SELECT COUNT(*) c FROM settlements WHERE project_id=?',(project_id,)).fetchone()['c']
+        conn.execute('UPDATE contracts SET project_id=NULL,updated_at=? WHERE project_id=?',(now_iso(),project_id))
+        conn.execute('UPDATE settlements SET project_id=NULL,updated_at=? WHERE project_id=?',(now_iso(),project_id))
+        conn.execute('UPDATE initiatives SET project_id=NULL,updated_at=? WHERE project_id=?',(now_iso(),project_id))
+        conn.execute('UPDATE ai_delegations SET project_id=NULL WHERE project_id=?',(project_id,))
+        conn.execute('DELETE FROM business_values WHERE project_id=?',(project_id,))
+        conn.execute('DELETE FROM projects WHERE id=?',(project_id,))
+        _audit(conn,request,actor,role,'管理员删除项目','project',project_id,details={
+            'project_no':row['project_no'],'name':row['name'],
+            'unlinked_contracts':contract_count,'unlinked_settlements':settlement_count,
+        })
+    return {'code':0,'message':'项目已删除；关联合同与结算已保留并解除关联','data':{
+        'id':project_id,'unlinked_contracts':contract_count,'unlinked_settlements':settlement_count,
+    }}
+
 @router.put('/projects/{project_id}/relations')
 def update_project_relations(project_id:int,payload:ProjectRelationsPayload,request:Request,x_user:Optional[str]=Header(None),x_role:Optional[str]=Header(None)):
     actor,role=_actor(x_user,x_role)

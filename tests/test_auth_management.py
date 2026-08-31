@@ -25,3 +25,4 @@ def test_login_and_system_user_management():
         assert catalog.status_code == 200
         assert catalog.json()['data']['ai'] == 'AI智能问答'
         assert not any(code.startswith('ai.') for code in catalog.json()['data'])
+

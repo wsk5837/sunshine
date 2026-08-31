@@ -24,3 +24,4 @@ def test_list_demands():
         result = client.get('/api/demands').json()
         assert result['code'] == 0
         assert result['data']['total'] >= 1
+

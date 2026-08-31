@@ -142,3 +142,4 @@ def test_work_hour_write_permissions_follow_business_roles(monkeypatch, tmp_path
             json={"estimated_hours": 80, "expected_completion_date": "2099-12-31"},
         )
         assert allowed.status_code == 200, allowed.text
+

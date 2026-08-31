@@ -1,3 +1,5 @@
+# 备选方案：此文件需要 Render Starter 付费实例和 Persistent Disk。
+# 免费 Render + Neon PostgreSQL 试点请直接使用 render.yaml。
 services:
   - type: web
     name: trm-tech-resource-poc
